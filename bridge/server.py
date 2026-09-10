@@ -47,10 +47,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Prompt ---
-# Structured output format: one finding per line, no markdown, no explanations.
-# This is tighter than before — the 7B model handles it reliably.
-PROMPT_TEMPLATE = """\
+# --- Prompts ---
+PROMPTS = {
+    "review": """\
 You are a senior code reviewer doing a security and correctness review of a git diff.
 Report every bug, warning, or note you find. Pay special attention to:
 - Null / None pointer dereferences
@@ -69,7 +68,37 @@ LINE:<n> SEVERITY:<BUG|WARNING|INFO> MSG:<one concise sentence describing the is
 
 Diff to review:
 {diff}
+""",
+    "write": """\
+You are an expert software engineer. Write or modify code based on the instruction and context.
+Output only the resulting code snippet or diff, without any markdown formatting or explanations unless requested.
+
+Context:
+{context}
+
+Instruction:
+{instruction}
+""",
+    "debug": """\
+You are an expert debugger. Find the root cause of the problem described by the instruction or stack trace based on the context.
+Provide a concise explanation of the root cause and a proposed fix.
+
+Context:
+{context}
+
+Instruction/Stack Trace:
+{instruction}
+""",
+    "explain": """\
+You are an expert code explainer. Explain the provided code context clearly and concisely based on the instruction.
+
+Context:
+{context}
+
+Instruction:
+{instruction}
 """
+}
 
 FINDING_RE = re.compile(
     r"LINE:(\d+)\s+SEVERITY:(BUG|WARNING|INFO)\s+MSG:(.+)"
@@ -96,6 +125,18 @@ class ReviewResponse(BaseModel):
     elapsed_ms: int
 
 
+class EscalateRequest(BaseModel):
+    task: str
+    context: str
+    instruction: str
+
+
+class EscalateResponse(BaseModel):
+    result: str
+    backend: str
+    elapsed_ms: int
+
+
 class StatusResponse(BaseModel):
     status: str
     backend: str
@@ -112,8 +153,8 @@ if BACKEND == "npu":
     MODEL_NAME = "Qwen2.5-Coder-1.5B (NPU)"
     OLLAMA_URL = None
 
-    def run_backend(diff: str) -> str:
-        return npu_backend.generate(diff)
+    def run_backend(prompt: str) -> str:
+        return npu_backend.generate(prompt)
 
 else:
     import requests as _requests
@@ -128,8 +169,7 @@ else:
         except Exception:
             return False
 
-    def call_ollama(diff: str) -> str:
-        prompt = PROMPT_TEMPLATE.format(diff=diff)
+    def call_ollama(prompt: str) -> str:
         try:
             resp = _requests.post(
                 f"{OLLAMA_URL}/api/generate",
@@ -146,11 +186,11 @@ else:
                 ),
             )
         except _requests.exceptions.Timeout:
-            raise HTTPException(status_code=504, detail="Ollama timed out — diff may be too large.")
+            raise HTTPException(status_code=504, detail="Ollama timed out.")
         return resp.json().get("response", "")
 
-    def run_backend(diff: str) -> str:
-        return call_ollama(diff)
+    def run_backend(prompt: str) -> str:
+        return call_ollama(prompt)
 
 
 # --- Parsing ---
@@ -177,8 +217,10 @@ def review(req: ReviewRequest) -> ReviewResponse:
         raise HTTPException(status_code=400, detail="diff must not be empty")
 
     log.info("Review request — diff length: %d chars", len(req.diff))
+    prompt = PROMPTS["review"].format(diff=req.diff)
+    
     t0 = time.time()
-    raw = run_backend(req.diff)
+    raw = run_backend(prompt)
     elapsed = int((time.time() - t0) * 1000)
     log.info("Backend response in %dms. Raw output: %s", elapsed, raw[:300])
 
@@ -186,6 +228,28 @@ def review(req: ReviewRequest) -> ReviewResponse:
     log.info("Parsed %d finding(s)", len(findings))
 
     return ReviewResponse(findings=findings, backend=BACKEND, elapsed_ms=elapsed)
+
+
+@app.post("/escalate", response_model=EscalateResponse)
+def escalate(req: EscalateRequest) -> EscalateResponse:
+    if req.task not in PROMPTS:
+        raise HTTPException(status_code=400, detail=f"Unsupported task: {req.task}")
+    if not req.instruction.strip() and req.task != "review":
+        raise HTTPException(status_code=400, detail="instruction must not be empty")
+
+    log.info("Escalate request — task: %s, context length: %d chars", req.task, len(req.context))
+    
+    if req.task == "review":
+        prompt = PROMPTS["review"].format(diff=req.context)
+    else:
+        prompt = PROMPTS[req.task].format(context=req.context, instruction=req.instruction)
+
+    t0 = time.time()
+    raw = run_backend(prompt)
+    elapsed = int((time.time() - t0) * 1000)
+    log.info("Backend response in %dms. Raw output: %s", elapsed, raw[:300])
+
+    return EscalateResponse(result=raw.strip(), backend=BACKEND, elapsed_ms=elapsed)
 
 
 @app.get("/health")
