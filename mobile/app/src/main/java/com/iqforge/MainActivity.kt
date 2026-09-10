@@ -2,6 +2,8 @@ package com.iqforge
 
 import android.os.Bundle
 import android.content.Context
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -29,6 +31,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewmodel.CreationExtras
+import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
+import com.iqforge.engine.CodeEngine
+import com.iqforge.engine.NativeEngine
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.iqforge.bridge.BridgeTask
@@ -151,13 +158,23 @@ sealed interface FeedItem {
 // ---------------------------------------------------------------------------
 
 class AgentViewModel(
-    internal val bridgeClient: LaptopBridgeClient = LaptopBridgeClient()
+    private val codeEngine: CodeEngine,
+    internal var bridgeClient: LaptopBridgeClient = LaptopBridgeClient()
 ) : ViewModel() {
-    private val offlineEngine = OfflineEngine()
     var composer by mutableStateOf(""); private set
     var bridgeUrl by mutableStateOf("http://192.168.1.2:8000"); private set
     var sending by mutableStateOf(false); private set
     var feed by mutableStateOf<List<FeedItem>>(emptyList()); internal set
+
+    companion object {
+        val Factory: ViewModelProvider.Factory = object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>, extras: CreationExtras): T {
+                val application = checkNotNull(extras[APPLICATION_KEY])
+                return AgentViewModel(NativeEngine(application)) as T
+            }
+        }
+    }
 
     fun updateComposer(value: String) { composer = value }
     fun updateBridgeUrl(value: String) { bridgeUrl = value }
@@ -186,14 +203,14 @@ class AgentViewModel(
             try {
                 val task = inferTask(prompt)
                 val response = when (task) {
-                    BridgeTask.REVIEW -> {
-                        val findings = offlineEngine.review(fileContext)
-                        if (findings.isEmpty()) "Offline review: no common high-risk patterns were found in the supplied change."
-                        else findings.joinToString("\n") { "${it.severity} line ${it.line}: ${it.message}" }
+                    BridgeTask.REVIEW  -> {
+                        val findings = codeEngine.review(fileContext)
+                        if (findings.isEmpty()) "No issues found."
+                        else findings.joinToString("\n") { "Line ${it.line}: [${it.severity}] ${it.message}" }
                     }
-                    BridgeTask.DEBUG   -> offlineEngine.debug(prompt, fileContext)
-                    BridgeTask.EXPLAIN -> offlineEngine.explain(fileContext)
-                    BridgeTask.WRITE   -> offlineEngine.write(prompt, fileContext)
+                    BridgeTask.DEBUG   -> codeEngine.debug(prompt, fileContext)
+                    BridgeTask.EXPLAIN -> codeEngine.explain(fileContext)
+                    BridgeTask.WRITE   -> codeEngine.write(prompt, fileContext)
                 }
                 feed += FeedItem.Reply(response)
                 // Offer escalation when a bridge URL is configured.
@@ -289,7 +306,7 @@ class AgentViewModel(
     appearance: Appearance,
     onAppearanceChange: (Appearance) -> Unit,
     workspace: WorkspaceViewModel = viewModel(),
-    agent: AgentViewModel = viewModel()
+    agent: AgentViewModel = viewModel(factory = AgentViewModel.Factory)
 ) {
     val state by workspace.state
     var drawerOpen by remember { mutableStateOf(false) }

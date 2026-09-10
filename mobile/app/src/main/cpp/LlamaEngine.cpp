@@ -17,11 +17,14 @@ Java_com_iqforge_engine_NativeEngine_nativeGenerate(
 
     llama_backend_init();
     llama_model_params model_params = llama_model_default_params();
-    // NPU DECISION POINT: n_gpu_layers = 0 means CPU-only — no accelerator offload.
-    // This is the honest fallback path (see EVENT_PLAN.md, Option B). If attempting the
-    // real Hexagon swap on-site (Option A), this is where a QNN/GenieX backend gets wired
-    // in instead of raising this number against plain llama.cpp CPU ggml.
-    model_params.n_gpu_layers = 0;
+    // NPU DECISION POINT: n_gpu_layers = 0 means CPU-only.
+    // If attempting the Hexagon swap on-site (Option A), CMake will define USE_QNN_BACKEND
+    // and we will raise this number to offload graph computation to the NPU.
+#ifdef USE_QNN_BACKEND
+    model_params.n_gpu_layers = 99; // Offload fully to Hexagon NPU
+#else
+    model_params.n_gpu_layers = 0;  // CPU fallback
+#endif
     llama_model * model = llama_model_load_from_file(path.c_str(), model_params);
     if (!model) return env->NewStringUTF("ERROR: unable to load GGUF model");
 

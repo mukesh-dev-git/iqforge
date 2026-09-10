@@ -8,12 +8,23 @@ android {
     namespace = "com.iqforge"
     compileSdk = 34
 
+    ndkVersion = "26.1.10909125"
+
     defaultConfig {
         applicationId = "com.iqforge"
         minSdk = 26
         targetSdk = 34
         versionCode = 1
         versionName = "0.1"
+        externalNativeBuild {
+            cmake {
+                cppFlags += "-std=c++17"
+                arguments += "-DANDROID_STL=c++_shared"
+            }
+        }
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     buildFeatures {
@@ -31,8 +42,12 @@ android {
         jvmTarget = "17"
     }
 
-    // salvaged/native/ (llama.cpp JNI) plugs in here once vendored — do not enable yet:
-    // externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
 }
 
 dependencies {

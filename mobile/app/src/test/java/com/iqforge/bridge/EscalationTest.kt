@@ -33,27 +33,27 @@ class EscalationTest {
     // ------------------------------------------------------------------
 
     @Test fun `inferTask maps review keyword to REVIEW`() {
-        val vm = AgentViewModel(FakeBridgeClient())
+        val vm = AgentViewModel(com.iqforge.engine.OfflineEngine(), FakeBridgeClient())
         assertEquals(BridgeTask.REVIEW, vm.inferTask("please review this diff"))
     }
 
     @Test fun `inferTask maps debug keyword to DEBUG`() {
-        val vm = AgentViewModel(FakeBridgeClient())
+        val vm = AgentViewModel(com.iqforge.engine.OfflineEngine(), FakeBridgeClient())
         assertEquals(BridgeTask.DEBUG, vm.inferTask("debug the crash"))
     }
 
     @Test fun `inferTask maps crash keyword to DEBUG`() {
-        val vm = AgentViewModel(FakeBridgeClient())
+        val vm = AgentViewModel(com.iqforge.engine.OfflineEngine(), FakeBridgeClient())
         assertEquals(BridgeTask.DEBUG, vm.inferTask("app crash on launch"))
     }
 
     @Test fun `inferTask maps explain keyword to EXPLAIN`() {
-        val vm = AgentViewModel(FakeBridgeClient())
+        val vm = AgentViewModel(com.iqforge.engine.OfflineEngine(), FakeBridgeClient())
         assertEquals(BridgeTask.EXPLAIN, vm.inferTask("explain this function"))
     }
 
     @Test fun `inferTask falls back to WRITE for unrecognised prompts`() {
-        val vm = AgentViewModel(FakeBridgeClient())
+        val vm = AgentViewModel(com.iqforge.engine.OfflineEngine(), FakeBridgeClient())
         assertEquals(BridgeTask.WRITE, vm.inferTask("add a null check here"))
     }
 
@@ -63,7 +63,7 @@ class EscalationTest {
 
     @Test fun `escalate with blank URL produces EscalateError immediately without network call`() = runTest {
         val fake = FakeBridgeClient()
-        val vm = AgentViewModel(fake)
+        val vm = AgentViewModel(com.iqforge.engine.OfflineEngine(), fake)
         vm.updateBridgeUrl("")
 
         // Put a prompt card in the feed first so replaceLast has a target.
@@ -83,7 +83,7 @@ class EscalationTest {
 
     @Test fun `escalate success replaces EscalatePrompt with LaptopReply`() = runTest {
         val fake = FakeBridgeClient(answer = "Laptop says: looks good")
-        val vm = AgentViewModel(fake)
+        val vm = AgentViewModel(com.iqforge.engine.OfflineEngine(), fake)
         vm.updateBridgeUrl("http://192.168.1.50:8000")
         vm.forceEscalatePrompt("explain this", "fun greet() = 1", BridgeTask.EXPLAIN)
 
@@ -102,7 +102,7 @@ class EscalationTest {
 
     @Test fun `escalate failure leaves offline Reply intact and adds EscalateError`() = runTest {
         val fake = FakeBridgeClient(throws = IOException("Connection refused"))
-        val vm = AgentViewModel(fake)
+        val vm = AgentViewModel(com.iqforge.engine.OfflineEngine(), fake)
         vm.updateBridgeUrl("http://192.168.1.50:8000")
 
         // Simulate: offline reply already in feed, then prompt card.
@@ -126,7 +126,7 @@ class EscalationTest {
 
     @Test fun `retry from EscalateError re-issues escalation and produces LaptopReply on success`() = runTest {
         val fake = FakeBridgeClient(answer = "Retried and got result")
-        val vm = AgentViewModel(fake)
+        val vm = AgentViewModel(com.iqforge.engine.OfflineEngine(), fake)
         vm.updateBridgeUrl("http://192.168.1.50:8000")
         vm.forceEscalateError("Connection refused", "write null guard", "", BridgeTask.WRITE)
 

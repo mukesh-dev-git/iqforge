@@ -47,7 +47,12 @@ engine and say so: "on-device, CPU inference today; Hexagon NPU backend is the n
 integration, same interface." The team's original Aug 24 draft did exactly this and it read
 as credible, not weak.
 
-**Decide before Saturday morning** — don't let the clock decide it for you.
+**DECISION LOG (Issue #5) — Sep 10:**
+We are committing to **Option A**. The NPU pipeline is wired into `mobile/app/src/main/cpp/CMakeLists.txt` via the `GGML_QNN` flag, but explicitly set to `OFF` today.
+- **Hour 0:** We will flash the `GGML_QNN=OFF` (CPU) build to establish the safety net.
+- **Hour 2:** We will switch `GGML_QNN=ON` and link the Qualcomm Neural Network (QNN) SDK provided on the iQOO 15 to map the layers to the Hexagon tensor cores (`n_gpu_layers = 99`).
+
+This keeps the CPU safety net intact while fully preparing the architecture for the NPU offload.
 
 ## Pre-event build checklist (now → Sep 11 night, on your own Android devices)
 
