@@ -46,6 +46,10 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.2")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.2")
 
+    // Full on-device Git workspace (clone, pull, commit, push)
+    implementation("org.eclipse.jgit:org.eclipse.jgit:6.8.0.202311291450-r")
+    implementation("org.slf4j:slf4j-android:1.7.36")
+
     // bridge/ HTTP client + CONTRACT.md wire format
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
@@ -59,4 +63,5 @@ dependencies {
     implementation("androidx.camera:camera-view:$cameraxVersion")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+    testImplementation("junit:junit:4.13.2")
 }
