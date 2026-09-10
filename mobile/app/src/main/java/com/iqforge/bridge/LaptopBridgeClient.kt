@@ -10,7 +10,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 
 /** HTTP client for the laptop bridge. The JSON fields mirror CONTRACT.md exactly. */
-class LaptopBridgeClient(
+open class LaptopBridgeClient(
     private val client: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)
@@ -18,7 +18,7 @@ class LaptopBridgeClient(
         .build(),
     private val json: Json = Json { ignoreUnknownKeys = true }
 ) {
-    suspend fun escalate(
+    open suspend fun escalate(
         laptopUrl: String,
         task: BridgeTask,
         context: String,
