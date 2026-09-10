@@ -36,6 +36,21 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
     private val mutableState = mutableStateOf(WorkspaceUiState())
     val state: State<WorkspaceUiState> = mutableState
 
+    init {
+        viewModelScope.launch(Dispatchers.IO) {
+            val existing = workspaceRoot.listFiles()
+                ?.filter { it.isDirectory && it.resolve(".git").isDirectory }
+                ?.maxByOrNull { it.resolve(".git/index").lastModified() }
+            if (existing != null) {
+                val repo = Repo(existing, existing.name)
+                val entries = files.visibleEntries(repo.root, emptySet())
+                withContext(Dispatchers.Main) {
+                    mutableState.value = mutableState.value.copy(repo = repo, entries = entries)
+                }
+            }
+        }
+    }
+
     fun updateRepoUrl(value: String) = update { copy(repoUrl = value, error = null) }
     fun updateUsername(value: String) = update { copy(githubUsername = value, error = null) }
     fun updateToken(value: String) = update { copy(githubToken = value, error = null) }
