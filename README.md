@@ -20,8 +20,7 @@ Build/event plan: [`../finals-30hr/EVENT_PLAN.md`](../finals-30hr/EVENT_PLAN.md)
 
 ```
 iqforge/
-├── mobile/       the phone app — Android Studio project (Kotlin, Compose). Create this
-│                 via Android Studio's New Project wizard, then port salvaged/ into it.
+├── mobile/       the phone app — Android Studio project (Kotlin, Compose)
 ├── bridge/       the laptop-side server (FastAPI) — escalation + toolchain execution
 └── salvaged/     proven code carried over from the old repo — see salvaged/README.md
 ```
@@ -29,8 +28,8 @@ iqforge/
 ## Quickstart
 
 1. Read `CONTRACT.md` first — it's short, and it's what lets three people build in parallel.
-2. `mobile/` doesn't exist yet — create it in Android Studio (empty Compose activity,
-   package `com.iqforge`), then move the files in `salvaged/` to where its README says.
+2. Open `mobile/` in Android Studio. It uses Java 17, compile/target SDK 34, and min SDK 26.
+   Build a debug APK with `gradlew.bat assembleDebug` on Windows.
 3. `bridge/` is a standalone FastAPI server:
    ```bash
    cd bridge && pip install -r requirements.txt && uvicorn server:app --host 0.0.0.0 --port 8000
@@ -39,6 +38,8 @@ iqforge/
 
 ## Status
 
-Fresh repo, scaffolding stage. `bridge/` is a known-good server ported from the old repo
-(model escalation works; toolchain execution — `/exec` — is new, not built yet). `mobile/`
-is not created yet. `salvaged/` holds four proven files waiting to be dropped in.
+Android scaffolding is complete and `assembleDebug` succeeds. The current app is a minimal
+Compose shell; the core clone/edit/review/escalate/commit/push loop is not implemented yet.
+`bridge/` contains the ported `/review` server, but contract-compatible `/escalate` and
+toolchain execution via `/exec` are not built yet. `salvaged/` holds the camera, sensor,
+and native llama.cpp integration files waiting to be moved into `mobile/`.
