@@ -56,7 +56,8 @@ dependencies {
 
     // salvaged/camera/CameraScanner.kt
     implementation("com.google.mlkit:text-recognition:16.0.1")
-    val cameraxVersion = "1.3.4"
+    // CameraX 1.4.0+ ships libimage_processing_util_jni.so with 16 KB ELF alignment.
+    val cameraxVersion = "1.4.2"
     implementation("androidx.camera:camera-core:$cameraxVersion")
     implementation("androidx.camera:camera-camera2:$cameraxVersion")
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
