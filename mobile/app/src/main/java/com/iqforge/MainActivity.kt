@@ -28,7 +28,10 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.iqforge.engine.OfflineEngine
+import kotlinx.coroutines.launch
 import com.iqforge.workspace.WorkspaceEntry
 import com.iqforge.workspace.WorkspaceUiState
 import com.iqforge.workspace.WorkspaceViewModel
@@ -108,6 +111,7 @@ sealed interface FeedItem {
 }
 
 class AgentViewModel : ViewModel() {
+    private val offlineEngine = OfflineEngine()
     var composer by mutableStateOf(""); private set
     var bridgeUrl by mutableStateOf("http://192.168.1.2:8000"); private set
     var sending by mutableStateOf(false); private set
@@ -115,13 +119,30 @@ class AgentViewModel : ViewModel() {
     fun updateComposer(value: String) { composer = value }
     fun updateBridgeUrl(value: String) { bridgeUrl = value }
     fun showClone(name: String) { if (feed.none { it is FeedItem.Status && it.text == "Cloned $name" }) feed += FeedItem.Status("Cloned $name", success = true) }
-    fun send() {
+    fun send(fileContext: String = "") {
         val prompt = composer.trim(); if (prompt.isEmpty() || sending) return
         composer = ""; sending = true
         feed += FeedItem.User(prompt)
         feed += FeedItem.Tool("iQForge — preparing an on-device response…")
-        feed += FeedItem.Reply("The local code engine is not installed yet. Connect the laptop bridge in the repository drawer to escalate this task, or retry after OfflineEngine is available.")
-        sending = false
+        viewModelScope.launch {
+            try {
+                val response = when {
+                    prompt.contains("review", ignoreCase = true) -> {
+                        val findings = offlineEngine.review(fileContext)
+                        if (findings.isEmpty()) "Offline review: no common high-risk patterns were found in the supplied change."
+                        else findings.joinToString("\n") { "${it.severity} line ${it.line}: ${it.message}" }
+                    }
+                    prompt.contains("debug", ignoreCase = true) || prompt.contains("crash", ignoreCase = true) -> offlineEngine.debug(prompt, fileContext)
+                    prompt.contains("explain", ignoreCase = true) -> offlineEngine.explain(fileContext)
+                    else -> offlineEngine.write(prompt, fileContext)
+                }
+                feed += FeedItem.Reply(response)
+            } catch (error: Exception) {
+                feed += FeedItem.Status(error.message ?: "The offline engine could not complete this request.", error = true)
+            } finally {
+                sending = false
+            }
+        }
     }
     fun retry() { feed += FeedItem.Status("Ready to retry using ${bridgeUrl.ifBlank { "the configured laptop bridge" }}") }
 }
@@ -143,7 +164,7 @@ class AgentViewModel : ViewModel() {
             navigationIcon = { IconButton({ drawerOpen = !drawerOpen }) { Icon(Icons.Default.Menu, "Open repository drawer") } },
             actions = { IconButton({ drawerOpen = true }) { Icon(Icons.Default.Folder, "Repository files") } }
         ) },
-        bottomBar = { Composer(agent) }
+        bottomBar = { Composer(agent) { agent.send(state.editorText) } }
     ) { padding ->
         Row(Modifier.fillMaxSize().padding(padding)) {
             if (drawerOpen) RepositoryDrawer(state, workspace, agent, appearance, onAppearanceChange) { drawerOpen = false }
@@ -176,7 +197,7 @@ class AgentViewModel : ViewModel() {
 @Composable private fun ToolCard(text: String) = Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()) { Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Refresh, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(10.dp)); Text(text) } }
 @Composable private fun DiffCard(diff: FeedItem.Diff) = Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), modifier = Modifier.fillMaxWidth()) { Column { Text("${diff.path} · 2 lines changed", Modifier.padding(12.dp), style = MaterialTheme.typography.titleSmall); Text("− ${diff.removed}", Modifier.fillMaxWidth().background(Color(0xFF4A1215)).padding(8.dp), color = Color(0xFFFF9B9B), fontFamily = FontFamily.Monospace); Text("+ ${diff.added}", Modifier.fillMaxWidth().background(Color(0xFF0C3816)).padding(8.dp), color = Color(0xFF75DF86), fontFamily = FontFamily.Monospace); Text(diff.summary, Modifier.padding(12.dp)) } }
 
-@Composable private fun Composer(agent: AgentViewModel) = Surface(color = MaterialTheme.colorScheme.background, shadowElevation = 8.dp) { Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) { IconButton({}) { Icon(Icons.Default.CameraAlt, "Attach code from camera") }; IconButton({}) { Icon(Icons.Default.Mic, "Voice prompt") }; OutlinedTextField(agent.composer, agent::updateComposer, Modifier.weight(1f), placeholder = { Text("Ask iQForge…") }, singleLine = true); IconButton(agent::send, enabled = agent.composer.isNotBlank() && !agent.sending) { Icon(Icons.AutoMirrored.Filled.Send, "Send", tint = MaterialTheme.colorScheme.primary) } } }
+@Composable private fun Composer(agent: AgentViewModel, send: () -> Unit) = Surface(color = MaterialTheme.colorScheme.background, shadowElevation = 8.dp) { Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) { IconButton({}) { Icon(Icons.Default.CameraAlt, "Attach code from camera") }; IconButton({}) { Icon(Icons.Default.Mic, "Voice prompt") }; OutlinedTextField(agent.composer, agent::updateComposer, Modifier.weight(1f), placeholder = { Text("Ask iQForge…") }, singleLine = true); IconButton(send, enabled = agent.composer.isNotBlank() && !agent.sending) { Icon(Icons.AutoMirrored.Filled.Send, "Send", tint = MaterialTheme.colorScheme.primary) } } }
 
 @Composable private fun RepositoryDrawer(state: WorkspaceUiState, workspace: WorkspaceViewModel, agent: AgentViewModel, appearance: Appearance, onAppearanceChange: (Appearance) -> Unit, close: () -> Unit) = Surface(color = MaterialTheme.colorScheme.surface, modifier = Modifier.width(330.dp).fillMaxSize()) { Column(Modifier.padding(16.dp)) {
     Row(verticalAlignment = Alignment.CenterVertically) { Text("Repository", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f)); IconButton(close) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Close drawer") } }
