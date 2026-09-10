@@ -1,9 +1,12 @@
 package com.iqforge
 
 import android.os.Bundle
+import android.content.Context
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -14,9 +17,13 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -26,11 +33,69 @@ import com.iqforge.workspace.WorkspaceEntry
 import com.iqforge.workspace.WorkspaceUiState
 import com.iqforge.workspace.WorkspaceViewModel
 
-private val ForgeColors = darkColorScheme(primary = Color(0xFF5B9CFF), background = Color(0xFF141414), surface = Color(0xFF1B1B1B), surfaceVariant = Color(0xFF222222), outline = Color(0xFF373737))
+private val ForgeDarkColors = darkColorScheme(primary = Color(0xFF5B9CFF), background = Color(0xFF141414), surface = Color(0xFF1B1B1B), surfaceVariant = Color(0xFF222222), outline = Color(0xFF373737))
+private val ForgeLightColors = lightColorScheme(primary = Color(0xFF185ABC), background = Color(0xFFFFFBFF), surface = Color(0xFFFFFBFF), surfaceVariant = Color(0xFFE7E0EC))
+
+private enum class Appearance { SYSTEM, LIGHT, DARK }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) = super.onCreate(savedInstanceState).also {
-        setContent { MaterialTheme(colorScheme = ForgeColors) { AgentApp() } }
+        setContent {
+            ForgeTheme { appearance, updateAppearance ->
+                var showSplash by remember { mutableStateOf(true) }
+                if (showSplash) LaunchSplash { showSplash = false }
+                else AgentApp(appearance = appearance, onAppearanceChange = updateAppearance)
+            }
+        }
+    }
+}
+
+@Composable private fun LaunchSplash(onFinished: () -> Unit) {
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(1100)
+        onFinished()
+    }
+    Surface(color = MaterialTheme.colorScheme.background, modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(horizontal = 40.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Image(
+                painter = painterResource(R.drawable.iqforge_logo),
+                contentDescription = "iQForge",
+                modifier = Modifier.fillMaxWidth(),
+                contentScale = ContentScale.Fit
+            )
+            Spacer(Modifier.height(22.dp))
+            Text("CODE ON THE GO", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onBackground)
+            Text("v0.1", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onBackground.copy(alpha = .62f), modifier = Modifier.padding(top = 6.dp))
+            Spacer(Modifier.height(72.dp))
+            Text("Powered by", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onBackground.copy(alpha = .58f))
+            Surface(color = Color.White, shape = RoundedCornerShape(6.dp), modifier = Modifier.padding(top = 7.dp)) {
+                Image(
+                    painter = painterResource(R.drawable.iqoo_logo),
+                    contentDescription = "iQOO",
+                    modifier = Modifier.width(88.dp).height(28.dp).padding(horizontal = 8.dp, vertical = 6.dp),
+                    contentScale = ContentScale.Fit
+                )
+            }
+        }
+    }
+}
+
+@Composable private fun ForgeTheme(content: @Composable (Appearance, (Appearance) -> Unit) -> Unit) {
+    val context = LocalContext.current
+    val preferences = remember { context.getSharedPreferences("iqforge_settings", Context.MODE_PRIVATE) }
+    var appearance by rememberSaveable {
+        mutableStateOf(runCatching { Appearance.valueOf(preferences.getString("appearance", Appearance.SYSTEM.name) ?: Appearance.SYSTEM.name) }.getOrDefault(Appearance.SYSTEM))
+    }
+    val dark = when (appearance) { Appearance.SYSTEM -> isSystemInDarkTheme(); Appearance.LIGHT -> false; Appearance.DARK -> true }
+    MaterialTheme(colorScheme = if (dark) ForgeDarkColors else ForgeLightColors) {
+        content(appearance) { value ->
+            appearance = value
+            preferences.edit().putString("appearance", value.name).apply()
+        }
     }
 }
 
@@ -62,7 +127,12 @@ class AgentViewModel : ViewModel() {
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun AgentApp(workspace: WorkspaceViewModel = viewModel(), agent: AgentViewModel = viewModel()) {
+@Composable private fun AgentApp(
+    appearance: Appearance,
+    onAppearanceChange: (Appearance) -> Unit,
+    workspace: WorkspaceViewModel = viewModel(),
+    agent: AgentViewModel = viewModel()
+) {
     val state by workspace.state
     var drawerOpen by remember { mutableStateOf(false) }
     state.repo?.let { agent.showClone(it.name) }
@@ -76,7 +146,7 @@ class AgentViewModel : ViewModel() {
         bottomBar = { Composer(agent) }
     ) { padding ->
         Row(Modifier.fillMaxSize().padding(padding)) {
-            if (drawerOpen) RepositoryDrawer(state, workspace, agent) { drawerOpen = false }
+            if (drawerOpen) RepositoryDrawer(state, workspace, agent, appearance, onAppearanceChange) { drawerOpen = false }
             Feed(Modifier.weight(1f), agent, state)
         }
     }
@@ -108,12 +178,20 @@ class AgentViewModel : ViewModel() {
 
 @Composable private fun Composer(agent: AgentViewModel) = Surface(color = MaterialTheme.colorScheme.background, shadowElevation = 8.dp) { Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) { IconButton({}) { Icon(Icons.Default.CameraAlt, "Attach code from camera") }; IconButton({}) { Icon(Icons.Default.Mic, "Voice prompt") }; OutlinedTextField(agent.composer, agent::updateComposer, Modifier.weight(1f), placeholder = { Text("Ask iQForge…") }, singleLine = true); IconButton(agent::send, enabled = agent.composer.isNotBlank() && !agent.sending) { Icon(Icons.AutoMirrored.Filled.Send, "Send", tint = MaterialTheme.colorScheme.primary) } } }
 
-@Composable private fun RepositoryDrawer(state: WorkspaceUiState, workspace: WorkspaceViewModel, agent: AgentViewModel, close: () -> Unit) = Surface(color = MaterialTheme.colorScheme.surface, modifier = Modifier.width(330.dp).fillMaxSize()) { Column(Modifier.padding(16.dp)) {
+@Composable private fun RepositoryDrawer(state: WorkspaceUiState, workspace: WorkspaceViewModel, agent: AgentViewModel, appearance: Appearance, onAppearanceChange: (Appearance) -> Unit, close: () -> Unit) = Surface(color = MaterialTheme.colorScheme.surface, modifier = Modifier.width(330.dp).fillMaxSize()) { Column(Modifier.padding(16.dp)) {
     Row(verticalAlignment = Alignment.CenterVertically) { Text("Repository", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f)); IconButton(close) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Close drawer") } }
     if (state.repo == null) ClonePanel(state, workspace) else FilePanel(state, workspace)
     Spacer(Modifier.height(12.dp)); OutlinedTextField(agent.bridgeUrl, agent::updateBridgeUrl, Modifier.fillMaxWidth(), label = { Text("Laptop bridge URL") }, singleLine = true)
     Text("Use http://<laptop-ip>:8000. Calls handle loading, timeout, retry, and offline states when the bridge is available.", style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 6.dp), color = MaterialTheme.colorScheme.onSurface.copy(alpha = .65f))
     TextButton(agent::retry) { Text("Retry bridge connection") }
+    Text("Appearance", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 12.dp))
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        Appearance.entries.forEach { choice ->
+            TextButton(onClick = { onAppearanceChange(choice) }, modifier = Modifier.weight(1f)) {
+                Text(if (appearance == choice) "✓ ${choice.name.lowercase().replaceFirstChar { it.uppercase() }}" else choice.name.lowercase().replaceFirstChar { it.uppercase() })
+            }
+        }
+    }
 } }
 
 @Composable private fun ClonePanel(state: WorkspaceUiState, workspace: WorkspaceViewModel) = Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { OutlinedTextField(state.repoUrl, workspace::updateRepoUrl, Modifier.fillMaxWidth(), label = { Text("Repository URL") }, singleLine = true); OutlinedTextField(state.githubUsername, workspace::updateUsername, Modifier.fillMaxWidth(), label = { Text("GitHub username (optional)") }, singleLine = true); OutlinedTextField(state.githubToken, workspace::updateToken, Modifier.fillMaxWidth(), label = { Text("Token (private repos)") }, visualTransformation = PasswordVisualTransformation(), singleLine = true); Button(workspace::cloneRepository, enabled = state.repoUrl.isNotBlank() && !state.busy, modifier = Modifier.fillMaxWidth()) { Text(if (state.busy) state.operation else "Clone to phone") }; state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) } }
