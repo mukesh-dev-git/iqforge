@@ -52,6 +52,15 @@ open class LaptopBridgeClient(
         }
     }
 
+    suspend fun planDispatch(laptopUrl: String, instruction: String, cwd: String): DispatchPlan = request(
+        laptopUrl = laptopUrl,
+        endpoint = "dispatch/plan",
+        body = json.encodeToString(DispatchPlanRequest.serializer(), DispatchPlanRequest(instruction, cwd))
+    ) { response -> json.decodeFromString(DispatchPlan.serializer(), response) }
+
+    suspend fun dispatchWorkspaces(laptopUrl: String): List<String> =
+        json.decodeFromString(DispatchWorkspacesResponse.serializer(), get(laptopUrl, "dispatch/workspaces")).workspaces
+
     open suspend fun search(
         laptopUrl: String,
         query: String,
@@ -133,6 +142,14 @@ enum class BridgeTask(val wireName: String) {
 data class ExecResult(val stdout: String, val stderr: String, val exitCode: Int)
 
 @Serializable
+data class DispatchPlan(
+    val summary: String,
+    val command: String? = null,
+    val cwd: String,
+    val executable: Boolean
+)
+
+@Serializable
 data class WebSearchResult(val title: String, val url: String, val snippet: String)
 
 data class BridgeHealth(
@@ -180,6 +197,12 @@ private data class ExecResponse(
     val stderr: String,
     @kotlinx.serialization.SerialName("exit_code") val exitCode: Int
 )
+
+@Serializable
+private data class DispatchPlanRequest(val instruction: String, val cwd: String)
+
+@Serializable
+private data class DispatchWorkspacesResponse(val workspaces: List<String>)
 
 @Serializable
 private data class WebSearchRequest(

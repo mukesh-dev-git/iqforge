@@ -29,6 +29,7 @@ import time
 import logging
 import subprocess
 import platform
+import shlex
 from pathlib import Path
 import requests
 import html
@@ -43,10 +44,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 BACKEND = os.environ.get("REVIEW_BACKEND", "ollama")
-ALLOWED_EXEC_ROOTS = [
+_configured_exec_roots = [
     os.path.abspath(p.strip()) for p in os.environ.get("ALLOWED_EXEC_ROOTS", "").split(",") if p.strip()
 ]
+ALLOWED_EXEC_ROOTS = _configured_exec_roots or [str(Path(__file__).resolve().parent.parent)]
 EXEC_TIMEOUT = int(os.environ.get("EXEC_TIMEOUT", "60"))
+ALLOWED_EXECUTABLES = {
+    "git", "gh", "rg", "python", "python.exe", "pytest", "gradle", "gradle.bat",
+    "gradlew", "gradlew.bat", "npm", "npm.cmd", "npx", "npx.cmd", "node", "node.exe",
+}
 
 app = FastAPI(title="iQOO Code Review Bridge", version="1.0.0")
 
@@ -158,6 +164,22 @@ class ExecResponse(BaseModel):
     stdout: str
     stderr: str
     exit_code: int
+
+
+class DispatchPlanRequest(BaseModel):
+    instruction: str
+    cwd: str
+
+
+class DispatchPlanResponse(BaseModel):
+    summary: str
+    command: str | None
+    cwd: str
+    executable: bool
+
+
+class DispatchWorkspacesResponse(BaseModel):
+    workspaces: list[str]
 
 
 class WebSearchRequest(BaseModel):
@@ -279,9 +301,6 @@ def parse_findings(raw_text: str) -> list[Finding]:
 
 
 def is_safe_path(requested_cwd: str) -> bool:
-    if not ALLOWED_EXEC_ROOTS:
-        return True # For testing, if none specified, allow any. Wait, the plan said "By default, I will set it to only allow execution within the user's workspace/temp directories." We should just warn if empty and allow, or enforce it. Since it's a hackathon, if empty we allow but log a warning.
-    
     try:
         requested_path = Path(requested_cwd).resolve()
         for root in ALLOWED_EXEC_ROOTS:
@@ -291,6 +310,38 @@ def is_safe_path(requested_cwd: str) -> bool:
         return False
     except Exception:
         return False
+
+
+def command_arguments(command: str) -> list[str]:
+    """Parse a command without a shell and enforce the developer-tool allowlist."""
+    try:
+        arguments = shlex.split(command, posix=True)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=f"Invalid command quoting: {error}")
+    if not arguments:
+        raise HTTPException(status_code=400, detail="Command must not be empty")
+    executable = Path(arguments[0]).name.lower()
+    if executable not in ALLOWED_EXECUTABLES:
+        raise HTTPException(status_code=403, detail=f"Executable is not allowed for Dispatch: {executable}")
+    return arguments
+
+
+def parse_dispatch_plan(raw: str, cwd: str) -> DispatchPlanResponse:
+    cleaned = raw.strip().removeprefix("```json").removesuffix("```").strip()
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return DispatchPlanResponse(summary=raw.strip(), command=None, cwd=cwd, executable=False)
+    summary = str(payload.get("summary") or "Dispatch plan ready").strip()
+    command = str(payload.get("command") or "").strip() or None
+    executable = False
+    if command:
+        try:
+            command_arguments(command)
+            executable = True
+        except HTTPException:
+            command = None
+    return DispatchPlanResponse(summary=summary, command=command, cwd=cwd, executable=executable)
 
 
 def search_web(query: str, max_results: int = 5) -> list[WebSearchResult]:
@@ -475,15 +526,17 @@ def execute_command(req: ExecRequest) -> ExecResponse:
     if not cwd_path.exists() or not cwd_path.is_dir():
         raise HTTPException(status_code=400, detail=f"Invalid or non-existent directory: {req.cwd}")
 
-    if ALLOWED_EXEC_ROOTS and not is_safe_path(req.cwd):
+    if not is_safe_path(req.cwd):
         raise HTTPException(status_code=403, detail="Execution restricted: requested cwd is not in ALLOWED_EXEC_ROOTS")
+
+    arguments = command_arguments(req.command)
 
     log.info("Exec request — cwd: %s, command: %s", req.cwd, req.command)
     
     # Process tree termination logic
     kwargs = {
         "cwd": str(cwd_path),
-        "shell": True,
+        "shell": False,
         "capture_output": True,
         "text": True,
         "timeout": EXEC_TIMEOUT
@@ -495,7 +548,7 @@ def execute_command(req: ExecRequest) -> ExecResponse:
         kwargs["start_new_session"] = True
 
     try:
-        result = subprocess.run(req.command, **kwargs)
+        result = subprocess.run(arguments, **kwargs)
         return ExecResponse(
             stdout=result.stdout,
             stderr=result.stderr,
@@ -509,6 +562,32 @@ def execute_command(req: ExecRequest) -> ExecResponse:
     except Exception as e:
         log.error("Execution failed: %s", str(e))
         raise HTTPException(status_code=500, detail=f"Execution failed: {str(e)}")
+
+
+@app.post("/dispatch/plan", response_model=DispatchPlanResponse)
+def dispatch_plan(req: DispatchPlanRequest) -> DispatchPlanResponse:
+    instruction = req.instruction.strip()
+    if not instruction:
+        raise HTTPException(status_code=400, detail="Instruction must not be empty")
+    if not is_safe_path(req.cwd):
+        raise HTTPException(status_code=403, detail="Dispatch is restricted to configured workspace roots")
+    prompt = f"""You are planning one safe developer-tool action on a laptop.
+Return strict JSON with keys summary and command. command may use only git, gh, rg, python,
+pytest, gradle/gradlew, npm/npx, or node. Never use a shell, redirection, pipes, command
+substitution, deletion, privilege changes, downloads, or package installation. If the request
+cannot be handled safely with one read/build/test command, set command to null and explain why.
+
+Working directory: {req.cwd}
+User request: {instruction}
+"""
+    return parse_dispatch_plan(run_backend(prompt), str(Path(req.cwd).resolve()))
+
+
+@app.get("/dispatch/workspaces", response_model=DispatchWorkspacesResponse)
+def dispatch_workspaces() -> DispatchWorkspacesResponse:
+    return DispatchWorkspacesResponse(
+        workspaces=[str(Path(root).resolve()) for root in ALLOWED_EXEC_ROOTS if Path(root).is_dir()]
+    )
 
 
 @app.post("/search", response_model=WebSearchResponse)

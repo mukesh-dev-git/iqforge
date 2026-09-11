@@ -9,6 +9,7 @@ import android.Manifest
 import android.net.Uri
 import android.provider.Settings
 import android.speech.RecognizerIntent
+import android.speech.tts.TextToSpeech
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.lifecycle.AndroidViewModel
 import androidx.activity.ComponentActivity
@@ -73,6 +74,9 @@ import com.iqforge.chat.SavedChat
 import com.iqforge.cowork.CoworkStatus
 import com.iqforge.cowork.CoworkTask
 import com.iqforge.cowork.CoworkTaskStore
+import com.iqforge.dispatch.DispatchRecord
+import com.iqforge.dispatch.DispatchStatus
+import com.iqforge.dispatch.DispatchStore
 import com.iqforge.engine.OfflineEngine
 import kotlinx.coroutines.launch
 import com.iqforge.workspace.WorkspaceEntry
@@ -99,7 +103,7 @@ private val ForgeLightColors = lightColorScheme(primary = Color(0xFF185ABC), bac
 
 private enum class Appearance { SYSTEM, LIGHT, DARK }
 private enum class FontChoice { DEFAULT, SERIF, MONOSPACE }
-private enum class AppDestination { CHATS, COWORK, PROJECTS, CODE, ARTIFACTS, SETTINGS }
+private enum class AppDestination { CHATS, DISPATCH, COWORK, PROJECTS, PROJECT_DETAIL, CODE, ARTIFACTS, SETTINGS }
 private enum class SettingsDialog { NONE, USAGE, CAPABILITIES, COLOR, FONT, VOICE, PRIVACY, DEVICE }
 
 class MainActivity : ComponentActivity() {
@@ -288,6 +292,7 @@ class AgentViewModel(
 ) : ViewModel() {
     private val historyStore = preferences?.let(::ChatHistoryStore)
     private val coworkStore = preferences?.let(::CoworkTaskStore)
+    private val dispatchStore = preferences?.let(::DispatchStore)
     var composer by mutableStateOf(""); private set
     var bridgeUrl by mutableStateOf(preferences?.getString("bridge_url", DEFAULT_BRIDGE_URL) ?: DEFAULT_BRIDGE_URL); private set
     var sending by mutableStateOf(false); private set
@@ -317,6 +322,10 @@ class AgentViewModel(
     var activeChatId by mutableStateOf<String?>(null); private set
     var incognito by mutableStateOf(false); private set
     var coworkTasks by mutableStateOf<List<CoworkTask>>(coworkStore?.markInterrupted().orEmpty()); private set
+    var dispatchRecords by mutableStateOf<List<DispatchRecord>>(dispatchStore?.load().orEmpty()); private set
+    var dispatchWorkspaces by mutableStateOf<List<String>>(emptyList()); private set
+    var dispatchBusy by mutableStateOf(false); private set
+    var dispatchError by mutableStateOf<String?>(null); private set
 
     companion object {
         private const val DEFAULT_BRIDGE_URL = "http://10.0.2.2:8000"
@@ -402,6 +411,68 @@ class AgentViewModel(
 
     fun removeCoworkTask(id: String) {
         coworkTasks = coworkStore?.remove(id).orEmpty()
+    }
+
+    fun refreshDispatchWorkspaces() {
+        viewModelScope.launch {
+            dispatchWorkspaces = runCatching { bridgeClient.dispatchWorkspaces(bridgeUrl) }
+                .onFailure { dispatchError = it.message }
+                .getOrDefault(emptyList())
+        }
+    }
+
+    fun planDispatch(instruction: String, cwd: String) {
+        if (instruction.isBlank() || cwd.isBlank() || dispatchBusy) return
+        val store = dispatchStore ?: return
+        dispatchBusy = true
+        dispatchError = null
+        viewModelScope.launch {
+            try {
+                val plan = bridgeClient.planDispatch(bridgeUrl, instruction.trim(), cwd)
+                dispatchRecords = store.add(
+                    DispatchRecord(
+                        id = "dispatch-${System.currentTimeMillis()}",
+                        instruction = instruction.trim(),
+                        summary = plan.summary,
+                        command = plan.command,
+                        cwd = plan.cwd,
+                        executable = plan.executable
+                    )
+                )
+            } catch (error: Exception) {
+                dispatchError = error.message ?: "Dispatch planning failed"
+            } finally {
+                dispatchBusy = false
+            }
+        }
+    }
+
+    fun executeDispatch(record: DispatchRecord) {
+        val command = record.command ?: return
+        val store = dispatchStore ?: return
+        if (!record.executable || dispatchBusy) return
+        dispatchBusy = true
+        dispatchError = null
+        dispatchRecords = store.update(record.id) { it.copy(status = DispatchStatus.RUNNING) }
+        viewModelScope.launch {
+            try {
+                val result = bridgeClient.execute(bridgeUrl, command, record.cwd)
+                dispatchRecords = store.update(record.id) {
+                    it.copy(
+                        status = if (result.exitCode == 0) DispatchStatus.COMPLETED else DispatchStatus.FAILED,
+                        stdout = result.stdout,
+                        stderr = result.stderr,
+                        exitCode = result.exitCode
+                    )
+                }
+            } catch (error: Exception) {
+                dispatchRecords = store.update(record.id) {
+                    it.copy(status = DispatchStatus.FAILED, stderr = error.message ?: "Execution failed")
+                }
+            } finally {
+                dispatchBusy = false
+            }
+        }
     }
 
     fun openChat(id: String) {
@@ -737,8 +808,11 @@ class AgentViewModel(
     val settingsPreferences = remember { context.getSharedPreferences("iqforge_settings", Context.MODE_PRIVATE) }
     var hapticEnabled by rememberSaveable { mutableStateOf(settingsPreferences.getBoolean("haptic_feedback", true)) }
     var voiceLanguage by rememberSaveable { mutableStateOf(settingsPreferences.getString("voice_language", Locale.getDefault().toLanguageTag()) ?: Locale.getDefault().toLanguageTag()) }
+    var voiceName by rememberSaveable { mutableStateOf(settingsPreferences.getString("tts_voice", "").orEmpty()) }
+    var voicePace by rememberSaveable { mutableStateOf(settingsPreferences.getFloat("voice_pace", 1f)) }
     var navigationOpen by remember { mutableStateOf(false) }
     var destination by rememberSaveable { mutableStateOf(AppDestination.CHATS) }
+    var selectedProjectName by rememberSaveable { mutableStateOf<String?>(null) }
     var showAddToChat by rememberSaveable { mutableStateOf(false) }
     var showToolAccess by rememberSaveable { mutableStateOf(false) }
     var showConnectors by rememberSaveable { mutableStateOf(false) }
@@ -790,7 +864,10 @@ class AgentViewModel(
             audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
-    LaunchedEffect(Unit) { agent.refreshServices() }
+    LaunchedEffect(Unit) {
+        agent.refreshServices()
+        agent.refreshDispatchWorkspaces()
+    }
     state.repo?.let { agent.showClone(it.name) }
     if (state.selectedFile != null) { EditorScreen(state, workspace); return }
     Scaffold(
@@ -821,17 +898,31 @@ class AgentViewModel(
         Box(Modifier.fillMaxSize().padding(padding)) {
             when (destination) {
                 AppDestination.CHATS -> Feed(Modifier.fillMaxSize(), agent, state)
+                AppDestination.DISPATCH -> DispatchPage(agent)
                 AppDestination.COWORK -> CoworkPage(agent, state) { showCreateTask = true }
                 AppDestination.PROJECTS -> ProjectsPage(
                     state = state,
                     workspace = workspace,
                     onOpen = {
                         workspace.selectRepository(it)
-                        destination = AppDestination.CODE
+                        selectedProjectName = it
+                        destination = AppDestination.PROJECT_DETAIL
                     },
                     onNew = {
                         showCreateProject = true
                     }
+                )
+                AppDestination.PROJECT_DETAIL -> ProjectDetailPage(
+                    name = selectedProjectName,
+                    state = state,
+                    workspace = workspace,
+                    agent = agent,
+                    onArtifacts = { destination = AppDestination.ARTIFACTS },
+                    onNewChat = {
+                        agent.newChat()
+                        destination = AppDestination.CHATS
+                    },
+                    onBack = { destination = AppDestination.PROJECTS }
                 )
                 AppDestination.CODE -> CodeSessionsPage(
                     state = state,
@@ -994,6 +1085,8 @@ class AgentViewModel(
             appearance = appearance,
             fontChoice = fontChoice,
             voiceLanguage = voiceLanguage,
+            voiceName = voiceName,
+            voicePace = voicePace,
             agent = agent,
             workspace = state,
             onAppearance = onAppearanceChange,
@@ -1001,6 +1094,14 @@ class AgentViewModel(
             onVoiceLanguage = {
                 voiceLanguage = it
                 settingsPreferences.edit().putString("voice_language", it).apply()
+            },
+            onVoiceName = {
+                voiceName = it
+                settingsPreferences.edit().putString("tts_voice", it).apply()
+            },
+            onVoicePace = {
+                voicePace = it
+                settingsPreferences.edit().putFloat("voice_pace", it).apply()
             },
             onStartVoice = startVoiceInput,
             onDismiss = { settingsDialog = SettingsDialog.NONE }
@@ -1759,6 +1860,7 @@ class AgentViewModel(
                     }
                 }
                 item { NavigationItem("Chats", Icons.Default.Forum) { onDestination(AppDestination.CHATS) } }
+                item { NavigationItem("Dispatch", Icons.Default.Terminal) { onDestination(AppDestination.DISPATCH) } }
                 item { NavigationItem("Cowork", Icons.Default.TaskAlt) { onDestination(AppDestination.COWORK) } }
                 item { NavigationItem("Projects", Icons.Default.Inventory2) { onDestination(AppDestination.PROJECTS) } }
                 item { NavigationItem("Code", Icons.Default.Code) { onDestination(AppDestination.CODE) } }
@@ -1852,6 +1954,236 @@ class AgentViewModel(
     )
 }
 
+@Composable private fun DispatchPage(agent: AgentViewModel) {
+    var instruction by rememberSaveable { mutableStateOf("") }
+    var selectedWorkspace by rememberSaveable(agent.dispatchWorkspaces) {
+        mutableStateOf(agent.dispatchWorkspaces.firstOrNull().orEmpty())
+    }
+    var workspaceMenu by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxSize().padding(horizontal = 22.dp)) {
+        Text("Dispatch", style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 14.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.weight(1f)) {
+                TextButton(onClick = { workspaceMenu = true }, enabled = agent.dispatchWorkspaces.isNotEmpty()) {
+                    Icon(Icons.Default.Folder, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(selectedWorkspace.ifBlank { "No bridge workspace available" }, maxLines = 1)
+                    Icon(Icons.Default.ArrowDropDown, null)
+                }
+                DropdownMenu(expanded = workspaceMenu, onDismissRequest = { workspaceMenu = false }) {
+                    agent.dispatchWorkspaces.forEach { root ->
+                        DropdownMenuItem(
+                            text = { Text(root, maxLines = 1) },
+                            onClick = {
+                                selectedWorkspace = root
+                                workspaceMenu = false
+                            }
+                        )
+                    }
+                }
+            }
+            IconButton(agent::refreshDispatchWorkspaces) { Icon(Icons.Default.Refresh, "Refresh workspaces") }
+        }
+        if (agent.dispatchRecords.isEmpty()) {
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text(
+                    if (selectedWorkspace.isBlank()) "Connect the laptop bridge to discover an allowed workspace."
+                    else "Describe one code search, Git, build, or test action. IQF will create a safe plan for your approval.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                )
+            }
+        } else {
+            LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                items(agent.dispatchRecords, key = { it.id }) { record ->
+                    ElevatedCard(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(record.instruction, style = MaterialTheme.typography.titleMedium)
+                            Text(record.summary, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            record.command?.let {
+                                Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(8.dp)) {
+                                    Text(it, Modifier.fillMaxWidth().padding(10.dp), fontFamily = FontFamily.Monospace)
+                                }
+                            }
+                            if (record.stdout.isNotBlank()) Text(record.stdout.take(4_000), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                            if (record.stderr.isNotBlank()) Text(record.stderr.take(2_000), color = MaterialTheme.colorScheme.error, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(record.status.name.lowercase().replaceFirstChar { it.uppercase() }, color = MaterialTheme.colorScheme.primary, modifier = Modifier.weight(1f))
+                                if (record.status == DispatchStatus.PLANNED && record.executable) {
+                                    Button(onClick = { agent.executeDispatch(record) }, enabled = !agent.dispatchBusy) {
+                                        Icon(Icons.Default.PlayArrow, null)
+                                        Text("Run approved command")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        agent.dispatchError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+        OutlinedTextField(
+            instruction,
+            { instruction = it },
+            Modifier.fillMaxWidth().padding(vertical = 8.dp),
+            placeholder = { Text("Ask IQF to search, build, test, or inspect") },
+            maxLines = 3
+        )
+        Button(
+            onClick = {
+                agent.planDispatch(instruction, selectedWorkspace)
+                instruction = ""
+            },
+            enabled = instruction.isNotBlank() && selectedWorkspace.isNotBlank() && !agent.dispatchBusy,
+            modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp)
+        ) { Text(if (agent.dispatchBusy) "Working…" else "Create safe plan") }
+    }
+}
+
+@Composable private fun ProjectDetailPage(
+    name: String?,
+    state: WorkspaceUiState,
+    workspace: WorkspaceViewModel,
+    agent: AgentViewModel,
+    onArtifacts: () -> Unit,
+    onNewChat: () -> Unit,
+    onBack: () -> Unit
+) {
+    val repo = state.repositories.firstOrNull { it.name == name }
+    if (repo == null) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Project is no longer available") }
+        return
+    }
+    val metadata = state.projectMetadata[repo.name] ?: com.iqforge.workspace.ProjectMetadata(repo.name)
+    val projectTasks = agent.coworkTasks.filter { it.repository == repo.name }
+    var menuOpen by remember { mutableStateOf(false) }
+    var editing by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
+    var description by remember(metadata.description) { mutableStateOf(metadata.description) }
+    var instructions by remember(metadata.instructions) { mutableStateOf(metadata.instructions) }
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(Modifier.fillMaxSize().padding(horizontal = 22.dp), contentPadding = PaddingValues(bottom = 100.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            item {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back to projects") }
+                    Spacer(Modifier.weight(1f))
+                    Box {
+                        IconButton(onClick = { menuOpen = true }) { Icon(Icons.Default.MoreVert, "Project actions") }
+                        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                            DropdownMenuItem(
+                                text = { Text(if (repo.name in state.pinnedRepositoryNames) "Unpin" else "Pin") },
+                                leadingIcon = { Icon(Icons.Default.PushPin, null) },
+                                onClick = { workspace.togglePinned(repo.name); menuOpen = false }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Edit details") },
+                                leadingIcon = { Icon(Icons.Default.Edit, null) },
+                                onClick = { editing = true; menuOpen = false }
+                            )
+                            DropdownMenuItem(
+                                text = { Text(if (metadata.archived) "Restore" else "Archive") },
+                                leadingIcon = { Icon(Icons.Default.Archive, null) },
+                                onClick = { workspace.toggleArchived(repo.name); menuOpen = false; onBack() }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Delete", color = MaterialTheme.colorScheme.error) },
+                                leadingIcon = { Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error) },
+                                onClick = { confirmDelete = true; menuOpen = false }
+                            )
+                        }
+                    }
+                }
+            }
+            item { Text(repo.name, style = MaterialTheme.typography.displaySmall) }
+            item {
+                AssistChip(
+                    onClick = {},
+                    label = { Text("Local Git repository") },
+                    leadingIcon = { Icon(Icons.Default.Lock, null) }
+                )
+            }
+            item {
+                ElevatedCard(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text("Memory", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            metadata.description.ifBlank { "No project memory has been added." },
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+            item {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    ElevatedCard(onClick = onArtifacts, modifier = Modifier.weight(1f)) {
+                        Column(Modifier.padding(16.dp)) {
+                            Text("Project knowledge", style = MaterialTheme.typography.titleSmall)
+                            Text("${state.artifacts.size} readable files", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                    ElevatedCard(onClick = { editing = true }, modifier = Modifier.weight(1f)) {
+                        Column(Modifier.padding(16.dp)) {
+                            Text("Custom instructions", style = MaterialTheme.typography.titleSmall)
+                            Text(if (metadata.instructions.isBlank()) "Add instructions" else "Configured", color = MaterialTheme.colorScheme.primary)
+                        }
+                    }
+                }
+            }
+            if (projectTasks.isEmpty()) {
+                item { Text("No Cowork tasks are linked to this project yet.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 22.dp)) }
+            } else {
+                items(projectTasks, key = { "project-task-${it.id}" }) { task ->
+                    ElevatedCard(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(16.dp)) {
+                            Text(task.title, style = MaterialTheme.typography.titleMedium)
+                            Text(task.status.name.lowercase(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            task.result?.let { Text(it.take(240), maxLines = 4, modifier = Modifier.padding(top = 8.dp)) }
+                        }
+                    }
+                }
+            }
+        }
+        Button(onClick = onNewChat, modifier = Modifier.align(Alignment.BottomEnd).padding(22.dp)) {
+            Icon(Icons.Default.Add, null)
+            Text("New chat")
+        }
+    }
+    if (editing) {
+        AlertDialog(
+            onDismissRequest = { editing = false },
+            title = { Text("Edit ${repo.name}") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedTextField(description, { description = it }, label = { Text("Memory and purpose") }, minLines = 3)
+                    OutlinedTextField(instructions, { instructions = it }, label = { Text("Custom model instructions") }, minLines = 3)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    workspace.updateProjectDetails(repo.name, description, instructions)
+                    editing = false
+                }) { Text("Save") }
+            },
+            dismissButton = { TextButton(onClick = { editing = false }) { Text("Cancel") } }
+        )
+    }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Delete ${repo.name}?") },
+            text = { Text("This removes the repository and its local files from this device. This cannot be undone.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    workspace.deleteRepository(repo.name)
+                    confirmDelete = false
+                    onBack()
+                }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } }
+        )
+    }
+}
+
 @Composable private fun ProjectsPage(
     state: WorkspaceUiState,
     workspace: WorkspaceViewModel,
@@ -1860,10 +2192,16 @@ class AgentViewModel(
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     val repositories = state.repositories
+        .filter { state.showArchivedProjects || state.projectMetadata[it.name]?.archived != true }
         .filter { it.name.contains(query, ignoreCase = true) }
         .sortedWith(compareByDescending<com.iqforge.git.Repo> { it.name in state.pinnedRepositoryNames }.thenBy { it.name.lowercase() })
     Column(Modifier.fillMaxSize().padding(horizontal = 22.dp)) {
-        Text("Projects", style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 14.dp, bottom = 20.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Projects", style = MaterialTheme.typography.displaySmall, modifier = Modifier.weight(1f).padding(top = 14.dp, bottom = 20.dp))
+            IconButton(onClick = { workspace.setShowArchived(!state.showArchivedProjects) }) {
+                Icon(if (state.showArchivedProjects) Icons.Default.Inventory2 else Icons.Default.FilterList, "Toggle archived projects")
+            }
+        }
         OutlinedTextField(
             value = query,
             onValueChange = { query = it },
@@ -2229,11 +2567,15 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
     appearance: Appearance,
     fontChoice: FontChoice,
     voiceLanguage: String,
+    voiceName: String,
+    voicePace: Float,
     agent: AgentViewModel,
     workspace: WorkspaceUiState,
     onAppearance: (Appearance) -> Unit,
     onFont: (FontChoice) -> Unit,
     onVoiceLanguage: (String) -> Unit,
+    onVoiceName: (String) -> Unit,
+    onVoicePace: (Float) -> Unit,
     onStartVoice: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -2277,27 +2619,15 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                         RadioSetting(choice.name.lowercase().replaceFirstChar { it.uppercase() }, fontChoice == choice) { onFont(choice) }
                     }
                 }
-                SettingsDialog.VOICE -> {
-                    val languages = remember {
-                        Locale.getAvailableLocales().filter { it.language.isNotBlank() }
-                            .distinctBy { it.toLanguageTag() }.sortedBy { it.displayName }.take(80)
-                    }
-                    Column {
-                        Text("Speech input language", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        LazyColumn(Modifier.heightIn(max = 280.dp)) {
-                            items(languages, key = { it.toLanguageTag() }) { locale ->
-                                RadioSetting(locale.displayName, voiceLanguage == locale.toLanguageTag()) {
-                                    onVoiceLanguage(locale.toLanguageTag())
-                                }
-                            }
-                        }
-                        Button(onClick = onStartVoice, modifier = Modifier.fillMaxWidth()) {
-                            Icon(Icons.Default.Mic, null)
-                            Spacer(Modifier.width(8.dp))
-                            Text("Test voice input")
-                        }
-                    }
-                }
+                SettingsDialog.VOICE -> VoiceSettingsContent(
+                    languageTag = voiceLanguage,
+                    voiceName = voiceName,
+                    pace = voicePace,
+                    onLanguage = onVoiceLanguage,
+                    onVoice = onVoiceName,
+                    onPace = onVoicePace,
+                    onTestInput = onStartVoice
+                )
                 SettingsDialog.PRIVACY -> Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text("Chats, task results, preferences, and repositories are stored locally on this device. Incognito chats bypass saved history and memory.")
                     OutlinedButton(onClick = agent::clearMemory, modifier = Modifier.fillMaxWidth()) { Text("Clear memory") }
@@ -2331,6 +2661,103 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
         RadioButton(selected, onClick)
         Text(label)
     }
+
+@Composable private fun VoiceSettingsContent(
+    languageTag: String,
+    voiceName: String,
+    pace: Float,
+    onLanguage: (String) -> Unit,
+    onVoice: (String) -> Unit,
+    onPace: (Float) -> Unit,
+    onTestInput: () -> Unit
+) {
+    val context = LocalContext.current
+    var engine by remember { mutableStateOf<TextToSpeech?>(null) }
+    var installedVoices by remember { mutableStateOf<List<android.speech.tts.Voice>>(emptyList()) }
+    var languageMenu by remember { mutableStateOf(false) }
+    var voiceMenu by remember { mutableStateOf(false) }
+    var paceMenu by remember { mutableStateOf(false) }
+    val locales = remember {
+        Locale.getAvailableLocales().filter { it.language.isNotBlank() }
+            .distinctBy { it.toLanguageTag() }.sortedBy { it.displayName }
+    }
+    val selectedLocale = locales.firstOrNull { it.toLanguageTag() == languageTag } ?: Locale.getDefault()
+    val matchingVoices = installedVoices.filter { it.locale.language == selectedLocale.language }.ifEmpty { installedVoices }
+    DisposableEffect(context) {
+        lateinit var tts: TextToSpeech
+        tts = TextToSpeech(context) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                engine = tts
+                installedVoices = tts.voices.orEmpty().filterNot { it.isNetworkConnectionRequired }.sortedBy { it.name }
+            }
+        }
+        onDispose {
+            tts.stop()
+            tts.shutdown()
+            engine = null
+        }
+    }
+    LaunchedEffect(engine, voiceName, pace, languageTag) {
+        engine?.let { tts ->
+            tts.language = selectedLocale
+            matchingVoices.firstOrNull { it.name == voiceName }?.let { tts.voice = it }
+            tts.setSpeechRate(pace)
+        }
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Box {
+            OutlinedButton(onClick = { languageMenu = true }, modifier = Modifier.fillMaxWidth()) {
+                Text("Language: ${selectedLocale.displayName}", Modifier.weight(1f), maxLines = 1)
+                Icon(Icons.Default.ArrowDropDown, null)
+            }
+            DropdownMenu(expanded = languageMenu, onDismissRequest = { languageMenu = false }, modifier = Modifier.heightIn(max = 360.dp)) {
+                locales.take(120).forEach { locale ->
+                    DropdownMenuItem(text = { Text(locale.displayName) }, onClick = {
+                        onLanguage(locale.toLanguageTag())
+                        languageMenu = false
+                    })
+                }
+            }
+        }
+        Box {
+            OutlinedButton(onClick = { voiceMenu = true }, enabled = matchingVoices.isNotEmpty(), modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    if (matchingVoices.isEmpty()) "Loading installed voices…" else "Voice: ${voiceName.ifBlank { matchingVoices.first().name }}",
+                    Modifier.weight(1f),
+                    maxLines = 1
+                )
+                Icon(Icons.Default.ArrowDropDown, null)
+            }
+            DropdownMenu(expanded = voiceMenu, onDismissRequest = { voiceMenu = false }, modifier = Modifier.heightIn(max = 300.dp)) {
+                matchingVoices.forEach { voice ->
+                    DropdownMenuItem(text = { Text(voice.name, maxLines = 1) }, onClick = {
+                        onVoice(voice.name)
+                        voiceMenu = false
+                    })
+                }
+            }
+        }
+        Box {
+            OutlinedButton(onClick = { paceMenu = true }, modifier = Modifier.fillMaxWidth()) {
+                Text("Pace: ${when (pace) { .75f -> "Slow"; 1.25f -> "Fast"; else -> "Normal" }}", Modifier.weight(1f))
+                Icon(Icons.Default.ArrowDropDown, null)
+            }
+            DropdownMenu(expanded = paceMenu, onDismissRequest = { paceMenu = false }) {
+                listOf("Slow" to .75f, "Normal" to 1f, "Fast" to 1.25f).forEach { (label, value) ->
+                    DropdownMenuItem(text = { Text(label) }, onClick = { onPace(value); paceMenu = false })
+                }
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = { engine?.speak("IQF voice preview is ready", TextToSpeech.QUEUE_FLUSH, null, "iqf-preview") },
+                enabled = engine != null,
+                modifier = Modifier.weight(1f)
+            ) { Text("Preview voice") }
+            OutlinedButton(onClick = onTestInput, modifier = Modifier.weight(1f)) { Text("Test input") }
+        }
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable private fun CreateCoworkTaskSheet(

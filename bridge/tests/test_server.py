@@ -84,10 +84,11 @@ import time
 def test_exec_success():
     with tempfile.TemporaryDirectory() as tmpdir:
         # A harmless command that works cross-platform
-        response = client.post("/exec", json={
-            "command": 'python -c "print(\'hello exec\')"',
-            "cwd": tmpdir
-        })
+        with patch("server.ALLOWED_EXEC_ROOTS", [tmpdir]):
+            response = client.post("/exec", json={
+                "command": 'python -c "print(\'hello exec\')"',
+                "cwd": tmpdir
+            })
         assert response.status_code == 200
         assert "hello exec" in response.json()["stdout"]
         assert response.json()["exit_code"] == 0
@@ -114,7 +115,7 @@ def test_exec_security_restriction():
 
 def test_exec_timeout():
     with tempfile.TemporaryDirectory() as tmpdir:
-        with patch("server.EXEC_TIMEOUT", 1):
+        with patch("server.EXEC_TIMEOUT", 1), patch("server.ALLOWED_EXEC_ROOTS", [tmpdir]):
             # A cross-platform way to sleep for more than 1 second in python
             response = client.post("/exec", json={
                 "command": 'python -c "import time; time.sleep(2)"',
@@ -122,6 +123,27 @@ def test_exec_timeout():
             })
             assert response.status_code == 504
             assert "Execution timed out" in response.json()["detail"]
+
+def test_exec_rejects_non_toolchain_executable():
+    with tempfile.TemporaryDirectory() as tmpdir, patch("server.ALLOWED_EXEC_ROOTS", [tmpdir]):
+        response = client.post("/exec", json={"command": "echo unsafe", "cwd": tmpdir})
+    assert response.status_code == 403
+
+def test_dispatch_plan_returns_validated_real_command():
+    with tempfile.TemporaryDirectory() as tmpdir, patch("server.ALLOWED_EXEC_ROOTS", [tmpdir]), \
+            patch("server.run_backend", return_value='{"summary":"Run tests","command":"pytest -q"}'):
+        response = client.post("/dispatch/plan", json={"instruction": "run tests", "cwd": tmpdir})
+    assert response.status_code == 200
+    assert response.json()["command"] == "pytest -q"
+    assert response.json()["executable"] is True
+
+def test_dispatch_plan_removes_unsafe_model_command():
+    with tempfile.TemporaryDirectory() as tmpdir, patch("server.ALLOWED_EXEC_ROOTS", [tmpdir]), \
+            patch("server.run_backend", return_value='{"summary":"No","command":"powershell rm -r ."}'):
+        response = client.post("/dispatch/plan", json={"instruction": "delete all", "cwd": tmpdir})
+    assert response.status_code == 200
+    assert response.json()["command"] is None
+    assert response.json()["executable"] is False
 
 def test_web_search_returns_grounding_results():
     fake_results = [{
