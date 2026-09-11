@@ -1515,8 +1515,20 @@ class AgentViewModel(
                         Modifier.fillMaxWidth().padding(top = 28.dp, bottom = 20.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("IQF", fontFamily = FontFamily.Serif, fontSize = 30.sp, modifier = Modifier.weight(1f))
-                        IconButton(onIncognito) { Icon(Icons.Default.VisibilityOff, "Start incognito chat") }
+                        Text(
+                            "IQF",
+                            color = MaterialTheme.colorScheme.onSurface,
+                            fontFamily = FontFamily.Serif,
+                            fontSize = 30.sp,
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(onIncognito) {
+                            Icon(
+                                Icons.Default.VisibilityOff,
+                                "Start incognito chat",
+                                tint = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
                     }
                 }
                 item { NavigationItem("Chats", Icons.Default.Forum) { onDestination(AppDestination.CHATS) } }
