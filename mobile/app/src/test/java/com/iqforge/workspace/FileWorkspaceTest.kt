@@ -38,6 +38,22 @@ class FileWorkspaceTest {
         assertEquals("after", workspace.readText(root, file))
     }
 
+    @Test
+    fun artifactsContainOnlyRealSupportedFilesOutsideGitMetadata() {
+        val root = temporaryFolder.newFolder("artifacts")
+        root.resolve(".git").mkdir()
+        root.resolve(".git/config").writeText("secret")
+        root.resolve("src").mkdir()
+        root.resolve("src/Main.kt").writeText("fun main() = Unit")
+        root.resolve("README.md").writeText("# Project")
+        root.resolve("preview.png").writeBytes(byteArrayOf(1, 2, 3))
+
+        val artifacts = workspace.artifactFiles(root)
+
+        assertEquals(listOf("README.md", "src/Main.kt"), artifacts.map { it.relativePath }.sorted())
+        assertTrue(artifacts.all { !it.directory && it.file.exists() })
+    }
+
     @Test(expected = IllegalArgumentException::class)
     fun binaryFileIsRejected() {
         val root = temporaryFolder.newFolder("repo")

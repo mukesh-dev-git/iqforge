@@ -18,6 +18,8 @@ data class WorkspaceUiState(
     val githubToken: String = "",
     val repo: Repo? = null,
     val repositories: List<Repo> = emptyList(),
+    val pinnedRepositoryNames: Set<String> = emptySet(),
+    val artifacts: List<WorkspaceEntry> = emptyList(),
     val entries: List<WorkspaceEntry> = emptyList(),
     val expandedDirectories: Set<String> = emptySet(),
     val selectedFile: WorkspaceEntry? = null,
@@ -34,7 +36,10 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
     private val workspaceRoot = application.filesDir.resolve("repositories")
     private val repoManager = JGitRepoManager(workspaceRoot)
     private val files = FileWorkspace()
-    private val mutableState = mutableStateOf(WorkspaceUiState())
+    private val preferences = application.getSharedPreferences("iqforge_workspace", android.content.Context.MODE_PRIVATE)
+    private val mutableState = mutableStateOf(
+        WorkspaceUiState(pinnedRepositoryNames = preferences.getStringSet("pinned_repositories", emptySet()).orEmpty())
+    )
     val state: State<WorkspaceUiState> = mutableState
 
     init {
@@ -51,7 +56,8 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
                     mutableState.value = mutableState.value.copy(
                         repo = existing,
                         repositories = repositories,
-                        entries = entries
+                        entries = entries,
+                        artifacts = files.artifactFiles(existing.root)
                     )
                 }
             } else withContext(Dispatchers.Main) {
@@ -79,6 +85,7 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
                     .sortedBy { it.name.lowercase() },
                 githubToken = "",
                 entries = files.visibleEntries(repo.root, emptySet()),
+                artifacts = files.artifactFiles(repo.root),
                 message = "Cloned ${repo.name}",
                 error = null
             )
@@ -93,6 +100,7 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
                 mutableState.value = mutableState.value.copy(
                     repo = repo,
                     entries = entries,
+                    artifacts = files.artifactFiles(repo.root),
                     expandedDirectories = emptySet(),
                     selectedFile = null,
                     editorText = "",
@@ -103,6 +111,29 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
             }
         }
     }
+
+    fun startNewRepository() = update {
+        copy(
+            repo = null,
+            entries = emptyList(),
+            artifacts = emptyList(),
+            selectedFile = null,
+            editorText = "",
+            repoUrl = "",
+            message = null,
+            error = null
+        )
+    }
+
+    fun togglePinned(name: String) {
+        val pins = mutableState.value.pinnedRepositoryNames.toMutableSet().apply {
+            if (!add(name)) remove(name)
+        }
+        preferences.edit().putStringSet("pinned_repositories", pins).apply()
+        update { copy(pinnedRepositoryNames = pins) }
+    }
+
+    fun openArtifact(entry: WorkspaceEntry) = openEntry(entry)
 
     fun openEntry(entry: WorkspaceEntry) {
         val repo = mutableState.value.repo ?: return
@@ -198,7 +229,8 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
 
     private suspend fun refreshFiles(repo: Repo) = withContext(Dispatchers.Main) {
         mutableState.value = mutableState.value.copy(
-            entries = files.visibleEntries(repo.root, mutableState.value.expandedDirectories)
+            entries = files.visibleEntries(repo.root, mutableState.value.expandedDirectories),
+            artifacts = files.artifactFiles(repo.root)
         )
     }
 

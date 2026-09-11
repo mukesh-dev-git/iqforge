@@ -54,6 +54,8 @@ import com.iqforge.bridge.BridgeModel
 import com.iqforge.chat.AttachmentKind
 import com.iqforge.chat.ChatAttachment
 import com.iqforge.chat.ChatAttachmentService
+import com.iqforge.chat.ChatHistoryStore
+import com.iqforge.chat.SavedChat
 import com.iqforge.engine.OfflineEngine
 import kotlinx.coroutines.launch
 import com.iqforge.workspace.WorkspaceEntry
@@ -61,6 +63,9 @@ import com.iqforge.workspace.WorkspaceUiState
 import com.iqforge.workspace.WorkspaceViewModel
 import java.io.IOException
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 private val IqfCoral = Color(0xFFDA7756)
 private val ForgeDarkColors = darkColorScheme(
@@ -76,6 +81,7 @@ private val ForgeDarkColors = darkColorScheme(
 private val ForgeLightColors = lightColorScheme(primary = Color(0xFF185ABC), background = Color(0xFFFFFBFF), surface = Color(0xFFFFFBFF), surfaceVariant = Color(0xFFE7E0EC))
 
 private enum class Appearance { SYSTEM, LIGHT, DARK }
+private enum class AppDestination { CHATS, PROJECTS, CODE, ARTIFACTS }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) = super.onCreate(savedInstanceState).also {
@@ -209,6 +215,7 @@ class AgentViewModel(
     private val preferences: android.content.SharedPreferences? = null,
     private val attachmentService: ChatAttachmentService = ChatAttachmentService()
 ) : ViewModel() {
+    private val historyStore = preferences?.let(::ChatHistoryStore)
     var composer by mutableStateOf(""); private set
     var bridgeUrl by mutableStateOf(preferences?.getString("bridge_url", DEFAULT_BRIDGE_URL) ?: DEFAULT_BRIDGE_URL); private set
     var sending by mutableStateOf(false); private set
@@ -234,6 +241,9 @@ class AgentViewModel(
     var selectedModel by mutableStateOf<String?>(null); private set
     var modelServiceReady by mutableStateOf(false); private set
     var connectors by mutableStateOf<List<BridgeConnector>>(emptyList()); private set
+    var chats by mutableStateOf<List<SavedChat>>(historyStore?.load().orEmpty()); private set
+    var activeChatId by mutableStateOf<String?>(null); private set
+    var incognito by mutableStateOf(false); private set
 
     companion object {
         private const val DEFAULT_BRIDGE_URL = "http://10.0.2.2:8000"
@@ -273,6 +283,32 @@ class AgentViewModel(
     fun updateEffort(level: EffortLevel) {
         effort = level
         preferences?.edit()?.putString("effort", level.name)?.apply()
+    }
+
+    fun newChat(privateMode: Boolean = false) {
+        activeChatId = if (privateMode) null else "chat-${System.currentTimeMillis()}"
+        incognito = privateMode
+        composer = ""
+        attachments = emptyList()
+        attachmentMessage = null
+        feed = emptyList()
+    }
+
+    fun openChat(id: String) {
+        val chat = chats.firstOrNull { it.id == id } ?: return
+        activeChatId = chat.id
+        incognito = false
+        composer = ""
+        attachments = emptyList()
+        feed = chat.messages.map { message ->
+            if (message.role == "user") FeedItem.User(message.text) else FeedItem.Reply(message.text)
+        }
+    }
+
+    private fun saveChatMessage(role: String, text: String) {
+        if (incognito) return
+        val id = activeChatId ?: "chat-${System.currentTimeMillis()}".also { activeChatId = it }
+        chats = historyStore?.append(id, role, text).orEmpty()
     }
 
     fun attachCamera(bitmap: android.graphics.Bitmap) = attach("Camera") {
@@ -399,11 +435,12 @@ class AgentViewModel(
     fun send(fileContext: String = "") {
         val prompt = composer.trim(); if (prompt.isEmpty() || sending) return
         val selectedAttachments = attachments
-        val remembered = if (memoryEnabled) rememberedContext() else ""
+        val remembered = if (memoryEnabled && !incognito) rememberedContext() else ""
         composer = ""; sending = true
         attachments = emptyList()
         attachmentMessage = null
         feed += FeedItem.User(prompt)
+        saveChatMessage("user", prompt)
         val willUseVerifiedModel = modelServiceReady &&
             (toolAccessMode == ToolAccessMode.AUTO || toolAccessMode == ToolAccessMode.AUTOMATIC)
         feed += FeedItem.Tool(
@@ -452,7 +489,8 @@ class AgentViewModel(
                         BridgeTask.WRITE   -> codeEngine.write(prompt, enrichedContext)
                     }.also { feed += FeedItem.Reply(it) }
                 }
-                if (memoryEnabled) remember("User: $prompt\nIQF: ${response.take(1_500)}")
+                saveChatMessage("assistant", response)
+                if (memoryEnabled && !incognito) remember("User: $prompt\nIQF: ${response.take(1_500)}")
                 if (!useRealModel && bridgeUrl.isNotBlank() && toolAccessMode != ToolAccessMode.OFF) {
                     feed += FeedItem.EscalatePrompt(prompt = prompt, context = enrichedContext, task = task)
                 }
@@ -502,6 +540,7 @@ class AgentViewModel(
                     matchType = { it is FeedItem.EscalatePrompt },
                     replacement = FeedItem.LaptopReply(result)
                 )
+                saveChatMessage("assistant", result)
             } catch (e: IOException) {
                 replaceLast(
                     matchType = { it is FeedItem.EscalatePrompt },
@@ -583,7 +622,8 @@ class AgentViewModel(
 ) {
     val state by workspace.state
     val context = LocalContext.current
-    var drawerOpen by remember { mutableStateOf(false) }
+    var navigationOpen by remember { mutableStateOf(false) }
+    var destination by rememberSaveable { mutableStateOf(AppDestination.CHATS) }
     var showAddToChat by rememberSaveable { mutableStateOf(false) }
     var showToolAccess by rememberSaveable { mutableStateOf(false) }
     var showConnectors by rememberSaveable { mutableStateOf(false) }
@@ -613,23 +653,73 @@ class AgentViewModel(
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             MinimalAgentHeader(
-                onMenu = { drawerOpen = !drawerOpen },
-                onEngine = { drawerOpen = true }
+                incognito = agent.incognito,
+                onMenu = { navigationOpen = !navigationOpen },
+                onIncognito = {
+                    agent.newChat(privateMode = !agent.incognito)
+                    destination = AppDestination.CHATS
+                }
             )
         },
         bottomBar = {
-            Composer(
-                agent = agent,
-                onAdd = { showAddToChat = true },
-                onModel = { showModels = true },
-                send = { agent.send(state.editorText) }
-            )
+            if (destination == AppDestination.CHATS) {
+                Composer(
+                    agent = agent,
+                    onAdd = { showAddToChat = true },
+                    onModel = { showModels = true },
+                    send = { agent.send(state.editorText) }
+                )
+            }
         }
     ) { padding ->
-        Row(Modifier.fillMaxSize().padding(padding)) {
-            if (drawerOpen) RepositoryDrawer(state, workspace, agent, appearance, onAppearanceChange) { drawerOpen = false }
-            Feed(Modifier.weight(1f), agent, state)
+        Box(Modifier.fillMaxSize().padding(padding)) {
+            when (destination) {
+                AppDestination.CHATS -> Feed(Modifier.fillMaxSize(), agent, state)
+                AppDestination.PROJECTS -> ProjectsPage(
+                    state = state,
+                    workspace = workspace,
+                    onOpen = {
+                        workspace.selectRepository(it)
+                        destination = AppDestination.CODE
+                    },
+                    onNew = {
+                        workspace.startNewRepository()
+                        destination = AppDestination.CODE
+                    }
+                )
+                AppDestination.CODE -> CodeWorkspacePage(state, workspace)
+                AppDestination.ARTIFACTS -> ArtifactsPage(state, workspace)
+            }
         }
+    }
+    if (navigationOpen) {
+        NavigationMenu(
+            state = state,
+            workspace = workspace,
+            agent = agent,
+            appearance = appearance,
+            onAppearanceChange = onAppearanceChange,
+            onDestination = {
+                destination = it
+                navigationOpen = false
+            },
+            onChat = {
+                agent.openChat(it)
+                destination = AppDestination.CHATS
+                navigationOpen = false
+            },
+            onNewChat = {
+                agent.newChat()
+                destination = AppDestination.CHATS
+                navigationOpen = false
+            },
+            onIncognito = {
+                agent.newChat(privateMode = true)
+                destination = AppDestination.CHATS
+                navigationOpen = false
+            },
+            onDismiss = { navigationOpen = false }
+        )
     }
     if (showAddToChat) {
         AddToChatSheet(
@@ -685,7 +775,8 @@ class AgentViewModel(
             },
             onClone = {
                 showProjects = false
-                drawerOpen = true
+                workspace.startNewRepository()
+                destination = AppDestination.CODE
             },
             onDismiss = { showProjects = false }
         )
@@ -705,7 +796,11 @@ class AgentViewModel(
     }
 }
 
-@Composable private fun MinimalAgentHeader(onMenu: () -> Unit, onEngine: () -> Unit) =
+@Composable private fun MinimalAgentHeader(
+    incognito: Boolean,
+    onMenu: () -> Unit,
+    onIncognito: () -> Unit
+) =
     Surface(color = MaterialTheme.colorScheme.background) {
         Row(
             modifier = Modifier.fillMaxWidth().height(70.dp).padding(horizontal = 14.dp),
@@ -714,16 +809,20 @@ class AgentViewModel(
             IconButton(onClick = onMenu) {
                 Icon(
                     Icons.Default.Menu,
-                    contentDescription = "Open repository drawer",
+                    contentDescription = "Open navigation",
                     tint = MaterialTheme.colorScheme.onSurface.copy(alpha = .72f),
                     modifier = Modifier.size(30.dp)
                 )
             }
             Spacer(Modifier.weight(1f))
-            IconButton(onClick = onEngine) {
+            if (incognito) {
+                Text("Incognito chat", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.weight(1f))
+            }
+            IconButton(onClick = onIncognito) {
                 Icon(
-                    Icons.Default.Memory,
-                    contentDescription = "On-device IQF engine",
+                    if (incognito) Icons.Default.Close else Icons.Default.VisibilityOff,
+                    contentDescription = if (incognito) "Exit incognito chat" else "Start incognito chat",
                     tint = MaterialTheme.colorScheme.onSurface,
                     modifier = Modifier.size(27.dp)
                 )
@@ -741,7 +840,7 @@ class AgentViewModel(
     LaunchedEffect(feedSize) { if (feedSize > 0) listState.animateScrollToItem(feedSize - 1) }
 
     if (agent.feed.isEmpty()) {
-        EmptyAgentState(modifier, workspace.repo?.name)
+        EmptyAgentState(modifier, workspace.repo?.name, agent.incognito)
         return
     }
 
@@ -765,27 +864,45 @@ class AgentViewModel(
     }
 }
 
-@Composable private fun EmptyAgentState(modifier: Modifier, repositoryName: String?) =
+@Composable private fun EmptyAgentState(modifier: Modifier, repositoryName: String?, incognito: Boolean) =
     Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(
             modifier = Modifier.padding(horizontal = 28.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Text(
-                text = "IQF",
-                color = IqfCoral,
-                fontSize = 30.sp,
-                fontWeight = FontWeight.Black,
-                letterSpacing = 3.sp
-            )
+            if (incognito) {
+                Icon(
+                    Icons.Default.VisibilityOff,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.size(44.dp)
+                )
+            } else {
+                Text(
+                    "IQF",
+                    color = IqfCoral,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 30.sp,
+                    letterSpacing = 2.sp
+                )
+            }
             Spacer(Modifier.height(22.dp))
             Text(
-                text = "Up late, Delfi?",
+                text = if (incognito) "Private session" else "Up late, Delfi?",
                 color = MaterialTheme.colorScheme.onBackground,
                 fontFamily = FontFamily.Serif,
                 fontSize = 25.sp,
                 lineHeight = 32.sp
             )
+            if (incognito) {
+                Spacer(Modifier.height(14.dp))
+                Text(
+                    "This chat is not saved to history or memory.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodyMedium,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                )
+            }
             if (repositoryName != null) {
                 Spacer(Modifier.height(12.dp))
                 Text(
@@ -986,7 +1103,7 @@ class AgentViewModel(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            "Private on-device coding",
+                            if (agent.modelServiceReady) "Connected coding model" else "Private offline fallback",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodyMedium
                         )
@@ -1369,6 +1486,240 @@ class AgentViewModel(
     },
     confirmButton = { TextButton(onDismiss) { Text("Done") } }
 )
+
+@Composable private fun NavigationMenu(
+    state: WorkspaceUiState,
+    workspace: WorkspaceViewModel,
+    agent: AgentViewModel,
+    appearance: Appearance,
+    onAppearanceChange: (Appearance) -> Unit,
+    onDestination: (AppDestination) -> Unit,
+    onChat: (String) -> Unit,
+    onNewChat: () -> Unit,
+    onIncognito: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    Box(Modifier.fillMaxSize()) {
+        Surface(onClick = onDismiss, color = Color.Black.copy(alpha = .42f), modifier = Modifier.fillMaxSize()) {}
+        Surface(
+            color = Color(0xFF111210),
+            modifier = Modifier.width(350.dp).fillMaxHeight(),
+            shadowElevation = 18.dp
+        ) {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize().padding(horizontal = 22.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                item {
+                    Row(
+                        Modifier.fillMaxWidth().padding(top = 28.dp, bottom = 20.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("IQF", fontFamily = FontFamily.Serif, fontSize = 30.sp, modifier = Modifier.weight(1f))
+                        IconButton(onIncognito) { Icon(Icons.Default.VisibilityOff, "Start incognito chat") }
+                    }
+                }
+                item { NavigationItem("Chats", Icons.Default.Forum) { onDestination(AppDestination.CHATS) } }
+                item { NavigationItem("Projects", Icons.Default.Inventory2) { onDestination(AppDestination.PROJECTS) } }
+                item { NavigationItem("Code", Icons.Default.Code) { onDestination(AppDestination.CODE) } }
+                item { NavigationItem("Artifacts", Icons.Default.Category) { onDestination(AppDestination.ARTIFACTS) } }
+                item { HorizontalDivider(Modifier.padding(vertical = 12.dp)) }
+                if (state.pinnedRepositoryNames.isNotEmpty()) {
+                    item { NavigationSection("Pinned") }
+                    items(
+                        state.repositories.filter { it.name in state.pinnedRepositoryNames },
+                        key = { "pin-${it.root.absolutePath}" }
+                    ) { repo ->
+                        NavigationItem(repo.name, Icons.Default.Folder) {
+                            workspace.selectRepository(repo.name)
+                            onDestination(AppDestination.CODE)
+                        }
+                    }
+                    item { HorizontalDivider(Modifier.padding(vertical = 12.dp)) }
+                }
+                item { NavigationSection("Recents") }
+                if (agent.chats.isEmpty()) {
+                    item {
+                        Text(
+                            "Your saved chats will appear here.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                        )
+                    }
+                } else {
+                    items(agent.chats.take(12), key = { it.id }) { chat ->
+                        TextButton(onClick = { onChat(chat.id) }, modifier = Modifier.fillMaxWidth()) {
+                            Text(chat.title, Modifier.fillMaxWidth(), maxLines = 1, color = MaterialTheme.colorScheme.onSurface)
+                        }
+                    }
+                }
+                item { Spacer(Modifier.height(90.dp)) }
+            }
+            Column(
+                Modifier.fillMaxSize().padding(22.dp),
+                verticalArrangement = Arrangement.Bottom
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    FilledIconButton(
+                        onClick = {
+                            onAppearanceChange(
+                                when (appearance) {
+                                    Appearance.DARK -> Appearance.LIGHT
+                                    Appearance.LIGHT -> Appearance.SYSTEM
+                                    Appearance.SYSTEM -> Appearance.DARK
+                                }
+                            )
+                        },
+                        colors = IconButtonDefaults.filledIconButtonColors(containerColor = IqfCoral)
+                    ) { Icon(Icons.Default.Tune, "Cycle appearance") }
+                    Spacer(Modifier.weight(1f))
+                    Button(
+                        onClick = onNewChat,
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.onSurface, contentColor = MaterialTheme.colorScheme.surface)
+                    ) {
+                        Icon(Icons.Default.Add, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("New chat")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable private fun NavigationItem(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    onClick: () -> Unit
+) = TextButton(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
+    Icon(icon, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+    Spacer(Modifier.width(14.dp))
+    Text(label, Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurface, textAlign = androidx.compose.ui.text.style.TextAlign.Start)
+}
+
+@Composable private fun NavigationSection(label: String) {
+    Text(
+        label,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+    )
+}
+
+@Composable private fun ProjectsPage(
+    state: WorkspaceUiState,
+    workspace: WorkspaceViewModel,
+    onOpen: (String) -> Unit,
+    onNew: () -> Unit
+) {
+    var query by rememberSaveable { mutableStateOf("") }
+    val repositories = state.repositories
+        .filter { it.name.contains(query, ignoreCase = true) }
+        .sortedWith(compareByDescending<com.iqforge.git.Repo> { it.name in state.pinnedRepositoryNames }.thenBy { it.name.lowercase() })
+    Column(Modifier.fillMaxSize().padding(horizontal = 22.dp)) {
+        Text("Projects", fontFamily = FontFamily.Serif, fontSize = 36.sp, modifier = Modifier.padding(top = 14.dp, bottom = 20.dp))
+        OutlinedTextField(
+            value = query,
+            onValueChange = { query = it },
+            modifier = Modifier.fillMaxWidth(),
+            placeholder = { Text("Search projects") },
+            leadingIcon = { Icon(Icons.Default.Search, null) },
+            singleLine = true,
+            shape = RoundedCornerShape(18.dp)
+        )
+        if (repositories.isEmpty()) {
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text(
+                    if (query.isBlank()) "No repositories are cloned on this device yet." else "No project matches '$query'.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        } else {
+            LazyColumn(Modifier.weight(1f).padding(top = 14.dp)) {
+                items(repositories, key = { it.root.absolutePath }) { repo ->
+                    Surface(onClick = { onOpen(repo.name) }, color = Color.Transparent) {
+                        Row(
+                            Modifier.fillMaxWidth().padding(vertical = 13.dp, horizontal = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(repo.name, style = MaterialTheme.typography.titleLarge)
+                                Text(
+                                    "Edited ${formatProjectDate(repo.root.resolve(".git/index").lastModified())}",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            IconButton(onClick = { workspace.togglePinned(repo.name) }) {
+                                Icon(
+                                    if (repo.name in state.pinnedRepositoryNames) Icons.Default.PushPin else Icons.Default.PushPin,
+                                    contentDescription = if (repo.name in state.pinnedRepositoryNames) "Unpin ${repo.name}" else "Pin ${repo.name}",
+                                    tint = if (repo.name in state.pinnedRepositoryNames) IqfCoral else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Button(
+            onClick = onNew,
+            modifier = Modifier.align(Alignment.End).padding(bottom = 22.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.onSurface, contentColor = MaterialTheme.colorScheme.surface)
+        ) {
+            Icon(Icons.Default.Add, null)
+            Spacer(Modifier.width(8.dp))
+            Text("New project")
+        }
+    }
+}
+
+@Composable private fun CodeWorkspacePage(state: WorkspaceUiState, workspace: WorkspaceViewModel) {
+    Column(Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 10.dp)) {
+        Text("Code", fontFamily = FontFamily.Serif, fontSize = 34.sp, modifier = Modifier.padding(bottom = 14.dp))
+        if (state.repo == null) ClonePanel(state, workspace) else FilePanel(state, workspace)
+    }
+}
+
+@Composable private fun ArtifactsPage(state: WorkspaceUiState, workspace: WorkspaceViewModel) {
+    var query by rememberSaveable { mutableStateOf("") }
+    val artifacts = state.artifacts.filter {
+        it.name.contains(query, ignoreCase = true) || it.relativePath.contains(query, ignoreCase = true)
+    }
+    Column(Modifier.fillMaxSize().padding(horizontal = 22.dp)) {
+        Text("Artifacts", fontFamily = FontFamily.Serif, fontSize = 36.sp, modifier = Modifier.padding(top = 14.dp, bottom = 20.dp))
+        OutlinedTextField(
+            query, { query = it }, Modifier.fillMaxWidth(),
+            placeholder = { Text("Search code artifacts") },
+            leadingIcon = { Icon(Icons.Default.Search, null) },
+            singleLine = true,
+            shape = RoundedCornerShape(18.dp)
+        )
+        if (state.repo == null) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("Open a project to browse its real artifacts.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        } else {
+            LazyColumn(Modifier.fillMaxSize().padding(top = 12.dp)) {
+                items(artifacts, key = { it.relativePath }) { artifact ->
+                    Surface(onClick = { workspace.openArtifact(artifact) }, color = Color.Transparent) {
+                        Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Description, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Spacer(Modifier.width(12.dp))
+                            Column {
+                                Text(artifact.name, style = MaterialTheme.typography.titleMedium)
+                                Text(artifact.relativePath, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun formatProjectDate(timestamp: Long): String = if (timestamp <= 0L) "unknown" else
+    SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date(timestamp))
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable private fun ConnectorsSheet(agent: AgentViewModel, onDismiss: () -> Unit) {

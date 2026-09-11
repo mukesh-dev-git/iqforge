@@ -16,6 +16,26 @@ data class WorkspaceEntry(
 )
 
 class FileWorkspace(private val maxTextBytes: Long = 1_048_576) {
+    fun artifactFiles(root: File, limit: Int = 100): List<WorkspaceEntry> = root
+        .walkTopDown()
+        .onEnter { it.name != ".git" }
+        .filter { file ->
+            file.isFile && file.length() <= maxTextBytes && file.extension.lowercase() in TEXT_EXTENSIONS
+        }
+        .take(limit)
+        .map { file ->
+            val safe = RepositoryPaths.requireInside(root, file)
+            WorkspaceEntry(
+                file = safe,
+                relativePath = safe.relativeTo(root).invariantSeparatorsPath,
+                name = safe.name,
+                depth = 0,
+                directory = false,
+                expanded = false
+            )
+        }
+        .toList()
+
     fun visibleEntries(root: File, expanded: Set<String>): List<WorkspaceEntry> {
         val entries = mutableListOf<WorkspaceEntry>()
         appendChildren(root.canonicalFile, root.canonicalFile, 0, expanded, entries)
@@ -71,5 +91,12 @@ class FileWorkspace(private val maxTextBytes: Long = 1_048_576) {
             output += WorkspaceEntry(safe, relative, safe.name, depth, safe.isDirectory, isExpanded)
             if (isExpanded) appendChildren(root, safe, depth + 1, expanded, output)
         }
+    }
+
+    private companion object {
+        val TEXT_EXTENSIONS = setOf(
+            "kt", "kts", "java", "py", "js", "ts", "tsx", "jsx", "json", "xml", "md",
+            "txt", "yaml", "yml", "toml", "gradle", "properties", "c", "cc", "cpp", "h", "hpp"
+        )
     }
 }
