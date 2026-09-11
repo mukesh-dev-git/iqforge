@@ -49,6 +49,12 @@ class ChatHistoryStore(
         preferences.edit().remove(KEY).apply()
     }
 
+    fun remove(chatId: String): List<SavedChat> {
+        val remaining = load().filterNot { it.id == chatId }
+        preferences.edit().putString(KEY, json.encodeToString(remaining)).apply()
+        return remaining
+    }
+
     private companion object {
         const val KEY = "saved_chats_v1"
         const val MAX_CHATS = 30

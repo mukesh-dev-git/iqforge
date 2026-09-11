@@ -328,6 +328,13 @@ class AgentViewModel(
     var dispatchWorkspaces by mutableStateOf<List<String>>(emptyList()); private set
     var dispatchBusy by mutableStateOf(false); private set
     var dispatchError by mutableStateOf<String?>(null); private set
+    var fileEditBusy by mutableStateOf(false); private set
+    var fileEditError by mutableStateOf<String?>(null); private set
+    var remoteFiles by mutableStateOf<List<String>>(emptyList()); private set
+    var remoteFilePath by mutableStateOf<String?>(null); private set
+    var remoteFileText by mutableStateOf(""); private set
+    var remoteBusy by mutableStateOf(false); private set
+    var remoteResult by mutableStateOf<String?>(null); private set
 
     companion object {
         private const val DEFAULT_BRIDGE_URL = "http://10.0.2.2:8000"
@@ -406,6 +413,11 @@ class AgentViewModel(
         historyStore?.clear()
         chats = emptyList()
         if (!incognito) newChat()
+    }
+
+    fun clearCurrentChat() {
+        activeChatId?.let { chats = historyStore?.remove(it).orEmpty() }
+        newChat(privateMode = incognito)
     }
 
     fun clearMemory() {
@@ -648,12 +660,6 @@ class AgentViewModel(
         attachmentMessage = null
         feed += FeedItem.User(prompt)
         saveChatMessage("user", prompt)
-        val willUseVerifiedModel = modelServiceReady &&
-            (toolAccessMode == ToolAccessMode.AUTO || toolAccessMode == ToolAccessMode.AUTOMATIC)
-        feed += FeedItem.Tool(
-            if (willUseVerifiedModel) "iQForge — running ${selectedModel ?: "verified model"}..."
-            else "iQForge — preparing the offline fallback..."
-        )
         viewModelScope.launch {
             try {
                 val task = inferTask(prompt)
@@ -780,6 +786,97 @@ class AgentViewModel(
         }
     }
 
+    fun generateFileEdit(path: String, currentText: String, instruction: String, onResult: (String) -> Unit) {
+        if (instruction.isBlank() || fileEditBusy) return
+        fileEditBusy = true
+        fileEditError = null
+        viewModelScope.launch {
+            try {
+                val generated = if (modelServiceReady) {
+                    bridgeClient.escalateWithOptions(
+                        bridgeUrl,
+                        BridgeTask.WRITE,
+                        "File: $path\n\n$currentText",
+                        "Apply this change and return the complete updated file only: ${instruction.trim()}",
+                        effort.wireName
+                    )
+                } else {
+                    codeEngine.write(
+                        "Apply this change and return the complete updated file only: ${instruction.trim()}",
+                        "File: $path\n\n$currentText"
+                    )
+                }
+                val cleaned = generated.trim()
+                    .replace(Regex("^```[A-Za-z0-9_+.-]*\\s*"), "")
+                    .replace(Regex("\\s*```$"), "")
+                    .trim()
+                require(cleaned.isNotBlank() && !cleaned.startsWith("ERROR:")) {
+                    cleaned.ifBlank { "Model returned an empty edit" }
+                }
+                onResult(cleaned)
+            } catch (error: Exception) {
+                fileEditError = error.message ?: "IQForge could not generate the edit"
+            } finally {
+                fileEditBusy = false
+            }
+        }
+    }
+
+    fun refreshRemoteFiles(cwd: String) {
+        if (cwd.isBlank() || remoteBusy) return
+        remoteBusy = true
+        remoteResult = null
+        viewModelScope.launch {
+            try { remoteFiles = bridgeClient.workspaceFiles(bridgeUrl, cwd) }
+            catch (error: Exception) { remoteResult = error.message ?: "Could not load laptop files" }
+            finally { remoteBusy = false }
+        }
+    }
+
+    fun openRemoteFile(cwd: String, path: String) {
+        remoteBusy = true
+        remoteResult = null
+        viewModelScope.launch {
+            try {
+                remoteFileText = bridgeClient.workspaceFile(bridgeUrl, cwd, path)
+                remoteFilePath = path
+            } catch (error: Exception) { remoteResult = error.message ?: "Could not read $path" }
+            finally { remoteBusy = false }
+        }
+    }
+
+    fun updateRemoteFile(value: String) { remoteFileText = value }
+    fun closeRemoteFile() { remoteFilePath = null; remoteFileText = "" }
+
+    fun saveRemoteFile(cwd: String) {
+        val path = remoteFilePath ?: return
+        remoteBusy = true
+        remoteResult = null
+        viewModelScope.launch {
+            try {
+                val bytes = bridgeClient.writeWorkspaceFile(bridgeUrl, cwd, path, remoteFileText)
+                remoteResult = "Saved $path on laptop ($bytes bytes)"
+            } catch (error: Exception) { remoteResult = error.message ?: "Could not save $path" }
+            finally { remoteBusy = false }
+        }
+    }
+
+    fun runRemoteTests(cwd: String) {
+        remoteBusy = true
+        remoteResult = "Running tests on laptop…"
+        viewModelScope.launch {
+            try {
+                val result = bridgeClient.execute(
+                    bridgeUrl,
+                    "bridge/.venv/Scripts/python.exe -m pytest -q bridge/tests examples/mobile-edit-demo",
+                    cwd
+                )
+                remoteResult = (result.stdout + result.stderr).trim().ifBlank { "Tests finished with exit code ${result.exitCode}" }
+            } catch (error: Exception) { remoteResult = error.message ?: "Test run failed" }
+            finally { remoteBusy = false }
+        }
+    }
+
     private fun buildContext(
         fileContext: String,
         selectedAttachments: List<ChatAttachment>,
@@ -895,7 +992,7 @@ class AgentViewModel(
         agent.refreshDispatchWorkspaces()
     }
     state.repo?.let { agent.showClone(it.name) }
-    if (state.selectedFile != null) { EditorScreen(state, workspace); return }
+    if (state.selectedFile != null) { EditorScreen(state, workspace, agent); return }
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
@@ -1176,7 +1273,10 @@ class AgentViewModel(
 @Composable private fun Feed(modifier: Modifier, agent: AgentViewModel, workspace: WorkspaceUiState) {
     val listState = rememberLazyListState()
     val feedSize = agent.feed.size
-    LaunchedEffect(feedSize) { if (feedSize > 0) listState.animateScrollToItem(feedSize - 1) }
+    LaunchedEffect(feedSize, agent.sending) {
+        val visibleItems = feedSize + if (agent.sending) 1 else 0
+        if (visibleItems > 0) listState.animateScrollToItem(visibleItems - 1)
+    }
 
     if (agent.feed.isEmpty()) {
         EmptyAgentState(modifier, workspace.repo?.name, agent.incognito)
@@ -1193,15 +1293,31 @@ class AgentViewModel(
             is FeedItem.User           -> UserBubble(item.text)
             is FeedItem.Status         -> StatusCard(item.text, item.success, item.error)
             is FeedItem.Tool           -> ToolCard(item.text)
-            is FeedItem.Reply          -> Text(item.text, style = MaterialTheme.typography.bodyLarge)
+            is FeedItem.Reply          -> Text(displayModelText(item.text), style = MaterialTheme.typography.bodyLarge)
             is FeedItem.Diff           -> DiffCard(item)
             is FeedItem.EscalatePrompt -> EscalatePromptCard(item) { agent.escalate(item.prompt, item.context, item.task) }
             is FeedItem.LaptopReply    -> LaptopReplyCard(item.text)
             is FeedItem.EscalateError  -> EscalateErrorCard(item) { agent.escalate(item.prompt, item.context, item.task) }
         } }
+        if (agent.sending) item { ThinkingIndicator() }
         item { Spacer(Modifier.height(8.dp)) }
     }
 }
+
+@Composable private fun ThinkingIndicator() {
+    Row(Modifier.padding(horizontal = 10.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+        CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+        Spacer(Modifier.width(12.dp))
+        Text("Thinking…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+private fun displayModelText(text: String): String = text
+    .replace(Regex("```[A-Za-z0-9_+.-]*"), "")
+    .replace("```", "")
+    .replace("**", "")
+    .replace("`", "")
+    .trim()
 
 @Composable private fun EmptyAgentState(modifier: Modifier, repositoryName: String?, incognito: Boolean) =
     Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -1366,7 +1482,7 @@ class AgentViewModel(
                 )
             }
             Spacer(Modifier.height(6.dp))
-            Text(text, style = MaterialTheme.typography.bodyLarge)
+            Text(displayModelText(text), style = MaterialTheme.typography.bodyLarge)
         }
     }
 }
@@ -1889,6 +2005,7 @@ class AgentViewModel(
                     }
                 }
                 item { NavigationItem("Chats", Icons.Default.Forum) { onDestination(AppDestination.CHATS) } }
+                item { NavigationItem("Clear current chat", Icons.Default.DeleteSweep) { agent.clearCurrentChat(); onDestination(AppDestination.CHATS) } }
                 item { NavigationItem("Dispatch", Icons.Default.Terminal) { onDestination(AppDestination.DISPATCH) } }
                 item { NavigationItem("Cowork", Icons.Default.TaskAlt) { onDestination(AppDestination.COWORK) } }
                 item { NavigationItem("Projects", Icons.Default.Inventory2) { onDestination(AppDestination.PROJECTS) } }
@@ -2376,12 +2493,26 @@ class AgentViewModel(
     onNewSession: () -> Unit
 ) {
     var filesOpen by rememberSaveable { mutableStateOf(false) }
+    var laptopFilesOpen by rememberSaveable { mutableStateOf(false) }
+    val laptopRoot = agent.dispatchWorkspaces.firstOrNull().orEmpty()
     Column(Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Code", style = MaterialTheme.typography.displaySmall, modifier = Modifier.weight(1f))
+            TextButton(
+                enabled = laptopRoot.isNotBlank(),
+                onClick = {
+                    laptopFilesOpen = !laptopFilesOpen
+                    filesOpen = false
+                    if (laptopFilesOpen) agent.refreshRemoteFiles(laptopRoot)
+                }
+            ) { Text(if (laptopFilesOpen) "Sessions" else "Laptop files") }
             if (state.repo != null) TextButton(onClick = { filesOpen = !filesOpen }) {
                 Text(if (filesOpen) "Sessions" else "Files")
             }
+        }
+        if (laptopFilesOpen) {
+            RemoteLaptopFiles(agent, laptopRoot)
+            return@Column
         }
         if (filesOpen && state.repo != null) {
             FilePanel(state, workspace)
@@ -2432,6 +2563,50 @@ class AgentViewModel(
             Spacer(Modifier.width(8.dp))
             Text("New session")
         }
+    }
+}
+
+@Composable private fun ColumnScope.RemoteLaptopFiles(agent: AgentViewModel, cwd: String) {
+    var query by rememberSaveable { mutableStateOf("") }
+    val shown = agent.remoteFiles.filter { it.contains(query, ignoreCase = true) }
+    OutlinedTextField(
+        query, { query = it }, Modifier.fillMaxWidth(),
+        placeholder = { Text("Search laptop workspace files") },
+        leadingIcon = { Icon(Icons.Default.Search, null) }, singleLine = true
+    )
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text("${shown.size} editable files", Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant)
+        TextButton(onClick = { agent.runRemoteTests(cwd) }, enabled = !agent.remoteBusy) {
+            Icon(Icons.Default.PlayArrow, null)
+            Text("Run tests")
+        }
+        IconButton(onClick = { agent.refreshRemoteFiles(cwd) }, enabled = !agent.remoteBusy) { Icon(Icons.Default.Refresh, "Refresh laptop files") }
+    }
+    if (agent.remoteBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
+    agent.remoteResult?.let { Text(it.take(1_500), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
+    LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        items(shown, key = { "remote-$it" }) { path ->
+            ListItem(
+                headlineContent = { Text(path, maxLines = 1) },
+                leadingContent = { Icon(Icons.Default.Description, null) },
+                modifier = Modifier.clickable { agent.openRemoteFile(cwd, path) }
+            )
+        }
+    }
+    agent.remoteFilePath?.let { path ->
+        AlertDialog(
+            onDismissRequest = agent::closeRemoteFile,
+            title = { Text(path, maxLines = 2) },
+            text = {
+                OutlinedTextField(
+                    agent.remoteFileText, agent::updateRemoteFile,
+                    Modifier.fillMaxWidth().heightIn(min = 320.dp, max = 520.dp),
+                    textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                )
+            },
+            confirmButton = { Button(onClick = { agent.saveRemoteFile(cwd) }, enabled = !agent.remoteBusy) { Text("Save to laptop") } },
+            dismissButton = { TextButton(onClick = agent::closeRemoteFile) { Text("Close") } }
+        )
     }
 }
 
@@ -3183,11 +3358,20 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
     }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun EditorScreen(state: WorkspaceUiState, workspace: WorkspaceViewModel) =
+@Composable private fun EditorScreen(state: WorkspaceUiState, workspace: WorkspaceViewModel, agent: AgentViewModel) {
+    var showAiEdit by remember { mutableStateOf(false) }
+    var instruction by rememberSaveable { mutableStateOf("") }
     Scaffold(topBar = {
         TopAppBar(
             title = { Text(state.selectedFile?.relativePath ?: "Editor") },
-            navigationIcon = { IconButton(workspace::closeEditor) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back to agent") } }
+            navigationIcon = { IconButton(workspace::closeEditor) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back to agent") } },
+            actions = {
+                TextButton(onClick = { showAiEdit = true }) {
+                    Icon(Icons.Default.AutoAwesome, null)
+                    Spacer(Modifier.width(6.dp))
+                    Text("Edit with IQF")
+                }
+            }
         )
     }) { padding ->
         Column(Modifier.fillMaxSize().padding(padding).padding(16.dp)) {
@@ -3202,3 +3386,38 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
             }
         }
     }
+    if (showAiEdit) AlertDialog(
+        onDismissRequest = { if (!agent.fileEditBusy) showAiEdit = false },
+        title = { Text("Edit ${state.selectedFile?.name.orEmpty()} with IQForge") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    instruction,
+                    { instruction = it },
+                    Modifier.fillMaxWidth(),
+                    label = { Text("Describe the code change") },
+                    minLines = 3,
+                    enabled = !agent.fileEditBusy
+                )
+                if (agent.fileEditBusy) {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                    Text("Generating the complete updated file…")
+                }
+                agent.fileEditError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = instruction.isNotBlank() && !agent.fileEditBusy,
+                onClick = {
+                    agent.generateFileEdit(state.selectedFile?.relativePath.orEmpty(), state.editorText, instruction) {
+                        workspace.updateEditor(it)
+                        instruction = ""
+                        showAiEdit = false
+                    }
+                }
+            ) { Text("Generate edit") }
+        },
+        dismissButton = { TextButton(enabled = !agent.fileEditBusy, onClick = { showAiEdit = false }) { Text("Cancel") } }
+    )
+}

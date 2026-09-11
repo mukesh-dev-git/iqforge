@@ -182,6 +182,26 @@ class DispatchWorkspacesResponse(BaseModel):
     workspaces: list[str]
 
 
+class WorkspaceFilesResponse(BaseModel):
+    files: list[str]
+
+
+class WorkspaceFileResponse(BaseModel):
+    path: str
+    content: str
+
+
+class WorkspaceWriteRequest(BaseModel):
+    cwd: str
+    path: str
+    content: str
+
+
+class WorkspaceWriteResponse(BaseModel):
+    path: str
+    bytes_written: int
+
+
 class WebSearchRequest(BaseModel):
     query: str
     max_results: int = 5
@@ -342,6 +362,16 @@ def parse_dispatch_plan(raw: str, cwd: str) -> DispatchPlanResponse:
         except HTTPException:
             command = None
     return DispatchPlanResponse(summary=summary, command=command, cwd=cwd, executable=executable)
+
+
+def resolve_workspace_file(cwd: str, relative_path: str) -> Path:
+    if not is_safe_path(cwd):
+        raise HTTPException(status_code=403, detail="Workspace is outside configured roots")
+    root = Path(cwd).resolve()
+    candidate = (root / relative_path).resolve()
+    if candidate == root or root not in candidate.parents:
+        raise HTTPException(status_code=403, detail="File path escapes the workspace")
+    return candidate
 
 
 def search_web(query: str, max_results: int = 5) -> list[WebSearchResult]:
@@ -530,6 +560,12 @@ def execute_command(req: ExecRequest) -> ExecResponse:
         raise HTTPException(status_code=403, detail="Execution restricted: requested cwd is not in ALLOWED_EXEC_ROOTS")
 
     arguments = command_arguments(req.command)
+    requested_executable = Path(arguments[0])
+    if not requested_executable.is_absolute() and requested_executable.parent != Path("."):
+        executable_path = (cwd_path / requested_executable).resolve()
+        if cwd_path not in executable_path.parents or not executable_path.is_file():
+            raise HTTPException(status_code=403, detail="Executable path is outside the selected workspace")
+        arguments[0] = str(executable_path)
 
     log.info("Exec request — cwd: %s, command: %s", req.cwd, req.command)
     
@@ -588,6 +624,59 @@ def dispatch_workspaces() -> DispatchWorkspacesResponse:
     return DispatchWorkspacesResponse(
         workspaces=[str(Path(root).resolve()) for root in ALLOWED_EXEC_ROOTS if Path(root).is_dir()]
     )
+
+
+@app.get("/workspace/files", response_model=WorkspaceFilesResponse)
+def workspace_files(cwd: str) -> WorkspaceFilesResponse:
+    if not is_safe_path(cwd):
+        raise HTTPException(status_code=403, detail="Workspace is outside configured roots")
+    root = Path(cwd).resolve()
+    ignored = {
+        ".git", ".gradle", ".idea", ".pytest_cache", ".tooling", ".venv", "venv",
+        "node_modules", "build", "dist", "__pycache__",
+    }
+    editable_suffixes = {
+        ".c", ".cc", ".cpp", ".css", ".gradle", ".h", ".hpp", ".html", ".java",
+        ".js", ".json", ".kt", ".kts", ".md", ".properties", ".py", ".sh", ".sql",
+        ".toml", ".ts", ".tsx", ".txt", ".xml", ".yaml", ".yml",
+    }
+    editable_names = {".gitignore", ".gitattributes", "Dockerfile", "Makefile"}
+    files: list[str] = []
+    for candidate in root.rglob("*"):
+        relative = candidate.relative_to(root)
+        if any(part in ignored for part in relative.parts) or (
+            candidate.suffix.lower() not in editable_suffixes and candidate.name not in editable_names
+        ):
+            continue
+        if candidate.is_file() and candidate.stat().st_size <= 1_000_000:
+            files.append(relative.as_posix())
+        if len(files) >= 400:
+            break
+    return WorkspaceFilesResponse(files=sorted(files))
+
+
+@app.get("/workspace/file", response_model=WorkspaceFileResponse)
+def workspace_file(cwd: str, path: str) -> WorkspaceFileResponse:
+    target = resolve_workspace_file(cwd, path)
+    if not target.is_file() or target.stat().st_size > 1_000_000:
+        raise HTTPException(status_code=400, detail="File is missing or too large to edit")
+    try:
+        content = target.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="Only UTF-8 text files can be edited")
+    return WorkspaceFileResponse(path=path, content=content)
+
+
+@app.post("/workspace/file", response_model=WorkspaceWriteResponse)
+def write_workspace_file(req: WorkspaceWriteRequest) -> WorkspaceWriteResponse:
+    target = resolve_workspace_file(req.cwd, req.path)
+    if not target.is_file():
+        raise HTTPException(status_code=400, detail="Only existing workspace files can be edited")
+    encoded = req.content.encode("utf-8")
+    if len(encoded) > 1_000_000:
+        raise HTTPException(status_code=413, detail="Edited file exceeds the 1 MB limit")
+    target.write_bytes(encoded)
+    return WorkspaceWriteResponse(path=req.path, bytes_written=len(encoded))
 
 
 @app.post("/search", response_model=WebSearchResponse)

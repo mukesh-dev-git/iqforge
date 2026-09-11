@@ -1,6 +1,7 @@
 package com.iqforge.bridge
 
 import java.io.IOException
+import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -60,6 +61,24 @@ open class LaptopBridgeClient(
 
     suspend fun dispatchWorkspaces(laptopUrl: String): List<String> =
         json.decodeFromString(DispatchWorkspacesResponse.serializer(), get(laptopUrl, "dispatch/workspaces")).workspaces
+
+    suspend fun workspaceFiles(laptopUrl: String, cwd: String): List<String> =
+        json.decodeFromString(
+            WorkspaceFilesResponse.serializer(),
+            get(laptopUrl, "workspace/files?cwd=${encode(cwd)}")
+        ).files
+
+    suspend fun workspaceFile(laptopUrl: String, cwd: String, path: String): String =
+        json.decodeFromString(
+            WorkspaceFileResponse.serializer(),
+            get(laptopUrl, "workspace/file?cwd=${encode(cwd)}&path=${encode(path)}")
+        ).content
+
+    suspend fun writeWorkspaceFile(laptopUrl: String, cwd: String, path: String, content: String): Int = request(
+        laptopUrl,
+        "workspace/file",
+        json.encodeToString(WorkspaceWriteRequest.serializer(), WorkspaceWriteRequest(cwd, path, content))
+    ) { response -> json.decodeFromString(WorkspaceWriteResponse.serializer(), response).bytesWritten }
 
     open suspend fun search(
         laptopUrl: String,
@@ -129,6 +148,8 @@ open class LaptopBridgeClient(
         }
         return normalized
     }
+
+    private fun encode(value: String): String = URLEncoder.encode(value, Charsets.UTF_8.name())
 
     private companion object {
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
@@ -203,6 +224,21 @@ private data class DispatchPlanRequest(val instruction: String, val cwd: String)
 
 @Serializable
 private data class DispatchWorkspacesResponse(val workspaces: List<String>)
+
+@Serializable
+private data class WorkspaceFilesResponse(val files: List<String>)
+
+@Serializable
+private data class WorkspaceFileResponse(val path: String, val content: String)
+
+@Serializable
+private data class WorkspaceWriteRequest(val cwd: String, val path: String, val content: String)
+
+@Serializable
+private data class WorkspaceWriteResponse(
+    val path: String,
+    @kotlinx.serialization.SerialName("bytes_written") val bytesWritten: Int
+)
 
 @Serializable
 private data class WebSearchRequest(

@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 import pytest
 import requests
 import json
+from pathlib import Path
 from fastapi.testclient import TestClient
 from unittest.mock import patch, Mock
 from server import app, ConnectorInfo, ModelInfo
@@ -144,6 +145,26 @@ def test_dispatch_plan_removes_unsafe_model_command():
     assert response.status_code == 200
     assert response.json()["command"] is None
     assert response.json()["executable"] is False
+
+
+def test_workspace_file_round_trip():
+    with tempfile.TemporaryDirectory() as tmpdir, patch("server.ALLOWED_EXEC_ROOTS", [tmpdir]):
+        source = Path(tmpdir) / "app.py"
+        source.write_text("answer = 1\n", encoding="utf-8")
+        listing = client.get("/workspace/files", params={"cwd": tmpdir})
+        assert listing.status_code == 200
+        assert "app.py" in listing.json()["files"]
+        read = client.get("/workspace/file", params={"cwd": tmpdir, "path": "app.py"})
+        assert read.json()["content"] == "answer = 1\n"
+        written = client.post("/workspace/file", json={"cwd": tmpdir, "path": "app.py", "content": "answer = 2\n"})
+        assert written.status_code == 200
+        assert source.read_text(encoding="utf-8") == "answer = 2\n"
+
+
+def test_workspace_file_rejects_path_escape():
+    with tempfile.TemporaryDirectory() as tmpdir, patch("server.ALLOWED_EXEC_ROOTS", [tmpdir]):
+        response = client.get("/workspace/file", params={"cwd": tmpdir, "path": "../secret.txt"})
+    assert response.status_code == 403
 
 def test_web_search_returns_grounding_results():
     fake_results = [{
