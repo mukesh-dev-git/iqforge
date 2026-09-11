@@ -1431,7 +1431,10 @@ class AgentViewModel(
     send: () -> Unit
 ) {
     val haptics = LocalHapticFeedback.current
-    Surface(color = MaterialTheme.colorScheme.background) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().imePadding(),
+        color = MaterialTheme.colorScheme.background
+    ) {
         Surface(
             modifier = Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 8.dp, bottom = 16.dp),
             color = MaterialTheme.colorScheme.surface,
