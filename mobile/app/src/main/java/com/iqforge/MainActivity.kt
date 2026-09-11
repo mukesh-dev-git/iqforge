@@ -317,6 +317,8 @@ class AgentViewModel(
     var availableModels by mutableStateOf<List<BridgeModel>>(emptyList()); private set
     var selectedModel by mutableStateOf<String?>(null); private set
     var modelServiceReady by mutableStateOf(false); private set
+    var offlineModelReady by mutableStateOf(false); private set
+    var offlineModelBytes by mutableStateOf(0L); private set
     var connectors by mutableStateOf<List<BridgeConnector>>(emptyList()); private set
     var chats by mutableStateOf<List<SavedChat>>(historyStore?.load().orEmpty()); private set
     var activeChatId by mutableStateOf<String?>(null); private set
@@ -329,6 +331,7 @@ class AgentViewModel(
 
     companion object {
         private const val DEFAULT_BRIDGE_URL = "http://10.0.2.2:8000"
+        private const val USB_BRIDGE_URL = "http://127.0.0.1:8000"
         private const val MEMORY_SEPARATOR = "\u001E"
         private const val MAX_MEMORY_ITEMS = 6
 
@@ -336,12 +339,35 @@ class AgentViewModel(
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>, extras: CreationExtras): T {
                 val application = checkNotNull(extras[APPLICATION_KEY])
+                val preferences = application.getSharedPreferences("iqforge_agent", Context.MODE_PRIVATE)
+                val looksLikeEmulator = Build.FINGERPRINT.contains("generic", ignoreCase = true) ||
+                    Build.MODEL.contains("Emulator", ignoreCase = true)
+                if (!looksLikeEmulator && preferences.getString("bridge_url", DEFAULT_BRIDGE_URL) == DEFAULT_BRIDGE_URL) {
+                    preferences.edit().putString("bridge_url", USB_BRIDGE_URL).apply()
+                }
                 return AgentViewModel(
                     codeEngine = NativeEngine(application),
-                    preferences = application.getSharedPreferences("iqforge_agent", Context.MODE_PRIVATE)
+                    preferences = preferences
                 ) as T
             }
         }
+    }
+
+    init {
+        refreshOfflineModel()
+    }
+
+    fun refreshOfflineModel() {
+        val nativeEngine = codeEngine as? NativeEngine ?: return
+        viewModelScope.launch {
+            offlineModelReady = nativeEngine.initialize()
+            offlineModelBytes = nativeEngine.installedModelBytes()
+            if (offlineModelReady && selectedModel == null) selectedModel = nativeEngine.displayName
+        }
+    }
+
+    fun selectOfflineModel() {
+        if (offlineModelReady) selectedModel = (codeEngine as? NativeEngine)?.displayName
     }
 
     fun updateComposer(value: String) { composer = value }
@@ -2952,8 +2978,8 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
         Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 20.dp)) {
             SheetTitle("Select model", onDismiss)
             if (agent.availableModels.isEmpty()) {
-                Text(
-                    "No verified model is available. Start Ollama and install a model, then refresh Connectors.",
+                if (!agent.offlineModelReady) Text(
+                    "No verified model is available. Install the on-device GGUF model or connect Ollama.",
                     color = MaterialTheme.colorScheme.error,
                     modifier = Modifier.padding(20.dp)
                 )
@@ -2983,6 +3009,20 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                             }
                             if (index != agent.availableModels.lastIndex) HorizontalDivider()
                         }
+                    }
+                }
+            }
+            if (agent.offlineModelReady) {
+                Spacer(Modifier.height(12.dp))
+                Surface(onClick = agent::selectOfflineModel, color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
+                    Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.PhoneAndroid, null, tint = Color(0xFF54C878))
+                        Spacer(Modifier.width(14.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("Qwen2.5 Coder 1.5B", style = MaterialTheme.typography.titleMedium)
+                            Text("On-device • ${agent.offlineModelBytes / 1_000_000} MB GGUF • works without internet", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        if (agent.selectedModel?.contains("on-device") == true) Icon(Icons.Default.Check, "Selected", tint = Color(0xFF54C878))
                     }
                 }
             }
