@@ -1,6 +1,7 @@
 package com.iqforge
 
 import android.os.Bundle
+import android.os.Build
 import android.content.Context
 import android.app.Application
 import android.Manifest
@@ -29,6 +30,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -85,12 +88,6 @@ private enum class AppDestination { CHATS, PROJECTS, CODE, ARTIFACTS }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) = super.onCreate(savedInstanceState).also {
-        window.statusBarColor = android.graphics.Color.rgb(18, 19, 17)
-        window.navigationBarColor = android.graphics.Color.BLACK
-        WindowCompat.getInsetsController(window, window.decorView).apply {
-            isAppearanceLightStatusBars = false
-            isAppearanceLightNavigationBars = false
-        }
         setContent {
             ForgeTheme { appearance, updateAppearance ->
                 var showSplash by remember { mutableStateOf(true) }
@@ -142,7 +139,21 @@ class MainActivity : ComponentActivity() {
         mutableStateOf(runCatching { Appearance.valueOf(preferences.getString("appearance", Appearance.DARK.name) ?: Appearance.DARK.name) }.getOrDefault(Appearance.DARK))
     }
     val dark = when (appearance) { Appearance.SYSTEM -> isSystemInDarkTheme(); Appearance.LIGHT -> false; Appearance.DARK -> true }
-    MaterialTheme(colorScheme = if (dark) ForgeDarkColors else ForgeLightColors) {
+    val colors = if (dark) ForgeDarkColors else ForgeLightColors
+    SideEffect {
+        (context as? ComponentActivity)?.window?.let { window ->
+            window.statusBarColor = colors.background.toArgb()
+            window.navigationBarColor = colors.background.toArgb()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                window.isNavigationBarContrastEnforced = false
+            }
+            WindowCompat.getInsetsController(window, window.decorView).apply {
+                isAppearanceLightStatusBars = !dark
+                isAppearanceLightNavigationBars = !dark
+            }
+        }
+    }
+    MaterialTheme(colorScheme = colors) {
         content(appearance) { value ->
             appearance = value
             preferences.edit().putString("appearance", value.name).apply()
@@ -1502,7 +1513,7 @@ class AgentViewModel(
     Box(Modifier.fillMaxSize()) {
         Surface(onClick = onDismiss, color = Color.Black.copy(alpha = .42f), modifier = Modifier.fillMaxSize()) {}
         Surface(
-            color = Color(0xFF111210),
+            color = MaterialTheme.colorScheme.background,
             modifier = Modifier.width(350.dp).fillMaxHeight(),
             shadowElevation = 18.dp
         ) {
@@ -1586,9 +1597,13 @@ class AgentViewModel(
                         colors = IconButtonDefaults.filledIconButtonColors(containerColor = IqfCoral)
                     ) { Icon(Icons.Default.Tune, "Cycle appearance") }
                     Spacer(Modifier.weight(1f))
+                    val darkTheme = MaterialTheme.colorScheme.background.luminance() < .5f
                     Button(
                         onClick = onNewChat,
-                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.onSurface, contentColor = MaterialTheme.colorScheme.surface)
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (darkTheme) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.surfaceVariant,
+                            contentColor = if (darkTheme) MaterialTheme.colorScheme.surface else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     ) {
                         Icon(Icons.Default.Add, null)
                         Spacer(Modifier.width(8.dp))
