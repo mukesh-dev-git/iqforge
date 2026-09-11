@@ -3,14 +3,19 @@ package com.iqforge
 import android.os.Bundle
 import android.content.Context
 import android.app.Application
+import android.Manifest
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.lifecycle.AndroidViewModel
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -28,32 +33,58 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.CreationExtras
 import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
+import androidx.core.view.WindowCompat
+import androidx.core.content.FileProvider
 import com.iqforge.engine.CodeEngine
 import com.iqforge.engine.NativeEngine
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.iqforge.bridge.BridgeTask
 import com.iqforge.bridge.LaptopBridgeClient
+import com.iqforge.bridge.BridgeConnector
+import com.iqforge.bridge.BridgeModel
+import com.iqforge.chat.AttachmentKind
+import com.iqforge.chat.ChatAttachment
+import com.iqforge.chat.ChatAttachmentService
 import com.iqforge.engine.OfflineEngine
 import kotlinx.coroutines.launch
 import com.iqforge.workspace.WorkspaceEntry
 import com.iqforge.workspace.WorkspaceUiState
 import com.iqforge.workspace.WorkspaceViewModel
 import java.io.IOException
+import java.io.File
 
-private val ForgeDarkColors = darkColorScheme(primary = Color(0xFF5B9CFF), background = Color(0xFF141414), surface = Color(0xFF1B1B1B), surfaceVariant = Color(0xFF222222), outline = Color(0xFF373737))
+private val IqfCoral = Color(0xFFDA7756)
+private val ForgeDarkColors = darkColorScheme(
+    primary = IqfCoral,
+    background = Color(0xFF121311),
+    surface = Color(0xFF1D1E1B),
+    surfaceVariant = Color(0xFF282925),
+    outline = Color(0xFF3B3C37),
+    onBackground = Color(0xFFF2EFE9),
+    onSurface = Color(0xFFF2EFE9),
+    onSurfaceVariant = Color(0xFFAAA9A3)
+)
 private val ForgeLightColors = lightColorScheme(primary = Color(0xFF185ABC), background = Color(0xFFFFFBFF), surface = Color(0xFFFFFBFF), surfaceVariant = Color(0xFFE7E0EC))
 
 private enum class Appearance { SYSTEM, LIGHT, DARK }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) = super.onCreate(savedInstanceState).also {
+        window.statusBarColor = android.graphics.Color.rgb(18, 19, 17)
+        window.navigationBarColor = android.graphics.Color.BLACK
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            isAppearanceLightStatusBars = false
+            isAppearanceLightNavigationBars = false
+        }
         setContent {
             ForgeTheme { appearance, updateAppearance ->
                 var showSplash by remember { mutableStateOf(true) }
@@ -102,7 +133,7 @@ class MainActivity : ComponentActivity() {
     val context = LocalContext.current
     val preferences = remember { context.getSharedPreferences("iqforge_settings", Context.MODE_PRIVATE) }
     var appearance by rememberSaveable {
-        mutableStateOf(runCatching { Appearance.valueOf(preferences.getString("appearance", Appearance.SYSTEM.name) ?: Appearance.SYSTEM.name) }.getOrDefault(Appearance.SYSTEM))
+        mutableStateOf(runCatching { Appearance.valueOf(preferences.getString("appearance", Appearance.DARK.name) ?: Appearance.DARK.name) }.getOrDefault(Appearance.DARK))
     }
     val dark = when (appearance) { Appearance.SYSTEM -> isSystemInDarkTheme(); Appearance.LIGHT -> false; Appearance.DARK -> true }
     MaterialTheme(colorScheme = if (dark) ForgeDarkColors else ForgeLightColors) {
@@ -153,31 +184,202 @@ sealed interface FeedItem {
     ) : FeedItem
 }
 
+enum class ToolAccessMode(val label: String) {
+    AUTO("Auto"),
+    ASK("On demand"),
+    AUTOMATIC("Always available"),
+    OFF("Off")
+}
+
+enum class EffortLevel(val label: String, val wireName: String) {
+    LOW("Low", "low"),
+    MEDIUM("Medium", "medium"),
+    HIGH("High", "high"),
+    EXTRA("Extra", "extra"),
+    MAX("Max", "max")
+}
+
 // ---------------------------------------------------------------------------
 // ViewModel
 // ---------------------------------------------------------------------------
 
 class AgentViewModel(
     private val codeEngine: CodeEngine,
-    internal var bridgeClient: LaptopBridgeClient = LaptopBridgeClient()
+    internal var bridgeClient: LaptopBridgeClient = LaptopBridgeClient(),
+    private val preferences: android.content.SharedPreferences? = null,
+    private val attachmentService: ChatAttachmentService = ChatAttachmentService()
 ) : ViewModel() {
     var composer by mutableStateOf(""); private set
-    var bridgeUrl by mutableStateOf("http://192.168.1.2:8000"); private set
+    var bridgeUrl by mutableStateOf(preferences?.getString("bridge_url", DEFAULT_BRIDGE_URL) ?: DEFAULT_BRIDGE_URL); private set
     var sending by mutableStateOf(false); private set
     var feed by mutableStateOf<List<FeedItem>>(emptyList()); internal set
+    var attachments by mutableStateOf<List<ChatAttachment>>(emptyList()); private set
+    var attachmentBusy by mutableStateOf(false); private set
+    var attachmentMessage by mutableStateOf<String?>(null); private set
+    var webSearchEnabled by mutableStateOf(preferences?.getBoolean("web_search", false) ?: false); private set
+    var memoryEnabled by mutableStateOf(preferences?.getBoolean("memory", true) ?: true); private set
+    var toolAccessMode by mutableStateOf(
+        runCatching {
+            ToolAccessMode.valueOf(preferences?.getString("tool_access", ToolAccessMode.AUTO.name) ?: ToolAccessMode.AUTO.name)
+        }.getOrDefault(ToolAccessMode.AUTO)
+    ); private set
+    var effort by mutableStateOf(
+        runCatching {
+            EffortLevel.valueOf(preferences?.getString("effort", EffortLevel.MEDIUM.name) ?: EffortLevel.MEDIUM.name)
+        }.getOrDefault(EffortLevel.MEDIUM)
+    ); private set
+    var connectorStatus by mutableStateOf("Not checked"); private set
+    var checkingConnector by mutableStateOf(false); private set
+    var availableModels by mutableStateOf<List<BridgeModel>>(emptyList()); private set
+    var selectedModel by mutableStateOf<String?>(null); private set
+    var modelServiceReady by mutableStateOf(false); private set
+    var connectors by mutableStateOf<List<BridgeConnector>>(emptyList()); private set
 
     companion object {
+        private const val DEFAULT_BRIDGE_URL = "http://10.0.2.2:8000"
+        private const val MEMORY_SEPARATOR = "\u001E"
+        private const val MAX_MEMORY_ITEMS = 6
+
         val Factory: ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>, extras: CreationExtras): T {
                 val application = checkNotNull(extras[APPLICATION_KEY])
-                return AgentViewModel(NativeEngine(application)) as T
+                return AgentViewModel(
+                    codeEngine = NativeEngine(application),
+                    preferences = application.getSharedPreferences("iqforge_agent", Context.MODE_PRIVATE)
+                ) as T
             }
         }
     }
 
     fun updateComposer(value: String) { composer = value }
-    fun updateBridgeUrl(value: String) { bridgeUrl = value }
+    fun updateBridgeUrl(value: String) {
+        bridgeUrl = value
+        preferences?.edit()?.putString("bridge_url", value)?.apply()
+        connectorStatus = "Not checked"
+    }
+    fun updateWebSearch(enabled: Boolean) {
+        webSearchEnabled = enabled
+        preferences?.edit()?.putBoolean("web_search", enabled)?.apply()
+    }
+    fun updateMemory(enabled: Boolean) {
+        memoryEnabled = enabled
+        preferences?.edit()?.putBoolean("memory", enabled)?.apply()
+    }
+    fun updateToolAccess(mode: ToolAccessMode) {
+        toolAccessMode = mode
+        preferences?.edit()?.putString("tool_access", mode.name)?.apply()
+    }
+    fun updateEffort(level: EffortLevel) {
+        effort = level
+        preferences?.edit()?.putString("effort", level.name)?.apply()
+    }
+
+    fun attachCamera(bitmap: android.graphics.Bitmap) = attach("Camera") {
+        attachmentService.fromCamera(bitmap)
+    }
+
+    fun attachCamera(context: Context, uri: android.net.Uri) = attach("Camera") {
+        attachmentService.fromCamera(context, uri)
+    }
+
+    fun attachPhoto(context: Context, uri: android.net.Uri) = attach("Photo") {
+        attachmentService.fromPhoto(context, uri)
+    }
+
+    fun attachFile(context: Context, uri: android.net.Uri) = attach("File") {
+        attachmentService.fromFile(context, uri)
+    }
+
+    fun removeAttachment(id: String) {
+        attachments = attachments.filterNot { it.id == id }
+        attachmentMessage = if (attachments.isEmpty()) null else "${attachments.size} item(s) attached"
+    }
+
+    fun reportAttachmentError(message: String) {
+        attachmentMessage = message
+    }
+
+    private fun attach(source: String, loader: suspend () -> ChatAttachment) {
+        if (attachmentBusy) return
+        attachmentBusy = true
+        attachmentMessage = "Reading $source..."
+        viewModelScope.launch {
+            try {
+                val attachment = loader()
+                attachments = (attachments.filterNot { it.id == attachment.id } + attachment).takeLast(5)
+                attachmentMessage = "Attached ${attachment.name} (${attachment.content.length} characters)"
+            } catch (error: Exception) {
+                attachmentMessage = error.message ?: "$source could not be attached."
+            } finally {
+                attachmentBusy = false
+            }
+        }
+    }
+
+    fun checkBridge() {
+        if (checkingConnector) return
+        checkingConnector = true
+        connectorStatus = "Checking..."
+        viewModelScope.launch {
+            connectorStatus = try {
+                val health = bridgeClient.health(bridgeUrl)
+                modelServiceReady = health.modelReachable
+                selectedModel = health.model
+                if (health.modelReachable) {
+                    "Connected - ${health.backend}${health.model?.let { " / $it" }.orEmpty()}"
+                } else {
+                    "Bridge online - model unavailable"
+                }
+            } catch (error: Exception) {
+                "Unavailable - ${error.message ?: "connection failed"}"
+            } finally {
+                checkingConnector = false
+            }
+        }
+    }
+
+    fun refreshServices() {
+        if (checkingConnector) return
+        checkingConnector = true
+        connectorStatus = "Checking live services..."
+        viewModelScope.launch {
+            try {
+                val health = bridgeClient.health(bridgeUrl)
+                var discoveredModels = bridgeClient.models(bridgeUrl)
+                if (discoveredModels.isNotEmpty() && discoveredModels.none { it.selected }) {
+                    val verified = bridgeClient.selectModel(bridgeUrl, discoveredModels.first().id)
+                    discoveredModels = discoveredModels.map { it.copy(selected = it.id == verified.id) }
+                }
+                val discoveredConnectors = bridgeClient.connectors(bridgeUrl)
+                availableModels = discoveredModels
+                connectors = discoveredConnectors
+                selectedModel = discoveredModels.firstOrNull { it.selected }?.id ?: health.model
+                modelServiceReady = discoveredModels.any { it.id == selectedModel }
+                val connectedCount = discoveredConnectors.count { it.connected }
+                connectorStatus = "$connectedCount live connector(s)"
+            } catch (error: Exception) {
+                modelServiceReady = false
+                connectorStatus = "Unavailable - ${error.message ?: "connection failed"}"
+            } finally {
+                checkingConnector = false
+            }
+        }
+    }
+
+    fun selectModel(model: BridgeModel) {
+        viewModelScope.launch {
+            try {
+                val selected = bridgeClient.selectModel(bridgeUrl, model.id)
+                selectedModel = selected.id
+                availableModels = availableModels.map { it.copy(selected = it.id == selected.id) }
+                modelServiceReady = true
+                connectorStatus = "Connected - ollama / ${selected.id}"
+            } catch (error: Exception) {
+                connectorStatus = "Model selection failed - ${error.message.orEmpty()}"
+            }
+        }
+    }
     fun showClone(name: String) {
         if (feed.none { it is FeedItem.Status && it.text == "Cloned $name" })
             feed += FeedItem.Status("Cloned $name", success = true)
@@ -196,27 +398,63 @@ class AgentViewModel(
 
     fun send(fileContext: String = "") {
         val prompt = composer.trim(); if (prompt.isEmpty() || sending) return
+        val selectedAttachments = attachments
+        val remembered = if (memoryEnabled) rememberedContext() else ""
         composer = ""; sending = true
+        attachments = emptyList()
+        attachmentMessage = null
         feed += FeedItem.User(prompt)
-        feed += FeedItem.Tool("iQForge — preparing an on-device response...")
+        val willUseVerifiedModel = modelServiceReady &&
+            (toolAccessMode == ToolAccessMode.AUTO || toolAccessMode == ToolAccessMode.AUTOMATIC)
+        feed += FeedItem.Tool(
+            if (willUseVerifiedModel) "iQForge — running ${selectedModel ?: "verified model"}..."
+            else "iQForge — preparing the offline fallback..."
+        )
         viewModelScope.launch {
             try {
                 val task = inferTask(prompt)
-                val response = when (task) {
-                    BridgeTask.REVIEW  -> {
-                        val findings = codeEngine.review(fileContext)
-                        if (findings.isEmpty()) "No issues found."
-                        else findings.joinToString("\n") { "Line ${it.line}: [${it.severity}] ${it.message}" }
+                var enrichedContext = buildContext(fileContext, selectedAttachments, remembered)
+                if (webSearchEnabled) {
+                    try {
+                        val results = bridgeClient.search(bridgeUrl, prompt)
+                        if (results.isNotEmpty()) {
+                            val grounding = results.joinToString("\n") {
+                                "- ${it.title}: ${it.snippet} (${it.url})"
+                            }
+                            enrichedContext += "\n\nWeb search grounding:\n$grounding"
+                            feed += FeedItem.Status("Web search added ${results.size} live source(s).", success = true)
+                        } else {
+                            feed += FeedItem.Status("Web search completed with no matching instant results.")
+                        }
+                    } catch (error: Exception) {
+                        feed += FeedItem.Status("Web search unavailable; continuing on-device. ${error.message.orEmpty()}", error = true)
                     }
-                    BridgeTask.DEBUG   -> codeEngine.debug(prompt, fileContext)
-                    BridgeTask.EXPLAIN -> codeEngine.explain(fileContext)
-                    BridgeTask.WRITE   -> codeEngine.write(prompt, fileContext)
                 }
-                feed += FeedItem.Reply(response)
-                // Offer escalation when a bridge URL is configured.
-                // Always explicit — the user must tap "Ask laptop"; nothing is sent automatically.
-                if (bridgeUrl.isNotBlank()) {
-                    feed += FeedItem.EscalatePrompt(prompt = prompt, context = fileContext, task = task)
+                val useRealModel = modelServiceReady &&
+                    (toolAccessMode == ToolAccessMode.AUTO || toolAccessMode == ToolAccessMode.AUTOMATIC)
+                val response = if (useRealModel) {
+                    bridgeClient.escalateWithOptions(
+                        laptopUrl = bridgeUrl,
+                        task = task,
+                        context = enrichedContext,
+                        instruction = prompt,
+                        effort = effort.wireName
+                    ).also { feed += FeedItem.LaptopReply(it) }
+                } else {
+                    when (task) {
+                        BridgeTask.REVIEW  -> {
+                            val findings = codeEngine.review(enrichedContext)
+                            if (findings.isEmpty()) "No issues found."
+                            else findings.joinToString("\n") { "Line ${it.line}: [${it.severity}] ${it.message}" }
+                        }
+                        BridgeTask.DEBUG   -> codeEngine.debug(prompt, enrichedContext)
+                        BridgeTask.EXPLAIN -> codeEngine.explain(enrichedContext)
+                        BridgeTask.WRITE   -> codeEngine.write(prompt, enrichedContext)
+                    }.also { feed += FeedItem.Reply(it) }
+                }
+                if (memoryEnabled) remember("User: $prompt\nIQF: ${response.take(1_500)}")
+                if (!useRealModel && bridgeUrl.isNotBlank() && toolAccessMode != ToolAccessMode.OFF) {
+                    feed += FeedItem.EscalatePrompt(prompt = prompt, context = enrichedContext, task = task)
                 }
             } catch (error: Exception) {
                 feed += FeedItem.Status(error.message ?: "The offline engine could not complete this request.", error = true)
@@ -295,6 +533,41 @@ class AgentViewModel(
             feed = mutable
         }
     }
+
+    private fun buildContext(
+        fileContext: String,
+        selectedAttachments: List<ChatAttachment>,
+        remembered: String
+    ): String = buildString {
+        if (fileContext.isNotBlank()) append("Open editor context:\n$fileContext")
+        selectedAttachments.forEach { attachment ->
+            if (isNotEmpty()) append("\n\n")
+            append("Attached ${attachment.kind.name.lowercase()} - ${attachment.name}:\n")
+            append(attachment.content)
+        }
+        if (remembered.isNotBlank()) {
+            if (isNotEmpty()) append("\n\n")
+            append("Recent local memory:\n$remembered")
+        }
+    }.take(96_000)
+
+    private fun rememberedContext(): String = preferences
+        ?.getString("chat_memory", "")
+        .orEmpty()
+        .split(MEMORY_SEPARATOR)
+        .filter { it.isNotBlank() }
+        .takeLast(3)
+        .joinToString("\n\n")
+
+    private fun remember(entry: String) {
+        val history = preferences?.getString("chat_memory", "")
+            .orEmpty()
+            .split(MEMORY_SEPARATOR)
+            .filter { it.isNotBlank() }
+            .plus(entry.take(2_000))
+            .takeLast(MAX_MEMORY_ITEMS)
+        preferences?.edit()?.putString("chat_memory", history.joinToString(MEMORY_SEPARATOR))?.apply()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -309,23 +582,154 @@ class AgentViewModel(
     agent: AgentViewModel = viewModel(factory = AgentViewModel.Factory)
 ) {
     val state by workspace.state
+    val context = LocalContext.current
     var drawerOpen by remember { mutableStateOf(false) }
+    var showAddToChat by rememberSaveable { mutableStateOf(false) }
+    var showToolAccess by rememberSaveable { mutableStateOf(false) }
+    var showConnectors by rememberSaveable { mutableStateOf(false) }
+    var showProjects by rememberSaveable { mutableStateOf(false) }
+    var showModels by rememberSaveable { mutableStateOf(false) }
+    var showEffort by rememberSaveable { mutableStateOf(false) }
+    var cameraUri by remember { mutableStateOf<android.net.Uri?>(null) }
+    val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { captured ->
+        val uri = cameraUri
+        if (captured && uri != null) agent.attachCamera(context, uri)
+        else if (!captured) agent.reportAttachmentError("Camera capture was cancelled.")
+    }
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) cameraUri?.let(cameraLauncher::launch)
+        else agent.reportAttachmentError("Camera permission is required to scan code.")
+    }
+    val photoLauncher = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        uri?.let { agent.attachPhoto(context, it) }
+    }
+    val fileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let { agent.attachFile(context, it) }
+    }
+    LaunchedEffect(Unit) { agent.refreshServices() }
     state.repo?.let { agent.showClone(it.name) }
     if (state.selectedFile != null) { EditorScreen(state, workspace); return }
     Scaffold(
-        topBar = { TopAppBar(
-            title = { Column { Text(state.repo?.name ?: "iQForge", style = MaterialTheme.typography.titleMedium); Text("Local code agent", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .65f)) } },
-            navigationIcon = { IconButton({ drawerOpen = !drawerOpen }) { Icon(Icons.Default.Menu, "Open repository drawer") } },
-            actions = { IconButton({ drawerOpen = true }) { Icon(Icons.Default.Folder, "Repository files") } }
-        ) },
-        bottomBar = { Composer(agent) { agent.send(state.editorText) } }
+        containerColor = MaterialTheme.colorScheme.background,
+        topBar = {
+            MinimalAgentHeader(
+                onMenu = { drawerOpen = !drawerOpen },
+                onEngine = { drawerOpen = true }
+            )
+        },
+        bottomBar = {
+            Composer(
+                agent = agent,
+                onAdd = { showAddToChat = true },
+                onModel = { showModels = true },
+                send = { agent.send(state.editorText) }
+            )
+        }
     ) { padding ->
         Row(Modifier.fillMaxSize().padding(padding)) {
             if (drawerOpen) RepositoryDrawer(state, workspace, agent, appearance, onAppearanceChange) { drawerOpen = false }
             Feed(Modifier.weight(1f), agent, state)
         }
     }
+    if (showAddToChat) {
+        AddToChatSheet(
+            agent = agent,
+            hasProject = state.repo != null,
+            onDismiss = { showAddToChat = false },
+            onCamera = {
+                val directory = File(context.cacheDir, "camera").apply { mkdirs() }
+                val target = File(directory, "capture-${System.currentTimeMillis()}.jpg")
+                cameraUri = FileProvider.getUriForFile(context, "${context.packageName}.files", target)
+                cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+            },
+            onPhotos = {
+                photoLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            },
+            onFiles = {
+                fileLauncher.launch(arrayOf("text/*", "application/json", "application/xml", "application/javascript"))
+            },
+            onProject = {
+                showAddToChat = false
+                showProjects = true
+            },
+            onToolAccess = {
+                showAddToChat = false
+                showToolAccess = true
+            },
+            onConnectors = {
+                showAddToChat = false
+                showConnectors = true
+                agent.refreshServices()
+            }
+        )
+    }
+    if (showToolAccess) {
+        ToolAccessDialog(
+            selected = agent.toolAccessMode,
+            onSelect = {
+                agent.updateToolAccess(it)
+                showToolAccess = false
+            },
+            onDismiss = { showToolAccess = false }
+        )
+    }
+    if (showConnectors) {
+        ConnectorsSheet(agent = agent, onDismiss = { showConnectors = false })
+    }
+    if (showProjects) {
+        ProjectSelectorSheet(
+            state = state,
+            onSelect = {
+                workspace.selectRepository(it)
+                showProjects = false
+            },
+            onClone = {
+                showProjects = false
+                drawerOpen = true
+            },
+            onDismiss = { showProjects = false }
+        )
+    }
+    if (showModels) {
+        ModelSelectorSheet(
+            agent = agent,
+            onEffort = {
+                showModels = false
+                showEffort = true
+            },
+            onDismiss = { showModels = false }
+        )
+    }
+    if (showEffort) {
+        EffortSheet(agent = agent, onDismiss = { showEffort = false })
+    }
 }
+
+@Composable private fun MinimalAgentHeader(onMenu: () -> Unit, onEngine: () -> Unit) =
+    Surface(color = MaterialTheme.colorScheme.background) {
+        Row(
+            modifier = Modifier.fillMaxWidth().height(70.dp).padding(horizontal = 14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = onMenu) {
+                Icon(
+                    Icons.Default.Menu,
+                    contentDescription = "Open repository drawer",
+                    tint = MaterialTheme.colorScheme.onSurface.copy(alpha = .72f),
+                    modifier = Modifier.size(30.dp)
+                )
+            }
+            Spacer(Modifier.weight(1f))
+            IconButton(onClick = onEngine) {
+                Icon(
+                    Icons.Default.Memory,
+                    contentDescription = "On-device IQF engine",
+                    tint = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.size(27.dp)
+                )
+            }
+        }
+    }
 
 // ---------------------------------------------------------------------------
 // Feed & card composables
@@ -336,13 +740,17 @@ class AgentViewModel(
     val feedSize = agent.feed.size
     LaunchedEffect(feedSize) { if (feedSize > 0) listState.animateScrollToItem(feedSize - 1) }
 
+    if (agent.feed.isEmpty()) {
+        EmptyAgentState(modifier, workspace.repo?.name)
+        return
+    }
+
     LazyColumn(
-        modifier.fillMaxSize().padding(horizontal = 16.dp),
+        modifier.fillMaxSize().padding(horizontal = 18.dp),
         state = listState,
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        item { Spacer(Modifier.height(4.dp)) }
-        if (workspace.repo == null && agent.feed.isEmpty()) item { StatusCard("Open the repository drawer to clone a project, then ask iQForge to review, explain, or fix code.") }
+        item { Spacer(Modifier.height(12.dp)) }
         items(agent.feed) { item -> when (item) {
             is FeedItem.User           -> UserBubble(item.text)
             is FeedItem.Status         -> StatusCard(item.text, item.success, item.error)
@@ -357,9 +765,41 @@ class AgentViewModel(
     }
 }
 
+@Composable private fun EmptyAgentState(modifier: Modifier, repositoryName: String?) =
+    Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(
+            modifier = Modifier.padding(horizontal = 28.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = "IQF",
+                color = IqfCoral,
+                fontSize = 30.sp,
+                fontWeight = FontWeight.Black,
+                letterSpacing = 3.sp
+            )
+            Spacer(Modifier.height(22.dp))
+            Text(
+                text = "Up late, Delfi?",
+                color = MaterialTheme.colorScheme.onBackground,
+                fontFamily = FontFamily.Serif,
+                fontSize = 25.sp,
+                lineHeight = 32.sp
+            )
+            if (repositoryName != null) {
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    text = repositoryName,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelLarge
+                )
+            }
+        }
+    }
+
 @Composable private fun UserBubble(text: String) =
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-        Surface(color = Color(0xFF0B4D93), shape = RoundedCornerShape(20.dp, 20.dp, 4.dp, 20.dp)) {
+        Surface(color = Color(0xFF553126), shape = RoundedCornerShape(20.dp, 20.dp, 4.dp, 20.dp)) {
             Text(text, Modifier.padding(horizontal = 16.dp, vertical = 11.dp))
         }
     }
@@ -526,20 +966,661 @@ class AgentViewModel(
 // Bottom bar & drawers
 // ---------------------------------------------------------------------------
 
-@Composable private fun Composer(agent: AgentViewModel, send: () -> Unit) =
-    Surface(color = MaterialTheme.colorScheme.background, shadowElevation = 8.dp) {
-        Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton({}) { Icon(Icons.Default.CameraAlt, "Attach code from camera") }
-            IconButton({}) { Icon(Icons.Default.Mic, "Voice prompt") }
-            OutlinedTextField(
-                agent.composer, agent::updateComposer, Modifier.weight(1f),
-                placeholder = { Text("Ask iQForge...") }, singleLine = true
-            )
-            IconButton(send, enabled = agent.composer.isNotBlank() && !agent.sending) {
-                Icon(Icons.AutoMirrored.Filled.Send, "Send", tint = MaterialTheme.colorScheme.primary)
+@Composable private fun Composer(agent: AgentViewModel, onAdd: () -> Unit, onModel: () -> Unit, send: () -> Unit) =
+    Surface(color = MaterialTheme.colorScheme.background) {
+        Surface(
+            modifier = Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 8.dp, bottom = 16.dp),
+            color = MaterialTheme.colorScheme.surface,
+            shape = RoundedCornerShape(32.dp),
+            shadowElevation = 10.dp,
+            tonalElevation = 1.dp
+        ) {
+            Column(Modifier.padding(14.dp)) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(24.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 17.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Private on-device coding",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Spacer(Modifier.weight(1f))
+                        Text(
+                            if (agent.modelServiceReady) "Real model ready" else "Offline fallback",
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.SemiBold,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                }
+
+                if (agent.attachments.isNotEmpty() || agent.attachmentMessage != null) {
+                    AttachmentStrip(agent)
+                }
+
+                TextField(
+                    value = agent.composer,
+                    onValueChange = agent::updateComposer,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 76.dp, max = 132.dp),
+                    placeholder = {
+                        Text(
+                            "Chat with IQF...",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .75f),
+                            fontSize = 22.sp
+                        )
+                    },
+                    enabled = !agent.sending,
+                    maxLines = 4,
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(fontSize = 20.sp),
+                    colors = TextFieldDefaults.colors(
+                        focusedContainerColor = Color.Transparent,
+                        unfocusedContainerColor = Color.Transparent,
+                        disabledContainerColor = Color.Transparent,
+                        focusedIndicatorColor = Color.Transparent,
+                        unfocusedIndicatorColor = Color.Transparent,
+                        disabledIndicatorColor = Color.Transparent
+                    )
+                )
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    FilledIconButton(
+                        onClick = onAdd,
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                            contentColor = MaterialTheme.colorScheme.onSurface
+                        )
+                    ) {
+                        Icon(Icons.Default.Add, "Attach code from camera")
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    Surface(
+                        onClick = onModel,
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        shape = RoundedCornerShape(24.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 11.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                Icons.Default.AutoAwesome,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(17.dp)
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                agent.selectedModel?.substringBefore(':') ?: "Select model",
+                                fontWeight = FontWeight.Medium,
+                                maxLines = 1
+                            )
+                        }
+                    }
+                    Spacer(Modifier.weight(1f))
+                    IconButton(onClick = {}) {
+                        Icon(
+                            Icons.Default.Mic,
+                            contentDescription = "Voice prompt",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(25.dp)
+                        )
+                    }
+                    Spacer(Modifier.width(4.dp))
+                    FilledIconButton(
+                        onClick = { if (agent.composer.isNotBlank() && !agent.sending) send() },
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = if (agent.composer.isNotBlank()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                            contentColor = if (agent.composer.isNotBlank()) Color.White else MaterialTheme.colorScheme.surface
+                        )
+                    ) {
+                        if (agent.sending) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(21.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.surface
+                            )
+                        } else {
+                            Icon(
+                                if (agent.composer.isBlank()) Icons.Default.GraphicEq else Icons.AutoMirrored.Filled.Send,
+                                contentDescription = if (agent.composer.isBlank()) "Voice conversation" else "Send"
+                            )
+                        }
+                    }
+                }
             }
         }
     }
+
+@Composable private fun AttachmentStrip(agent: AgentViewModel) {
+    Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+        if (agent.attachments.isNotEmpty()) {
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(agent.attachments, key = { it.id }) { attachment ->
+                    InputChip(
+                        selected = true,
+                        onClick = { agent.removeAttachment(attachment.id) },
+                        label = { Text(attachment.name, maxLines = 1) },
+                        avatar = {
+                            Icon(
+                                when (attachment.kind) {
+                                    AttachmentKind.CAMERA -> Icons.Default.CameraAlt
+                                    AttachmentKind.PHOTO -> Icons.Default.Photo
+                                    AttachmentKind.FILE -> Icons.Default.Description
+                                },
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        },
+                        trailingIcon = { Icon(Icons.Default.Close, "Remove ${attachment.name}", Modifier.size(16.dp)) }
+                    )
+                }
+            }
+        }
+        agent.attachmentMessage?.let { message ->
+            Row(
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (agent.attachmentBusy) {
+                    CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(7.dp))
+                }
+                Text(
+                    message,
+                    color = if (message.contains("could not", true) || message.contains("required", true) || message.startsWith("No "))
+                        MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun AddToChatSheet(
+    agent: AgentViewModel,
+    hasProject: Boolean,
+    onDismiss: () -> Unit,
+    onCamera: () -> Unit,
+    onPhotos: () -> Unit,
+    onFiles: () -> Unit,
+    onProject: () -> Unit,
+    onToolAccess: () -> Unit,
+    onConnectors: () -> Unit
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = Color(0xFF151614),
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        dragHandle = { BottomSheetDefaults.DragHandle(color = MaterialTheme.colorScheme.outline) }
+    ) {
+        LazyColumn(
+            modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            item {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onDismiss) { Icon(Icons.Default.Close, "Close add to chat") }
+                    Text(
+                        "Add to chat",
+                        modifier = Modifier.weight(1f),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(Modifier.size(48.dp))
+                }
+            }
+            item {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    AddToChatTile("Camera", Icons.Default.CameraAlt, onCamera, Modifier.weight(1f))
+                    AddToChatTile("Photos", Icons.Default.PhotoLibrary, onPhotos, Modifier.weight(1f))
+                    AddToChatTile("Files", Icons.Default.UploadFile, onFiles, Modifier.weight(1f))
+                }
+            }
+            item {
+                Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(24.dp)) {
+                    Column {
+                        AddToChatToggle(
+                            title = "Web search",
+                            subtitle = "Ground prompts with live sources through the laptop bridge",
+                            icon = Icons.Default.Language,
+                            checked = agent.webSearchEnabled,
+                            onCheckedChange = agent::updateWebSearch
+                        )
+                        HorizontalDivider(color = MaterialTheme.colorScheme.background)
+                        AddToChatToggle(
+                            title = "Memory",
+                            subtitle = "Remember recent context privately on this device",
+                            icon = Icons.Default.History,
+                            checked = agent.memoryEnabled,
+                            onCheckedChange = agent::updateMemory
+                        )
+                    }
+                }
+            }
+            item {
+                Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(24.dp)) {
+                    Column {
+                        AddToChatRow(
+                            title = "Add to project",
+                            subtitle = if (hasProject) "Current repository attached" else "Choose or clone a repository",
+                            icon = Icons.Default.Inventory2,
+                            onClick = onProject
+                        )
+                        HorizontalDivider(color = MaterialTheme.colorScheme.background)
+                        AddToChatRow(
+                            title = "Tool access",
+                            subtitle = agent.toolAccessMode.label,
+                            icon = Icons.Default.BusinessCenter,
+                            onClick = onToolAccess
+                        )
+                    }
+                }
+            }
+            item {
+                Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(24.dp)) {
+                    AddToChatRow(
+                        title = "Connectors & plugins",
+                        subtitle = agent.connectorStatus,
+                        icon = Icons.Default.Link,
+                        loading = agent.checkingConnector,
+                        onClick = onConnectors
+                    )
+                }
+            }
+            item {
+                Text(
+                    "Connection states come from live provider checks. Unreachable services are never shown as connected.",
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            item { Spacer(Modifier.height(8.dp)) }
+        }
+    }
+}
+
+@Composable private fun AddToChatTile(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) = Surface(
+    onClick = onClick,
+    modifier = modifier.height(142.dp),
+    color = MaterialTheme.colorScheme.surface,
+    shape = RoundedCornerShape(22.dp)
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(50)) {
+            Icon(icon, null, Modifier.padding(15.dp).size(25.dp))
+        }
+        Spacer(Modifier.height(12.dp))
+        Text(label, style = MaterialTheme.typography.titleMedium)
+    }
+}
+
+@Composable private fun AddToChatToggle(
+    title: String,
+    subtitle: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) = Row(
+    modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 14.dp),
+    verticalAlignment = Alignment.CenterVertically
+) {
+    SheetIcon(icon)
+    Spacer(Modifier.width(14.dp))
+    Column(Modifier.weight(1f)) {
+        Text(title, style = MaterialTheme.typography.titleMedium)
+        Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+    }
+    Spacer(Modifier.width(10.dp))
+    Switch(
+        checked = checked,
+        onCheckedChange = onCheckedChange,
+        colors = SwitchDefaults.colors(
+            checkedThumbColor = Color.White,
+            checkedTrackColor = MaterialTheme.colorScheme.primary,
+            uncheckedThumbColor = MaterialTheme.colorScheme.onSurfaceVariant,
+            uncheckedTrackColor = MaterialTheme.colorScheme.surfaceVariant
+        )
+    )
+}
+
+@Composable private fun AddToChatRow(
+    title: String,
+    subtitle: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    loading: Boolean = false,
+    onClick: () -> Unit
+) = Surface(onClick = onClick, color = Color.Transparent) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 15.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        SheetIcon(icon)
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.titleMedium)
+            Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
+        }
+        if (loading) CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+        else Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+@Composable private fun SheetIcon(icon: androidx.compose.ui.graphics.vector.ImageVector) =
+    Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(50)) {
+        Icon(icon, null, Modifier.padding(12.dp).size(23.dp))
+    }
+
+@Composable private fun ToolAccessDialog(
+    selected: ToolAccessMode,
+    onSelect: (ToolAccessMode) -> Unit,
+    onDismiss: () -> Unit
+) = AlertDialog(
+    onDismissRequest = onDismiss,
+    title = { Text("Laptop tool access") },
+    text = {
+        Column {
+            Text(
+                "Controls whether IQF may send the current prompt and attached context to your configured laptop bridge.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium
+            )
+            Spacer(Modifier.height(12.dp))
+            listOf(ToolAccessMode.AUTO, ToolAccessMode.ASK, ToolAccessMode.AUTOMATIC).forEach { mode ->
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    RadioButton(selected = selected == mode, onClick = { onSelect(mode) })
+                    Column {
+                        Text(mode.label, fontWeight = FontWeight.Medium)
+                        Text(
+                            when (mode) {
+                                ToolAccessMode.AUTO -> "IQF chooses the verified real model when it is available."
+                                ToolAccessMode.ASK -> "Load the laptop model only when you tap Ask laptop."
+                                ToolAccessMode.AUTOMATIC -> "Keep the verified model ready for every request."
+                                ToolAccessMode.OFF -> "Never send prompts to the laptop bridge."
+                            },
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+        }
+    },
+    confirmButton = { TextButton(onDismiss) { Text("Done") } }
+)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun ConnectorsSheet(agent: AgentViewModel, onDismiss: () -> Unit) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.background,
+        contentColor = MaterialTheme.colorScheme.onBackground,
+        dragHandle = { BottomSheetDefaults.DragHandle() }
+    ) {
+        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 20.dp)) {
+            SheetTitle("Connectors", onDismiss) {
+                IconButton(agent::refreshServices, enabled = !agent.checkingConnector) {
+                    Icon(Icons.Default.Refresh, "Refresh live connectors")
+                }
+            }
+            if (agent.checkingConnector && agent.connectors.isEmpty()) {
+                Box(Modifier.fillMaxWidth().height(220.dp), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            } else if (agent.connectors.isEmpty()) {
+                Text(
+                    agent.connectorStatus,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(24.dp)
+                )
+            } else {
+                Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
+                    Column {
+                        agent.connectors.forEachIndexed { index, connector ->
+                            Row(
+                                Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 17.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                SheetIcon(
+                                    when (connector.id) {
+                                        "github" -> Icons.Default.Code
+                                        "ollama" -> Icons.Default.Memory
+                                        else -> Icons.Default.Language
+                                    }
+                                )
+                                Spacer(Modifier.width(14.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(connector.name, style = MaterialTheme.typography.titleMedium)
+                                    Text(
+                                        connector.detail,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+                                Icon(
+                                    if (connector.connected) Icons.Default.CheckCircle else Icons.Default.ErrorOutline,
+                                    contentDescription = connector.status,
+                                    tint = if (connector.connected) Color(0xFF4CAF70) else MaterialTheme.colorScheme.error
+                                )
+                            }
+                            if (index != agent.connectors.lastIndex) HorizontalDivider()
+                        }
+                    }
+                }
+            }
+            Text(
+                "These states are live checks against Ollama, GitHub's API, and the web-search provider. Authentication secrets are never bundled in the APK.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(12.dp)
+            )
+            Spacer(Modifier.height(20.dp))
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun ProjectSelectorSheet(
+    state: WorkspaceUiState,
+    onSelect: (String) -> Unit,
+    onClone: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    var query by rememberSaveable { mutableStateOf("") }
+    val projects = state.repositories.filter { it.name.contains(query, ignoreCase = true) }
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.background,
+        contentColor = MaterialTheme.colorScheme.onBackground
+    ) {
+        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 20.dp)) {
+            SheetTitle("Add to project", onDismiss) {
+                IconButton(onClone) { Icon(Icons.Default.Add, "Clone another repository") }
+            }
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                modifier = Modifier.fillMaxWidth(),
+                placeholder = { Text("Search projects") },
+                leadingIcon = { Icon(Icons.Default.Search, null) },
+                singleLine = true,
+                shape = RoundedCornerShape(18.dp)
+            )
+            Spacer(Modifier.height(14.dp))
+            if (projects.isEmpty()) {
+                Text("No cloned project matches your search.", Modifier.padding(20.dp))
+            } else {
+                Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
+                    Column {
+                        projects.forEachIndexed { index, repo ->
+                            Surface(onClick = { onSelect(repo.name) }, color = Color.Transparent) {
+                                Row(
+                                    Modifier.fillMaxWidth().padding(18.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(Icons.Default.Inventory2, null)
+                                    Spacer(Modifier.width(14.dp))
+                                    Text(repo.name, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                                    if (repo.root == state.repo?.root) Icon(Icons.Default.Check, "Selected")
+                                }
+                            }
+                            if (index != projects.lastIndex) HorizontalDivider()
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(28.dp))
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun ModelSelectorSheet(
+    agent: AgentViewModel,
+    onEffort: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.background,
+        contentColor = MaterialTheme.colorScheme.onBackground
+    ) {
+        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 20.dp)) {
+            SheetTitle("Select model", onDismiss)
+            if (agent.availableModels.isEmpty()) {
+                Text(
+                    "No verified model is available. Start Ollama and install a model, then refresh Connectors.",
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(20.dp)
+                )
+            } else {
+                Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
+                    Column {
+                        agent.availableModels.forEachIndexed { index, model ->
+                            Surface(onClick = { agent.selectModel(model) }, color = Color.Transparent) {
+                                Row(
+                                    Modifier.fillMaxWidth().padding(18.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(
+                                            model.id,
+                                            color = if (model.id == agent.selectedModel) Color(0xFF75AFFF) else MaterialTheme.colorScheme.onSurface,
+                                            style = MaterialTheme.typography.titleMedium
+                                        )
+                                        Text(
+                                            listOfNotNull(model.parameterSize, model.quantization).joinToString(" - "),
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
+                                    if (model.id == agent.selectedModel) Icon(Icons.Default.Check, "Selected", tint = Color(0xFF75AFFF))
+                                }
+                            }
+                            if (index != agent.availableModels.lastIndex) HorizontalDivider()
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+            Surface(onClick = onEffort, color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
+                Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
+                    SheetIcon(Icons.Default.Timer)
+                    Spacer(Modifier.width(14.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Effort", style = MaterialTheme.typography.titleMedium)
+                        Text(agent.effort.label, color = Color(0xFF75AFFF))
+                    }
+                    Icon(Icons.Default.ChevronRight, null)
+                }
+            }
+            Spacer(Modifier.height(24.dp))
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun EffortSheet(agent: AgentViewModel, onDismiss: () -> Unit) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.background,
+        contentColor = MaterialTheme.colorScheme.onBackground
+    ) {
+        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 20.dp)) {
+            SheetTitle("Effort", onDismiss)
+            Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
+                Column {
+                    EffortLevel.entries.forEachIndexed { index, level ->
+                        Surface(
+                            onClick = { agent.updateEffort(level) },
+                            color = Color.Transparent
+                        ) {
+                            Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        level.label,
+                                        color = if (level == agent.effort) Color(0xFF75AFFF) else MaterialTheme.colorScheme.onSurface,
+                                        style = MaterialTheme.typography.titleMedium
+                                    )
+                                    if (level == EffortLevel.MEDIUM) Text("Default", style = MaterialTheme.typography.labelSmall)
+                                }
+                                if (level == agent.effort) Icon(Icons.Default.Check, "Selected", tint = Color(0xFF75AFFF))
+                            }
+                        }
+                        if (index != EffortLevel.entries.lastIndex) HorizontalDivider()
+                    }
+                }
+            }
+            Text(
+                "Effort changes the depth and response budget sent to the real model.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(12.dp)
+            )
+            Spacer(Modifier.height(24.dp))
+        }
+    }
+}
+
+@Composable private fun SheetTitle(
+    title: String,
+    onBack: () -> Unit,
+    action: @Composable () -> Unit = { Spacer(Modifier.size(48.dp)) }
+) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        IconButton(onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
+        Text(
+            title,
+            Modifier.weight(1f),
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.SemiBold
+        )
+        action()
+    }
+    Spacer(Modifier.height(14.dp))
+}
 
 @Composable private fun RepositoryDrawer(
     state: WorkspaceUiState,

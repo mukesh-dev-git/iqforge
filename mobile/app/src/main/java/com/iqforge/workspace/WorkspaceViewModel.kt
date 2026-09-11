@@ -17,6 +17,7 @@ data class WorkspaceUiState(
     val githubUsername: String = "",
     val githubToken: String = "",
     val repo: Repo? = null,
+    val repositories: List<Repo> = emptyList(),
     val entries: List<WorkspaceEntry> = emptyList(),
     val expandedDirectories: Set<String> = emptySet(),
     val selectedFile: WorkspaceEntry? = null,
@@ -38,15 +39,23 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
-            val existing = workspaceRoot.listFiles()
+            val repositories = workspaceRoot.listFiles()
                 ?.filter { it.isDirectory && it.resolve(".git").isDirectory }
-                ?.maxByOrNull { it.resolve(".git/index").lastModified() }
+                ?.sortedByDescending { it.resolve(".git/index").lastModified() }
+                ?.map { Repo(it, it.name) }
+                .orEmpty()
+            val existing = repositories.firstOrNull()
             if (existing != null) {
-                val repo = Repo(existing, existing.name)
-                val entries = files.visibleEntries(repo.root, emptySet())
+                val entries = files.visibleEntries(existing.root, emptySet())
                 withContext(Dispatchers.Main) {
-                    mutableState.value = mutableState.value.copy(repo = repo, entries = entries)
+                    mutableState.value = mutableState.value.copy(
+                        repo = existing,
+                        repositories = repositories,
+                        entries = entries
+                    )
                 }
+            } else withContext(Dispatchers.Main) {
+                mutableState.value = mutableState.value.copy(repositories = repositories)
             }
         }
     }
@@ -66,11 +75,32 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
         withContext(Dispatchers.Main) {
             mutableState.value = mutableState.value.copy(
                 repo = repo,
+                repositories = (mutableState.value.repositories.filterNot { it.root == repo.root } + repo)
+                    .sortedBy { it.name.lowercase() },
                 githubToken = "",
                 entries = files.visibleEntries(repo.root, emptySet()),
                 message = "Cloned ${repo.name}",
                 error = null
             )
+        }
+    }
+
+    fun selectRepository(name: String) {
+        val repo = mutableState.value.repositories.firstOrNull { it.name == name } ?: return
+        runOperation("Opening ${repo.name}…") {
+            val entries = files.visibleEntries(repo.root, emptySet())
+            withContext(Dispatchers.Main) {
+                mutableState.value = mutableState.value.copy(
+                    repo = repo,
+                    entries = entries,
+                    expandedDirectories = emptySet(),
+                    selectedFile = null,
+                    editorText = "",
+                    editorDirty = false,
+                    message = "Opened ${repo.name}",
+                    error = null
+                )
+            }
         }
     }
 

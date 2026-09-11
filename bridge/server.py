@@ -30,6 +30,10 @@ import logging
 import subprocess
 import platform
 from pathlib import Path
+import requests
+import html
+import json
+import xml.etree.ElementTree as ET
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -136,6 +140,7 @@ class EscalateRequest(BaseModel):
     task: str
     context: str
     instruction: str
+    effort: str = "medium"
 
 
 class EscalateResponse(BaseModel):
@@ -155,6 +160,22 @@ class ExecResponse(BaseModel):
     exit_code: int
 
 
+class WebSearchRequest(BaseModel):
+    query: str
+    max_results: int = 5
+
+
+class WebSearchResult(BaseModel):
+    title: str
+    url: str
+    snippet: str
+
+
+class WebSearchResponse(BaseModel):
+    query: str
+    results: list[WebSearchResult]
+
+
 class StatusResponse(BaseModel):
     status: str
     backend: str
@@ -163,12 +184,41 @@ class StatusResponse(BaseModel):
     ollama_reachable: bool | None
 
 
+class ModelInfo(BaseModel):
+    id: str
+    parameter_size: str | None = None
+    quantization: str | None = None
+    capabilities: list[str] = []
+    selected: bool = False
+
+
+class ModelsResponse(BaseModel):
+    models: list[ModelInfo]
+
+
+class SelectModelRequest(BaseModel):
+    model: str
+
+
+class ConnectorInfo(BaseModel):
+    id: str
+    name: str
+    status: str
+    detail: str
+    connected: bool
+
+
+class ConnectorsResponse(BaseModel):
+    connectors: list[ConnectorInfo]
+
+
 # --- Backend setup ---
 
 if BACKEND == "npu":
     import npu_backend
 
     MODEL_NAME = "Qwen2.5-Coder-1.5B (NPU)"
+    ACTIVE_MODEL = MODEL_NAME
     OLLAMA_URL = None
 
     def run_backend(prompt: str) -> str:
@@ -178,7 +228,8 @@ else:
     import requests as _requests
 
     OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-    MODEL_NAME = os.environ.get("REVIEW_MODEL", "qwen2.5-coder:7b")
+    MODEL_NAME = os.environ.get("REVIEW_MODEL", "qwen2.5-coder:1.5b")
+    ACTIVE_MODEL = MODEL_NAME
 
     def _check_ollama() -> bool:
         try:
@@ -191,7 +242,7 @@ else:
         try:
             resp = _requests.post(
                 f"{OLLAMA_URL}/api/generate",
-                json={"model": MODEL_NAME, "prompt": prompt, "stream": False},
+                json={"model": ACTIVE_MODEL, "prompt": prompt, "stream": False},
                 timeout=180,
             )
             resp.raise_for_status()
@@ -200,7 +251,7 @@ else:
                 status_code=503,
                 detail=(
                     f"Ollama is not running. Start it with: ollama serve  "
-                    f"then: ollama pull {MODEL_NAME}"
+                    f"then: ollama pull {ACTIVE_MODEL}"
                 ),
             )
         except _requests.exceptions.Timeout:
@@ -242,6 +293,124 @@ def is_safe_path(requested_cwd: str) -> bool:
         return False
 
 
+def search_web(query: str, max_results: int = 5) -> list[WebSearchResult]:
+    """Live developer lookup with a second real provider when Bing is unavailable."""
+    results: list[WebSearchResult] = []
+    try:
+        response = requests.get(
+            "https://www.bing.com/search",
+            params={"q": query, "format": "rss"},
+            headers={"User-Agent": "iQForge/1.0"},
+            timeout=12,
+        )
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+        for item in root.findall(".//item"):
+            title = (item.findtext("title") or "").strip()
+            url = (item.findtext("link") or "").strip()
+            description = html.unescape(item.findtext("description") or "")
+            snippet = re.sub(r"<[^>]+>", " ", description)
+            snippet = re.sub(r"\s+", " ", snippet).strip()
+            if title and url:
+                results.append(WebSearchResult(title=title, url=url, snippet=snippet))
+            if len(results) >= max_results:
+                break
+    except (requests.RequestException, ET.ParseError, subprocess.SubprocessError, OSError, json.JSONDecodeError) as error:
+        log.warning("Bing search failed; trying authenticated GitHub search: %s", error)
+
+    if results:
+        return results[:max_results]
+
+    # GitHub CLI uses the existing OS-keyring credential, which avoids embedding an API
+    # token and provides a useful developer-search fallback for coding prompts.
+    gh = subprocess.run(
+        ["gh", "api", "--method", "GET", "search/repositories", "-f", f"q={query}",
+         "-f", f"per_page={max_results}"],
+        capture_output=True, text=True, timeout=15, check=True,
+    )
+    for item in json.loads(gh.stdout).get("items", []):
+        results.append(WebSearchResult(
+            title=item.get("full_name", "GitHub repository"),
+            url=item.get("html_url", ""),
+            snippet=(item.get("description") or "GitHub repository result").strip(),
+        ))
+    return [result for result in results if result.url][:max_results]
+
+
+def installed_ollama_models() -> list[ModelInfo]:
+    """Return only models Ollama confirms are installed on this machine."""
+    if BACKEND != "ollama":
+        return [ModelInfo(id=ACTIVE_MODEL, selected=True)]
+    response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=8)
+    response.raise_for_status()
+    models: list[ModelInfo] = []
+    for item in response.json().get("models", []):
+        details = item.get("details") or {}
+        models.append(ModelInfo(
+            id=item.get("name") or item.get("model"),
+            parameter_size=details.get("parameter_size"),
+            quantization=details.get("quantization_level"),
+            capabilities=item.get("capabilities") or [],
+            selected=(item.get("name") or item.get("model")) == ACTIVE_MODEL,
+        ))
+    return [model for model in models if model.id]
+
+
+def live_connectors() -> list[ConnectorInfo]:
+    """Probe real providers; a failed probe is never reported as connected."""
+    connectors: list[ConnectorInfo] = []
+
+    try:
+        models = installed_ollama_models()
+        selected = next((model for model in models if model.selected), None)
+        connectors.append(ConnectorInfo(
+            id="ollama",
+            name="Ollama",
+            status="Connected" if selected else "Model selection required",
+            detail=(selected.id if selected else f"{len(models)} installed model(s)"),
+            connected=selected is not None,
+        ))
+    except (requests.RequestException, subprocess.SubprocessError, OSError, json.JSONDecodeError) as error:
+        connectors.append(ConnectorInfo(
+            id="ollama", name="Ollama", status="Unavailable",
+            detail=str(error), connected=False,
+        ))
+
+    repository = os.environ.get("GITHUB_REPOSITORY", "mukesh-dev-git/iqforge")
+    try:
+        # gh reads the user's token from its OS keyring. The secret is never copied into
+        # this process, logged, returned to the phone, or bundled in the APK.
+        gh = subprocess.run(
+            ["gh", "api", f"repos/{repository}"],
+            capture_output=True, text=True, timeout=12, check=True,
+        )
+        payload = json.loads(gh.stdout)
+        connectors.append(ConnectorInfo(
+            id="github", name="GitHub", status="Connected",
+            detail=f"{payload['full_name']} - {payload.get('open_issues_count', 0)} open issue(s)",
+            connected=True,
+        ))
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError) as error:
+        connectors.append(ConnectorInfo(
+            id="github", name="GitHub", status="Unavailable",
+            detail=str(error), connected=False,
+        ))
+
+    try:
+        result_count = len(search_web("iQForge GitHub", 1))
+        connectors.append(ConnectorInfo(
+            id="web", name="Web search", status="Connected" if result_count else "Unavailable",
+            detail="Bing RSS live grounding" if result_count else "Provider returned no result",
+            connected=result_count > 0,
+        ))
+    except (requests.RequestException, ET.ParseError, subprocess.SubprocessError, OSError, json.JSONDecodeError) as error:
+        connectors.append(ConnectorInfo(
+            id="web", name="Web search", status="Unavailable",
+            detail=str(error), connected=False,
+        ))
+    return connectors
+
+
 # --- Endpoints ---
 
 @app.post("/review", response_model=ReviewResponse)
@@ -276,6 +445,18 @@ def escalate(req: EscalateRequest) -> EscalateResponse:
         prompt = PROMPTS["review"].format(diff=req.context)
     else:
         prompt = PROMPTS[req.task].format(context=req.context, instruction=req.instruction)
+
+    effort_guidance = {
+        "low": "Answer briefly. Use at most 180 generated tokens.",
+        "medium": "Give a focused answer with enough implementation detail.",
+        "high": "Reason carefully and cover important edge cases.",
+        "extra": "Perform a deep engineering analysis before answering.",
+        "max": "Use maximum rigor: analyze alternatives, edge cases, tests, and failure modes.",
+    }
+    effort = req.effort.lower()
+    if effort not in effort_guidance:
+        raise HTTPException(status_code=400, detail="Unsupported effort level")
+    prompt = f"{effort_guidance[effort]}\n\n{prompt}"
 
     t0 = time.time()
     raw = run_backend(prompt)
@@ -330,10 +511,60 @@ def execute_command(req: ExecRequest) -> ExecResponse:
         raise HTTPException(status_code=500, detail=f"Execution failed: {str(e)}")
 
 
+@app.post("/search", response_model=WebSearchResponse)
+def web_search(req: WebSearchRequest) -> WebSearchResponse:
+    query = req.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query must not be empty")
+    if len(query) > 500:
+        raise HTTPException(status_code=400, detail="query must be 500 characters or fewer")
+    limit = max(1, min(req.max_results, 8))
+    try:
+        results = search_web(query, limit)
+    except (requests.RequestException, subprocess.SubprocessError, OSError, json.JSONDecodeError) as error:
+        log.warning("Web search unavailable: %s", error)
+        raise HTTPException(status_code=502, detail="Web search provider is unavailable")
+    return WebSearchResponse(query=query, results=results)
+
+
 @app.get("/health")
 def health():
-    """Quick liveness check — use /status for a richer diagnostic."""
-    return {"status": "ok", "backend": BACKEND, "model": MODEL_NAME}
+    """Liveness plus truthful model readiness; never imply a missing model is connected."""
+    reachable = _check_ollama() if BACKEND == "ollama" else True
+    return {
+        "status": "ok" if reachable else "degraded",
+        "backend": BACKEND,
+        "model": ACTIVE_MODEL,
+        "model_reachable": reachable,
+    }
+
+
+@app.get("/models", response_model=ModelsResponse)
+def models() -> ModelsResponse:
+    try:
+        return ModelsResponse(models=installed_ollama_models())
+    except requests.RequestException as error:
+        raise HTTPException(status_code=503, detail=f"Model service unavailable: {error}")
+
+
+@app.post("/models/select", response_model=ModelInfo)
+def select_model(req: SelectModelRequest) -> ModelInfo:
+    global ACTIVE_MODEL
+    try:
+        installed = installed_ollama_models()
+    except requests.RequestException as error:
+        raise HTTPException(status_code=503, detail=f"Model service unavailable: {error}")
+    selected = next((model for model in installed if model.id == req.model), None)
+    if selected is None:
+        raise HTTPException(status_code=400, detail="Model is not installed in Ollama")
+    ACTIVE_MODEL = selected.id
+    selected.selected = True
+    return selected
+
+
+@app.get("/connectors", response_model=ConnectorsResponse)
+def connectors() -> ConnectorsResponse:
+    return ConnectorsResponse(connectors=live_connectors())
 
 
 @app.get("/status", response_model=StatusResponse)
@@ -343,7 +574,7 @@ def status() -> StatusResponse:
     return StatusResponse(
         status="ok",
         backend=BACKEND,
-        model=MODEL_NAME,
+        model=ACTIVE_MODEL,
         uptime_s=round(time.time() - _server_start, 1),
         ollama_reachable=ollama_ok,
     )
