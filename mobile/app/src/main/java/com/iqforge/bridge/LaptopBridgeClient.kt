@@ -80,6 +80,16 @@ open class LaptopBridgeClient(
         json.encodeToString(WorkspaceWriteRequest.serializer(), WorkspaceWriteRequest(cwd, path, content))
     ) { response -> json.decodeFromString(WorkspaceWriteResponse.serializer(), response).bytesWritten }
 
+    suspend fun cloneRepository(laptopUrl: String, workspace: String, url: String): RepositoryResult = request(
+        laptopUrl, "repository/clone",
+        json.encodeToString(RepositoryRequest.serializer(), RepositoryRequest(workspace, url = url))
+    ) { response -> json.decodeFromString(RepositoryResponse.serializer(), response).let { RepositoryResult(it.path, it.output) } }
+
+    suspend fun createRepository(laptopUrl: String, workspace: String, name: String, publish: Boolean): RepositoryResult = request(
+        laptopUrl, "repository/create",
+        json.encodeToString(RepositoryRequest.serializer(), RepositoryRequest(workspace, name = name, publish = publish))
+    ) { response -> json.decodeFromString(RepositoryResponse.serializer(), response).let { RepositoryResult(it.path, it.output) } }
+
     open suspend fun search(
         laptopUrl: String,
         query: String,
@@ -239,6 +249,19 @@ private data class WorkspaceWriteResponse(
     val path: String,
     @kotlinx.serialization.SerialName("bytes_written") val bytesWritten: Int
 )
+
+data class RepositoryResult(val path: String, val output: String)
+
+@Serializable
+private data class RepositoryRequest(
+    val workspace: String,
+    val name: String? = null,
+    val url: String? = null,
+    val publish: Boolean = false
+)
+
+@Serializable
+private data class RepositoryResponse(val path: String, val output: String)
 
 @Serializable
 private data class WebSearchRequest(

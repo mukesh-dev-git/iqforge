@@ -30,6 +30,7 @@ import logging
 import subprocess
 import platform
 import shlex
+import shutil
 from pathlib import Path
 import requests
 import html
@@ -202,6 +203,18 @@ class WorkspaceWriteResponse(BaseModel):
     bytes_written: int
 
 
+class RepositoryRequest(BaseModel):
+    workspace: str
+    name: str | None = None
+    url: str | None = None
+    publish: bool = False
+
+
+class RepositoryResponse(BaseModel):
+    path: str
+    output: str
+
+
 class WebSearchRequest(BaseModel):
     query: str
     max_results: int = 5
@@ -372,6 +385,13 @@ def resolve_workspace_file(cwd: str, relative_path: str) -> Path:
     if candidate == root or root not in candidate.parents:
         raise HTTPException(status_code=403, detail="File path escapes the workspace")
     return candidate
+
+
+def repository_name(value: str) -> str:
+    name = value.strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", name):
+        raise HTTPException(status_code=400, detail="Invalid repository name")
+    return name
 
 
 def search_web(query: str, max_results: int = 5) -> list[WebSearchResult]:
@@ -677,6 +697,68 @@ def write_workspace_file(req: WorkspaceWriteRequest) -> WorkspaceWriteResponse:
         raise HTTPException(status_code=413, detail="Edited file exceeds the 1 MB limit")
     target.write_bytes(encoded)
     return WorkspaceWriteResponse(path=req.path, bytes_written=len(encoded))
+
+
+@app.post("/repository/clone", response_model=RepositoryResponse)
+def clone_repository(req: RepositoryRequest) -> RepositoryResponse:
+    if not is_safe_path(req.workspace):
+        raise HTTPException(status_code=403, detail="Workspace is outside configured roots")
+    url = (req.url or "").strip()
+    if not re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?", url):
+        raise HTTPException(status_code=400, detail="Enter a valid HTTPS GitHub repository URL")
+    name = repository_name(Path(url.removesuffix(".git")).name)
+    destination = (Path(req.workspace).resolve() / name).resolve()
+    if destination.exists():
+        raise HTTPException(status_code=409, detail=f"{name} already exists")
+    result = subprocess.run(
+        ["git", "clone", url, str(destination)], capture_output=True, text=True,
+        timeout=EXEC_TIMEOUT, check=False,
+    )
+    if result.returncode != 0:
+        raise HTTPException(status_code=400, detail=(result.stderr or result.stdout).strip())
+    return RepositoryResponse(path=str(destination), output=(result.stdout or result.stderr).strip())
+
+
+@app.post("/repository/create", response_model=RepositoryResponse)
+def create_repository(req: RepositoryRequest) -> RepositoryResponse:
+    if not is_safe_path(req.workspace):
+        raise HTTPException(status_code=403, detail="Workspace is outside configured roots")
+    name = repository_name(req.name or "")
+    destination = (Path(req.workspace).resolve() / name).resolve()
+    if destination.exists():
+        raise HTTPException(status_code=409, detail=f"{name} already exists")
+    destination.mkdir()
+    (destination / "README.md").write_text(f"# {name}\n", encoding="utf-8")
+    identity = subprocess.run(["gh", "api", "user"], capture_output=True, text=True, timeout=15)
+    if identity.returncode != 0:
+        shutil.rmtree(destination)
+        raise HTTPException(status_code=400, detail="GitHub CLI is not authenticated; run gh auth login on the laptop")
+    account = json.loads(identity.stdout)
+    login = account["login"]
+    email = account.get("email") or f"{account['id']}+{login}@users.noreply.github.com"
+    commands = (
+        ["git", "init"],
+        ["git", "config", "user.name", account.get("name") or login],
+        ["git", "config", "user.email", email],
+        ["git", "add", "README.md"],
+        ["git", "commit", "-m", "Initial commit"],
+    )
+    output: list[str] = []
+    for command in commands:
+        result = subprocess.run(command, cwd=destination, capture_output=True, text=True, timeout=EXEC_TIMEOUT)
+        output.append((result.stdout or result.stderr).strip())
+        if result.returncode != 0:
+            shutil.rmtree(destination)
+            raise HTTPException(status_code=400, detail=output[-1])
+    if req.publish:
+        result = subprocess.run(
+            ["gh", "repo", "create", name, "--private", "--source", ".", "--remote", "origin", "--push"],
+            cwd=destination, capture_output=True, text=True, timeout=EXEC_TIMEOUT,
+        )
+        output.append((result.stdout or result.stderr).strip())
+        if result.returncode != 0:
+            raise HTTPException(status_code=400, detail=output[-1])
+    return RepositoryResponse(path=str(destination), output="\n".join(filter(None, output)))
 
 
 @app.post("/search", response_model=WebSearchResponse)

@@ -234,3 +234,19 @@ def test_effort_is_validated_before_model_call():
         "task": "write", "context": "", "instruction": "hello", "effort": "impossible"
     })
     assert response.status_code == 400
+
+
+def test_clone_rejects_non_github_url():
+    response = client.post("/repository/clone", json={
+        "workspace": str(Path(__file__).resolve().parents[2]),
+        "url": "https://example.com/untrusted/repository.git",
+    })
+    assert response.status_code == 400
+
+
+def test_create_rejects_unsafe_repository_name():
+    response = client.post("/repository/create", json={
+        "workspace": str(Path(__file__).resolve().parents[2]),
+        "name": "../escape",
+    })
+    assert response.status_code == 400

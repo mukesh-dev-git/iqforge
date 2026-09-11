@@ -335,6 +335,7 @@ class AgentViewModel(
     var remoteFileText by mutableStateOf(""); private set
     var remoteBusy by mutableStateOf(false); private set
     var remoteResult by mutableStateOf<String?>(null); private set
+    var activeRemoteWorkspace by mutableStateOf(""); private set
 
     companion object {
         private const val DEFAULT_BRIDGE_URL = "http://10.0.2.2:8000"
@@ -456,6 +457,56 @@ class AgentViewModel(
             dispatchWorkspaces = runCatching { bridgeClient.dispatchWorkspaces(bridgeUrl) }
                 .onFailure { dispatchError = it.message }
                 .getOrDefault(emptyList())
+            if (activeRemoteWorkspace.isBlank()) activeRemoteWorkspace = dispatchWorkspaces.firstOrNull().orEmpty()
+        }
+    }
+
+    fun selectRemoteWorkspace(path: String) {
+        activeRemoteWorkspace = path
+        refreshRemoteFiles(path)
+    }
+
+    fun cloneRemoteRepository(root: String, url: String) {
+        if (remoteBusy) return
+        remoteBusy = true; remoteResult = "Cloning repository…"
+        viewModelScope.launch {
+            try {
+                val result = bridgeClient.cloneRepository(bridgeUrl, root, url.trim())
+                activeRemoteWorkspace = result.path
+                remoteResult = "Repository cloned\n${result.output}"
+                remoteBusy = false
+                refreshRemoteFiles(result.path)
+            } catch (error: Exception) { remoteResult = error.message ?: "Clone failed" }
+            finally { remoteBusy = false }
+        }
+    }
+
+    fun createRemoteRepository(root: String, name: String, publish: Boolean) {
+        if (remoteBusy) return
+        remoteBusy = true; remoteResult = if (publish) "Creating and publishing repository…" else "Creating repository…"
+        viewModelScope.launch {
+            try {
+                val result = bridgeClient.createRepository(bridgeUrl, root, name.trim(), publish)
+                activeRemoteWorkspace = result.path
+                remoteResult = if (publish) "Private GitHub repository created and pushed" else "Local Git repository created"
+                remoteBusy = false
+                refreshRemoteFiles(result.path)
+            } catch (error: Exception) { remoteResult = error.message ?: "Repository creation failed" }
+            finally { remoteBusy = false }
+        }
+    }
+
+    fun runRemoteCommand(cwd: String, command: String) {
+        if (remoteBusy || command.isBlank()) return
+        remoteBusy = true; remoteResult = "$ $command\nRunning…"
+        viewModelScope.launch {
+            try {
+                val result = bridgeClient.execute(bridgeUrl, command.trim(), cwd)
+                remoteResult = "$ $command\n" + (result.stdout + result.stderr).trim() + "\nExit ${result.exitCode}"
+                remoteBusy = false
+                refreshRemoteFiles(cwd)
+            } catch (error: Exception) { remoteResult = error.message ?: "Command failed" }
+            finally { remoteBusy = false }
         }
     }
 
@@ -1051,8 +1102,7 @@ class AgentViewModel(
                     state = state,
                     workspace = workspace,
                     agent = agent,
-                    onAddDevice = { settingsDialog = SettingsDialog.DEVICE },
-                    onNewSession = { showCreateTask = true }
+                    onAddDevice = { settingsDialog = SettingsDialog.DEVICE }
                 )
                 AppDestination.ARTIFACTS -> ArtifactsPage(state, workspace)
                 AppDestination.SETTINGS -> SettingsPage(
@@ -2489,12 +2539,13 @@ private fun displayModelText(text: String): String = text
     state: WorkspaceUiState,
     workspace: WorkspaceViewModel,
     agent: AgentViewModel,
-    onAddDevice: () -> Unit,
-    onNewSession: () -> Unit
+    onAddDevice: () -> Unit
 ) {
     var filesOpen by rememberSaveable { mutableStateOf(false) }
     var laptopFilesOpen by rememberSaveable { mutableStateOf(false) }
+    var showRepositoryDialog by rememberSaveable { mutableStateOf(false) }
     val laptopRoot = agent.dispatchWorkspaces.firstOrNull().orEmpty()
+    val activeRoot = agent.activeRemoteWorkspace.ifBlank { laptopRoot }
     Column(Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Code", style = MaterialTheme.typography.displaySmall, modifier = Modifier.weight(1f))
@@ -2503,7 +2554,7 @@ private fun displayModelText(text: String): String = text
                 onClick = {
                     laptopFilesOpen = !laptopFilesOpen
                     filesOpen = false
-                    if (laptopFilesOpen) agent.refreshRemoteFiles(laptopRoot)
+                    if (laptopFilesOpen) agent.refreshRemoteFiles(activeRoot)
                 }
             ) { Text(if (laptopFilesOpen) "Sessions" else "Laptop files") }
             if (state.repo != null) TextButton(onClick = { filesOpen = !filesOpen }) {
@@ -2511,7 +2562,7 @@ private fun displayModelText(text: String): String = text
             }
         }
         if (laptopFilesOpen) {
-            RemoteLaptopFiles(agent, laptopRoot)
+            RemoteLaptopFiles(agent, activeRoot)
             return@Column
         }
         if (filesOpen && state.repo != null) {
@@ -2558,16 +2609,23 @@ private fun displayModelText(text: String): String = text
                 }
             }
         }
-        Button(onClick = onNewSession, modifier = Modifier.align(Alignment.End).padding(bottom = 22.dp)) {
+        Button(onClick = { showRepositoryDialog = true }, modifier = Modifier.align(Alignment.End).padding(bottom = 22.dp)) {
             Icon(Icons.Default.Add, null)
             Spacer(Modifier.width(8.dp))
             Text("New session")
         }
     }
+    if (showRepositoryDialog) RepositorySessionDialog(
+        agent = agent,
+        root = laptopRoot,
+        onDismiss = { showRepositoryDialog = false },
+        onCreated = { showRepositoryDialog = false; laptopFilesOpen = true }
+    )
 }
 
 @Composable private fun ColumnScope.RemoteLaptopFiles(agent: AgentViewModel, cwd: String) {
     var query by rememberSaveable { mutableStateOf("") }
+    var command by rememberSaveable { mutableStateOf("") }
     val shown = agent.remoteFiles.filter { it.contains(query, ignoreCase = true) }
     OutlinedTextField(
         query, { query = it }, Modifier.fillMaxWidth(),
@@ -2584,6 +2642,15 @@ private fun displayModelText(text: String): String = text
     }
     if (agent.remoteBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
     agent.remoteResult?.let { Text(it.take(1_500), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
+    OutlinedTextField(
+        command, { command = it }, Modifier.fillMaxWidth(),
+        placeholder = { Text("CLI: git status, git add ., git commit -m …, git push") },
+        trailingIcon = {
+            IconButton(onClick = { agent.runRemoteCommand(cwd, command) }, enabled = command.isNotBlank() && !agent.remoteBusy) {
+                Icon(Icons.Default.Send, "Run command")
+            }
+        }, singleLine = true
+    )
     LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         items(shown, key = { "remote-$it" }) { path ->
             ListItem(
@@ -2608,6 +2675,48 @@ private fun displayModelText(text: String): String = text
             dismissButton = { TextButton(onClick = agent::closeRemoteFile) { Text("Close") } }
         )
     }
+}
+
+@Composable private fun RepositorySessionDialog(
+    agent: AgentViewModel,
+    root: String,
+    onDismiss: () -> Unit,
+    onCreated: () -> Unit
+) {
+    var cloneMode by rememberSaveable { mutableStateOf(true) }
+    var value by rememberSaveable { mutableStateOf("") }
+    var publish by rememberSaveable { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("New coding session") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(cloneMode, { cloneMode = true }, { Text("Clone GitHub") })
+                    FilterChip(!cloneMode, { cloneMode = false }, { Text("Create repository") })
+                }
+                OutlinedTextField(
+                    value, { value = it }, Modifier.fillMaxWidth(),
+                    label = { Text(if (cloneMode) "HTTPS GitHub URL" else "Repository name") },
+                    singleLine = true
+                )
+                if (!cloneMode) Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(publish, { publish = it })
+                    Text("Create private GitHub repo and push")
+                }
+                Text("Laptop: $root", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                if (cloneMode) agent.cloneRemoteRepository(root, value) else agent.createRemoteRepository(root, value, publish)
+                onCreated()
+            }, enabled = root.isNotBlank() && value.isNotBlank() && !agent.remoteBusy) {
+                Text(if (cloneMode) "Clone and open" else "Create and open")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
 }
 
 @Composable private fun ArtifactsPage(state: WorkspaceUiState, workspace: WorkspaceViewModel) {
