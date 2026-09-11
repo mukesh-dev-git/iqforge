@@ -92,6 +92,20 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun createRepository(name: String, description: String) = runOperation("Creating project…") {
+        val repo = repoManager.create(name, description)
+        withContext(Dispatchers.Main) {
+            mutableState.value = mutableState.value.copy(
+                repo = repo,
+                repositories = (mutableState.value.repositories + repo).sortedBy { it.name.lowercase() },
+                entries = files.visibleEntries(repo.root, emptySet()),
+                artifacts = files.artifactFiles(repo.root),
+                message = "Created ${repo.name}",
+                error = null
+            )
+        }
+    }
+
     fun selectRepository(name: String) {
         val repo = mutableState.value.repositories.firstOrNull { it.name == name } ?: return
         runOperation("Opening ${repo.name}…") {

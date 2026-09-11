@@ -45,6 +45,10 @@ class ChatHistoryStore(
         return result
     }
 
+    fun clear() {
+        preferences.edit().remove(KEY).apply()
+    }
+
     private companion object {
         const val KEY = "saved_chats_v1"
         const val MAX_CHATS = 30

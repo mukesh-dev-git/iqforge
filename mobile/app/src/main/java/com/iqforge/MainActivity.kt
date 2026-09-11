@@ -3,8 +3,12 @@ package com.iqforge
 import android.os.Bundle
 import android.os.Build
 import android.content.Context
+import android.content.Intent
 import android.app.Application
 import android.Manifest
+import android.net.Uri
+import android.provider.Settings
+import android.speech.RecognizerIntent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.lifecycle.AndroidViewModel
 import androidx.activity.ComponentActivity
@@ -13,12 +17,16 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -34,6 +42,8 @@ import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -46,6 +56,7 @@ import androidx.lifecycle.viewmodel.CreationExtras
 import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.core.view.WindowCompat
 import androidx.core.content.FileProvider
+import androidx.core.content.ContextCompat
 import com.iqforge.engine.CodeEngine
 import com.iqforge.engine.NativeEngine
 import androidx.lifecycle.viewModelScope
@@ -59,6 +70,9 @@ import com.iqforge.chat.ChatAttachment
 import com.iqforge.chat.ChatAttachmentService
 import com.iqforge.chat.ChatHistoryStore
 import com.iqforge.chat.SavedChat
+import com.iqforge.cowork.CoworkStatus
+import com.iqforge.cowork.CoworkTask
+import com.iqforge.cowork.CoworkTaskStore
 import com.iqforge.engine.OfflineEngine
 import kotlinx.coroutines.launch
 import com.iqforge.workspace.WorkspaceEntry
@@ -84,15 +98,22 @@ private val ForgeDarkColors = darkColorScheme(
 private val ForgeLightColors = lightColorScheme(primary = Color(0xFF185ABC), background = Color(0xFFFFFBFF), surface = Color(0xFFFFFBFF), surfaceVariant = Color(0xFFE7E0EC))
 
 private enum class Appearance { SYSTEM, LIGHT, DARK }
-private enum class AppDestination { CHATS, PROJECTS, CODE, ARTIFACTS }
+private enum class FontChoice { DEFAULT, SERIF, MONOSPACE }
+private enum class AppDestination { CHATS, COWORK, PROJECTS, CODE, ARTIFACTS, SETTINGS }
+private enum class SettingsDialog { NONE, USAGE, CAPABILITIES, COLOR, FONT, VOICE, PRIVACY, DEVICE }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) = super.onCreate(savedInstanceState).also {
         setContent {
-            ForgeTheme { appearance, updateAppearance ->
+            ForgeTheme { appearance, updateAppearance, fontChoice, updateFontChoice ->
                 var showSplash by remember { mutableStateOf(true) }
                 if (showSplash) LaunchSplash { showSplash = false }
-                else AgentApp(appearance = appearance, onAppearanceChange = updateAppearance)
+                else AgentApp(
+                    appearance = appearance,
+                    onAppearanceChange = updateAppearance,
+                    fontChoice = fontChoice,
+                    onFontChoiceChange = updateFontChoice
+                )
             }
         }
     }
@@ -132,11 +153,16 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@Composable private fun ForgeTheme(content: @Composable (Appearance, (Appearance) -> Unit) -> Unit) {
+@Composable private fun ForgeTheme(
+    content: @Composable (Appearance, (Appearance) -> Unit, FontChoice, (FontChoice) -> Unit) -> Unit
+) {
     val context = LocalContext.current
     val preferences = remember { context.getSharedPreferences("iqforge_settings", Context.MODE_PRIVATE) }
     var appearance by rememberSaveable {
         mutableStateOf(runCatching { Appearance.valueOf(preferences.getString("appearance", Appearance.DARK.name) ?: Appearance.DARK.name) }.getOrDefault(Appearance.DARK))
+    }
+    var fontChoice by rememberSaveable {
+        mutableStateOf(runCatching { FontChoice.valueOf(preferences.getString("font_style", FontChoice.DEFAULT.name) ?: FontChoice.DEFAULT.name) }.getOrDefault(FontChoice.DEFAULT))
     }
     val dark = when (appearance) { Appearance.SYSTEM -> isSystemInDarkTheme(); Appearance.LIGHT -> false; Appearance.DARK -> true }
     val colors = if (dark) ForgeDarkColors else ForgeLightColors
@@ -153,12 +179,46 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-    MaterialTheme(colorScheme = colors) {
-        content(appearance) { value ->
-            appearance = value
-            preferences.edit().putString("appearance", value.name).apply()
-        }
+    MaterialTheme(colorScheme = colors, typography = forgeTypography(fontChoice)) {
+        content(
+            appearance,
+            { value ->
+                appearance = value
+                preferences.edit().putString("appearance", value.name).apply()
+            },
+            fontChoice,
+            { value ->
+                fontChoice = value
+                preferences.edit().putString("font_style", value.name).apply()
+            }
+        )
     }
+}
+
+private fun forgeTypography(choice: FontChoice): Typography {
+    val family = when (choice) {
+        FontChoice.DEFAULT -> FontFamily.Default
+        FontChoice.SERIF -> FontFamily.Serif
+        FontChoice.MONOSPACE -> FontFamily.Monospace
+    }
+    val base = Typography()
+    return Typography(
+        displayLarge = base.displayLarge.copy(fontFamily = family),
+        displayMedium = base.displayMedium.copy(fontFamily = family),
+        displaySmall = base.displaySmall.copy(fontFamily = family),
+        headlineLarge = base.headlineLarge.copy(fontFamily = family),
+        headlineMedium = base.headlineMedium.copy(fontFamily = family),
+        headlineSmall = base.headlineSmall.copy(fontFamily = family),
+        titleLarge = base.titleLarge.copy(fontFamily = family),
+        titleMedium = base.titleMedium.copy(fontFamily = family),
+        titleSmall = base.titleSmall.copy(fontFamily = family),
+        bodyLarge = base.bodyLarge.copy(fontFamily = family),
+        bodyMedium = base.bodyMedium.copy(fontFamily = family),
+        bodySmall = base.bodySmall.copy(fontFamily = family),
+        labelLarge = base.labelLarge.copy(fontFamily = family),
+        labelMedium = base.labelMedium.copy(fontFamily = family),
+        labelSmall = base.labelSmall.copy(fontFamily = family)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +287,7 @@ class AgentViewModel(
     private val attachmentService: ChatAttachmentService = ChatAttachmentService()
 ) : ViewModel() {
     private val historyStore = preferences?.let(::ChatHistoryStore)
+    private val coworkStore = preferences?.let(::CoworkTaskStore)
     var composer by mutableStateOf(""); private set
     var bridgeUrl by mutableStateOf(preferences?.getString("bridge_url", DEFAULT_BRIDGE_URL) ?: DEFAULT_BRIDGE_URL); private set
     var sending by mutableStateOf(false); private set
@@ -255,6 +316,7 @@ class AgentViewModel(
     var chats by mutableStateOf<List<SavedChat>>(historyStore?.load().orEmpty()); private set
     var activeChatId by mutableStateOf<String?>(null); private set
     var incognito by mutableStateOf(false); private set
+    var coworkTasks by mutableStateOf<List<CoworkTask>>(coworkStore?.markInterrupted().orEmpty()); private set
 
     companion object {
         private const val DEFAULT_BRIDGE_URL = "http://10.0.2.2:8000"
@@ -303,6 +365,43 @@ class AgentViewModel(
         attachments = emptyList()
         attachmentMessage = null
         feed = emptyList()
+    }
+
+    fun clearSavedChats() {
+        historyStore?.clear()
+        chats = emptyList()
+        if (!incognito) newChat()
+    }
+
+    fun clearMemory() {
+        preferences?.edit()?.remove("chat_memory")?.apply()
+    }
+
+    fun createCoworkTask(title: String, instruction: String, repository: String?) {
+        require(title.isNotBlank()) { "Enter a task name" }
+        require(instruction.isNotBlank()) { "Describe what the task should achieve" }
+        val store = coworkStore ?: return
+        val task = store.create(title, instruction, repository)
+        coworkTasks = store.load()
+        viewModelScope.launch {
+            coworkTasks = try {
+                val context = repository?.let { "Repository: $it" }.orEmpty()
+                val result = bridgeClient.escalateWithOptions(
+                    laptopUrl = bridgeUrl,
+                    task = inferTask(instruction),
+                    context = context,
+                    instruction = instruction,
+                    effort = effort.wireName
+                )
+                store.finish(task.id, result)
+            } catch (error: Exception) {
+                store.fail(task.id, error.message ?: "Task failed")
+            }
+        }
+    }
+
+    fun removeCoworkTask(id: String) {
+        coworkTasks = coworkStore?.remove(id).orEmpty()
     }
 
     fun openChat(id: String) {
@@ -628,11 +727,16 @@ class AgentViewModel(
 @Composable private fun AgentApp(
     appearance: Appearance,
     onAppearanceChange: (Appearance) -> Unit,
+    fontChoice: FontChoice,
+    onFontChoiceChange: (FontChoice) -> Unit,
     workspace: WorkspaceViewModel = viewModel(),
     agent: AgentViewModel = viewModel(factory = AgentViewModel.Factory)
 ) {
     val state by workspace.state
     val context = LocalContext.current
+    val settingsPreferences = remember { context.getSharedPreferences("iqforge_settings", Context.MODE_PRIVATE) }
+    var hapticEnabled by rememberSaveable { mutableStateOf(settingsPreferences.getBoolean("haptic_feedback", true)) }
+    var voiceLanguage by rememberSaveable { mutableStateOf(settingsPreferences.getString("voice_language", Locale.getDefault().toLanguageTag()) ?: Locale.getDefault().toLanguageTag()) }
     var navigationOpen by remember { mutableStateOf(false) }
     var destination by rememberSaveable { mutableStateOf(AppDestination.CHATS) }
     var showAddToChat by rememberSaveable { mutableStateOf(false) }
@@ -641,6 +745,9 @@ class AgentViewModel(
     var showProjects by rememberSaveable { mutableStateOf(false) }
     var showModels by rememberSaveable { mutableStateOf(false) }
     var showEffort by rememberSaveable { mutableStateOf(false) }
+    var showCreateTask by rememberSaveable { mutableStateOf(false) }
+    var showCreateProject by rememberSaveable { mutableStateOf(false) }
+    var settingsDialog by rememberSaveable { mutableStateOf(SettingsDialog.NONE) }
     var cameraUri by remember { mutableStateOf<android.net.Uri?>(null) }
     val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { captured ->
         val uri = cameraUri
@@ -656,6 +763,32 @@ class AgentViewModel(
     }
     val fileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let { agent.attachFile(context, it) }
+    }
+    val speechLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK) {
+            val spoken = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()
+            if (!spoken.isNullOrBlank()) agent.updateComposer(spoken)
+        }
+    }
+    val launchSpeech: () -> Unit = {
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, voiceLanguage)
+            putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak your IQF request")
+        }
+        runCatching { speechLauncher.launch(intent) }
+            .onFailure { agent.reportAttachmentError("No Android speech recognition service is available.") }
+        Unit
+    }
+    val audioPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) launchSpeech() else agent.reportAttachmentError("Microphone permission is required for voice input.")
+    }
+    val startVoiceInput: () -> Unit = {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            launchSpeech()
+        } else {
+            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
     }
     LaunchedEffect(Unit) { agent.refreshServices() }
     state.repo?.let { agent.showClone(it.name) }
@@ -678,6 +811,8 @@ class AgentViewModel(
                     agent = agent,
                     onAdd = { showAddToChat = true },
                     onModel = { showModels = true },
+                    onVoice = startVoiceInput,
+                    hapticEnabled = hapticEnabled,
                     send = { agent.send(state.editorText) }
                 )
             }
@@ -686,6 +821,7 @@ class AgentViewModel(
         Box(Modifier.fillMaxSize().padding(padding)) {
             when (destination) {
                 AppDestination.CHATS -> Feed(Modifier.fillMaxSize(), agent, state)
+                AppDestination.COWORK -> CoworkPage(agent, state) { showCreateTask = true }
                 AppDestination.PROJECTS -> ProjectsPage(
                     state = state,
                     workspace = workspace,
@@ -694,12 +830,32 @@ class AgentViewModel(
                         destination = AppDestination.CODE
                     },
                     onNew = {
-                        workspace.startNewRepository()
-                        destination = AppDestination.CODE
+                        showCreateProject = true
                     }
                 )
-                AppDestination.CODE -> CodeWorkspacePage(state, workspace)
+                AppDestination.CODE -> CodeSessionsPage(
+                    state = state,
+                    workspace = workspace,
+                    agent = agent,
+                    onAddDevice = { settingsDialog = SettingsDialog.DEVICE },
+                    onNewSession = { showCreateTask = true }
+                )
                 AppDestination.ARTIFACTS -> ArtifactsPage(state, workspace)
+                AppDestination.SETTINGS -> SettingsPage(
+                    appearance = appearance,
+                    fontChoice = fontChoice,
+                    hapticEnabled = hapticEnabled,
+                    agent = agent,
+                    onDialog = { settingsDialog = it },
+                    onConnectors = {
+                        showConnectors = true
+                        agent.refreshServices()
+                    },
+                    onHaptic = {
+                        hapticEnabled = it
+                        settingsPreferences.edit().putBoolean("haptic_feedback", it).apply()
+                    }
+                )
             }
         }
     }
@@ -804,6 +960,51 @@ class AgentViewModel(
     }
     if (showEffort) {
         EffortSheet(agent = agent, onDismiss = { showEffort = false })
+    }
+    if (showCreateTask) {
+        CreateCoworkTaskSheet(
+            repositories = state.repositories.map { it.name },
+            onCreate = { title, instruction, repository ->
+                agent.createCoworkTask(title, instruction, repository)
+                showCreateTask = false
+                destination = AppDestination.COWORK
+            },
+            onDismiss = { showCreateTask = false }
+        )
+    }
+    if (showCreateProject) {
+        CreateProjectSheet(
+            busy = state.busy,
+            onCreate = { name, goal ->
+                workspace.createRepository(name, goal)
+                showCreateProject = false
+                destination = AppDestination.PROJECTS
+            },
+            onClone = {
+                workspace.startNewRepository()
+                showCreateProject = false
+                destination = AppDestination.CODE
+            },
+            onDismiss = { showCreateProject = false }
+        )
+    }
+    if (settingsDialog != SettingsDialog.NONE) {
+        SettingsDetailDialog(
+            dialog = settingsDialog,
+            appearance = appearance,
+            fontChoice = fontChoice,
+            voiceLanguage = voiceLanguage,
+            agent = agent,
+            workspace = state,
+            onAppearance = onAppearanceChange,
+            onFont = onFontChoiceChange,
+            onVoiceLanguage = {
+                voiceLanguage = it
+                settingsPreferences.edit().putString("voice_language", it).apply()
+            },
+            onStartVoice = startVoiceInput,
+            onDismiss = { settingsDialog = SettingsDialog.NONE }
+        )
     }
 }
 
@@ -1094,7 +1295,15 @@ class AgentViewModel(
 // Bottom bar & drawers
 // ---------------------------------------------------------------------------
 
-@Composable private fun Composer(agent: AgentViewModel, onAdd: () -> Unit, onModel: () -> Unit, send: () -> Unit) =
+@Composable private fun Composer(
+    agent: AgentViewModel,
+    onAdd: () -> Unit,
+    onModel: () -> Unit,
+    onVoice: () -> Unit,
+    hapticEnabled: Boolean,
+    send: () -> Unit
+) {
+    val haptics = LocalHapticFeedback.current
     Surface(color = MaterialTheme.colorScheme.background) {
         Surface(
             modifier = Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 8.dp, bottom = 16.dp),
@@ -1191,7 +1400,7 @@ class AgentViewModel(
                         }
                     }
                     Spacer(Modifier.weight(1f))
-                    IconButton(onClick = {}) {
+                    IconButton(onClick = onVoice) {
                         Icon(
                             Icons.Default.Mic,
                             contentDescription = "Voice prompt",
@@ -1201,7 +1410,13 @@ class AgentViewModel(
                     }
                     Spacer(Modifier.width(4.dp))
                     FilledIconButton(
-                        onClick = { if (agent.composer.isNotBlank() && !agent.sending) send() },
+                        onClick = {
+                            if (agent.composer.isBlank()) onVoice()
+                            else if (!agent.sending) {
+                                if (hapticEnabled) haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                send()
+                            }
+                        },
                         colors = IconButtonDefaults.filledIconButtonColors(
                             containerColor = if (agent.composer.isNotBlank()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
                             contentColor = if (agent.composer.isNotBlank()) Color.White else MaterialTheme.colorScheme.surface
@@ -1224,6 +1439,7 @@ class AgentViewModel(
             }
         }
     }
+}
 
 @Composable private fun AttachmentStrip(agent: AgentViewModel) {
     Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
@@ -1543,9 +1759,11 @@ class AgentViewModel(
                     }
                 }
                 item { NavigationItem("Chats", Icons.Default.Forum) { onDestination(AppDestination.CHATS) } }
+                item { NavigationItem("Cowork", Icons.Default.TaskAlt) { onDestination(AppDestination.COWORK) } }
                 item { NavigationItem("Projects", Icons.Default.Inventory2) { onDestination(AppDestination.PROJECTS) } }
                 item { NavigationItem("Code", Icons.Default.Code) { onDestination(AppDestination.CODE) } }
                 item { NavigationItem("Artifacts", Icons.Default.Category) { onDestination(AppDestination.ARTIFACTS) } }
+                item { NavigationItem("Settings", Icons.Default.Settings) { onDestination(AppDestination.SETTINGS) } }
                 item { HorizontalDivider(Modifier.padding(vertical = 12.dp)) }
                 if (state.pinnedRepositoryNames.isNotEmpty()) {
                     item { NavigationSection("Pinned") }
@@ -1645,7 +1863,7 @@ class AgentViewModel(
         .filter { it.name.contains(query, ignoreCase = true) }
         .sortedWith(compareByDescending<com.iqforge.git.Repo> { it.name in state.pinnedRepositoryNames }.thenBy { it.name.lowercase() })
     Column(Modifier.fillMaxSize().padding(horizontal = 22.dp)) {
-        Text("Projects", fontFamily = FontFamily.Serif, fontSize = 36.sp, modifier = Modifier.padding(top = 14.dp, bottom = 20.dp))
+        Text("Projects", style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 14.dp, bottom = 20.dp))
         OutlinedTextField(
             value = query,
             onValueChange = { query = it },
@@ -1698,13 +1916,155 @@ class AgentViewModel(
             Spacer(Modifier.width(8.dp))
             Text("New project")
         }
+        state.message?.let { Text(it, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(bottom = 8.dp)) }
+        state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(bottom = 8.dp)) }
     }
 }
 
-@Composable private fun CodeWorkspacePage(state: WorkspaceUiState, workspace: WorkspaceViewModel) {
-    Column(Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 10.dp)) {
-        Text("Code", fontFamily = FontFamily.Serif, fontSize = 34.sp, modifier = Modifier.padding(bottom = 14.dp))
-        if (state.repo == null) ClonePanel(state, workspace) else FilePanel(state, workspace)
+@Composable private fun CoworkPage(agent: AgentViewModel, state: WorkspaceUiState, onNewTask: () -> Unit) {
+    var selected by remember { mutableStateOf<CoworkTask?>(null) }
+    Column(Modifier.fillMaxSize().padding(horizontal = 22.dp)) {
+        Text("Cowork", style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 14.dp, bottom = 18.dp))
+        if (agent.coworkTasks.isEmpty()) {
+            Column(
+                Modifier.weight(1f).fillMaxWidth().padding(horizontal = 22.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Icon(Icons.Default.Workspaces, null, tint = IqfCoral, modifier = Modifier.size(78.dp))
+                Spacer(Modifier.height(22.dp))
+                Text("Run coding work from your phone", style = MaterialTheme.typography.headlineMedium, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                Spacer(Modifier.height(18.dp))
+                Text("Tasks are sent to your connected model and their real result is saved here.", color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                state.repo?.let {
+                    Spacer(Modifier.height(10.dp))
+                    Text("Current repository: ${it.name}", color = MaterialTheme.colorScheme.primary)
+                }
+            }
+        } else {
+            LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                items(agent.coworkTasks, key = { it.id }) { task ->
+                    ElevatedCard(onClick = { selected = task }, modifier = Modifier.fillMaxWidth()) {
+                        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                when (task.status) {
+                                    CoworkStatus.RUNNING -> Icons.Default.Sync
+                                    CoworkStatus.COMPLETED -> Icons.Default.TaskAlt
+                                    CoworkStatus.FAILED, CoworkStatus.INTERRUPTED -> Icons.Default.ErrorOutline
+                                },
+                                null,
+                                tint = when (task.status) {
+                                    CoworkStatus.RUNNING -> MaterialTheme.colorScheme.primary
+                                    CoworkStatus.COMPLETED -> Color(0xFF2EAD5B)
+                                    else -> MaterialTheme.colorScheme.error
+                                }
+                            )
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(task.title, style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                                Text(
+                                    listOfNotNull(task.repository, task.status.name.lowercase().replaceFirstChar(Char::uppercase)).joinToString(" · "),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Text(formatProjectDate(task.updatedAt), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                }
+            }
+        }
+        Button(onClick = onNewTask, modifier = Modifier.align(Alignment.End).padding(bottom = 22.dp)) {
+            Icon(Icons.Default.Add, null)
+            Spacer(Modifier.width(8.dp))
+            Text("New task")
+        }
+    }
+    selected?.let { task ->
+        AlertDialog(
+            onDismissRequest = { selected = null },
+            title = { Text(task.title) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(task.instruction)
+                    task.result?.let { Text(it, color = MaterialTheme.colorScheme.onSurface) }
+                    task.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                }
+            },
+            confirmButton = { TextButton(onClick = { selected = null }) { Text("Done") } },
+            dismissButton = {
+                TextButton(onClick = {
+                    agent.removeCoworkTask(task.id)
+                    selected = null
+                }) { Text("Delete") }
+            }
+        )
+    }
+}
+
+@Composable private fun CodeSessionsPage(
+    state: WorkspaceUiState,
+    workspace: WorkspaceViewModel,
+    agent: AgentViewModel,
+    onAddDevice: () -> Unit,
+    onNewSession: () -> Unit
+) {
+    var filesOpen by rememberSaveable { mutableStateOf(false) }
+    Column(Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 10.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Code", style = MaterialTheme.typography.displaySmall, modifier = Modifier.weight(1f))
+            if (state.repo != null) TextButton(onClick = { filesOpen = !filesOpen }) {
+                Text(if (filesOpen) "Sessions" else "Files")
+            }
+        }
+        if (filesOpen && state.repo != null) {
+            FilePanel(state, workspace)
+            return@Column
+        }
+        Text("Devices", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 24.dp))
+        AssistChip(onClick = onAddDevice, label = { Text("Add or configure device") }, leadingIcon = { Icon(Icons.Default.Add, null) })
+        ElevatedCard(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+            Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(if (agent.modelServiceReady) Icons.Default.Laptop else Icons.Default.Computer, null)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(agent.bridgeUrl, maxLines = 1, style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        if (agent.modelServiceReady) "Connected · ${agent.selectedModel ?: "model ready"}" else agent.connectorStatus,
+                        color = if (agent.modelServiceReady) Color(0xFF2EAD5B) else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                IconButton(agent::checkBridge) { Icon(Icons.Default.Refresh, "Check connection") }
+            }
+        }
+        Text("Sessions", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 26.dp, bottom = 8.dp))
+        if (agent.coworkTasks.isEmpty()) {
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text("No model-backed coding sessions yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        } else {
+            LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                items(agent.coworkTasks, key = { "session-${it.id}" }) { task ->
+                    ElevatedCard(Modifier.fillMaxWidth()) {
+                        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Code, null)
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(task.title, maxLines = 1)
+                                Text(
+                                    "${task.status.name.lowercase()}${task.repository?.let { " · $it" }.orEmpty()}",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Button(onClick = onNewSession, modifier = Modifier.align(Alignment.End).padding(bottom = 22.dp)) {
+            Icon(Icons.Default.Add, null)
+            Spacer(Modifier.width(8.dp))
+            Text("New session")
+        }
     }
 }
 
@@ -1714,7 +2074,7 @@ class AgentViewModel(
         it.name.contains(query, ignoreCase = true) || it.relativePath.contains(query, ignoreCase = true)
     }
     Column(Modifier.fillMaxSize().padding(horizontal = 22.dp)) {
-        Text("Artifacts", fontFamily = FontFamily.Serif, fontSize = 36.sp, modifier = Modifier.padding(top = 14.dp, bottom = 20.dp))
+        Text("Artifacts", style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 14.dp, bottom = 20.dp))
         OutlinedTextField(
             query, { query = it }, Modifier.fillMaxWidth(),
             placeholder = { Text("Search code artifacts") },
@@ -1727,17 +2087,28 @@ class AgentViewModel(
                 Text("Open a project to browse its real artifacts.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         } else {
-            LazyColumn(Modifier.fillMaxSize().padding(top = 12.dp)) {
-                items(artifacts, key = { it.relativePath }) { artifact ->
-                    Surface(onClick = { workspace.openArtifact(artifact) }, color = Color.Transparent) {
-                        Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.Description, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Spacer(Modifier.width(12.dp))
-                            Column {
-                                Text(artifact.name, style = MaterialTheme.typography.titleMedium)
-                                Text(artifact.relativePath, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(2),
+                modifier = Modifier.fillMaxSize().padding(top = 14.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                gridItems(artifacts, key = { it.relativePath }) { artifact ->
+                    Column(Modifier.fillMaxWidth()) {
+                        OutlinedCard(onClick = { workspace.openArtifact(artifact) }, modifier = Modifier.fillMaxWidth().height(130.dp)) {
+                            val preview = remember(artifact.file.lastModified()) {
+                                runCatching { artifact.file.readText().take(320) }.getOrDefault("Unable to preview")
                             }
+                            Text(
+                                preview,
+                                modifier = Modifier.padding(12.dp),
+                                maxLines = 7,
+                                fontFamily = FontFamily.Monospace,
+                                style = MaterialTheme.typography.labelSmall
+                            )
                         }
+                        Text(artifact.name, maxLines = 1, style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 7.dp))
+                        Text(formatProjectDate(artifact.file.lastModified()), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
                     }
                 }
             }
@@ -1747,6 +2118,273 @@ class AgentViewModel(
 
 private fun formatProjectDate(timestamp: Long): String = if (timestamp <= 0L) "unknown" else
     SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date(timestamp))
+
+@Composable private fun SettingsPage(
+    appearance: Appearance,
+    fontChoice: FontChoice,
+    hapticEnabled: Boolean,
+    agent: AgentViewModel,
+    onDialog: (SettingsDialog) -> Unit,
+    onConnectors: () -> Unit,
+    onHaptic: (Boolean) -> Unit
+) {
+    val context = LocalContext.current
+    val connected = agent.connectors.count { it.connected }
+    LazyColumn(
+        Modifier.fillMaxSize().padding(horizontal = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+        contentPadding = PaddingValues(bottom = 28.dp)
+    ) {
+        item { Text("Settings", style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 14.dp, bottom = 10.dp)) }
+        item {
+            SettingsGroup {
+                SettingsRow(Icons.Default.QueryStats, "Usage", "${agent.chats.sumOf { it.messages.size }} saved messages") { onDialog(SettingsDialog.USAGE) }
+            }
+        }
+        item {
+            SettingsGroup {
+                SettingsRow(Icons.Default.Tune, "Capabilities", "${enabledCapabilityCount(agent)} enabled") { onDialog(SettingsDialog.CAPABILITIES) }
+                HorizontalDivider()
+                SettingsRow(Icons.Default.Link, "Connectors", "$connected connected", onConnectors)
+                HorizontalDivider()
+                SettingsRow(Icons.Default.AdminPanelSettings, "Permissions", "Android app permissions") {
+                    context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}")))
+                }
+            }
+        }
+        item {
+            SettingsGroup {
+                SettingsRow(Icons.Default.DarkMode, "Color mode", appearance.name.lowercase().replaceFirstChar { it.uppercase() }) { onDialog(SettingsDialog.COLOR) }
+                HorizontalDivider()
+                SettingsRow(Icons.Default.TextFields, "Font style", fontChoice.name.lowercase().replaceFirstChar { it.uppercase() }) { onDialog(SettingsDialog.FONT) }
+                HorizontalDivider()
+                SettingsRow(Icons.Default.GraphicEq, "Voice", "Android speech recognition") { onDialog(SettingsDialog.VOICE) }
+            }
+        }
+        item {
+            SettingsGroup {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Vibration, null)
+                    Spacer(Modifier.width(14.dp))
+                    Text("Haptic feedback", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                    Switch(checked = hapticEnabled, onCheckedChange = onHaptic)
+                }
+                HorizontalDivider()
+                SettingsRow(Icons.Default.Notifications, "Notifications", "System notification controls") {
+                    val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                        .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                    context.startActivity(intent)
+                }
+                HorizontalDivider()
+                SettingsRow(Icons.Default.PrivacyTip, "Privacy", "Manage local data") { onDialog(SettingsDialog.PRIVACY) }
+                HorizontalDivider()
+                SettingsRow(Icons.Default.Share, "Sharing", "Open Android share sheet") {
+                    context.startActivity(
+                        Intent.createChooser(
+                            Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(Intent.EXTRA_TEXT, "iQForge mobile coding workspace")
+                            },
+                            "Share iQForge"
+                        )
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable private fun SettingsGroup(content: @Composable ColumnScope.() -> Unit) =
+    Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(18.dp), tonalElevation = 1.dp) {
+        Column(content = content)
+    }
+
+@Composable private fun SettingsRow(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    title: String,
+    subtitle: String,
+    onClick: () -> Unit
+) = Surface(onClick = onClick, color = Color.Transparent) {
+    Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+        Icon(icon, null)
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.titleMedium)
+            Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
+        }
+        Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
+    agent.modelServiceReady,
+    agent.webSearchEnabled,
+    agent.memoryEnabled,
+    agent.connectors.any { it.connected },
+    true // The compiled offline engine is always available.
+).count { it }
+
+@Composable private fun SettingsDetailDialog(
+    dialog: SettingsDialog,
+    appearance: Appearance,
+    fontChoice: FontChoice,
+    voiceLanguage: String,
+    agent: AgentViewModel,
+    workspace: WorkspaceUiState,
+    onAppearance: (Appearance) -> Unit,
+    onFont: (FontChoice) -> Unit,
+    onVoiceLanguage: (String) -> Unit,
+    onStartVoice: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    var bridgeUrl by remember(dialog) { mutableStateOf(agent.bridgeUrl) }
+    val title = when (dialog) {
+        SettingsDialog.USAGE -> "Usage"
+        SettingsDialog.CAPABILITIES -> "Capabilities"
+        SettingsDialog.COLOR -> "Color mode"
+        SettingsDialog.FONT -> "Font style"
+        SettingsDialog.VOICE -> "Voice"
+        SettingsDialog.PRIVACY -> "Privacy"
+        SettingsDialog.DEVICE -> "Laptop bridge"
+        SettingsDialog.NONE -> "Settings"
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            when (dialog) {
+                SettingsDialog.USAGE -> Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Saved chats: ${agent.chats.size}")
+                    Text("Saved messages: ${agent.chats.sumOf { it.messages.size }}")
+                    Text("Cowork tasks: ${agent.coworkTasks.size}")
+                    Text("Repositories on device: ${workspace.repositories.size}")
+                    Text("Readable artifacts: ${workspace.artifacts.size}")
+                }
+                SettingsDialog.CAPABILITIES -> Column {
+                    CapabilityToggle("Real model", agent.modelServiceReady, null)
+                    CapabilityToggle("Offline engine", true, null)
+                    CapabilityToggle("Web search", agent.webSearchEnabled, agent::updateWebSearch)
+                    CapabilityToggle("Memory", agent.memoryEnabled, agent::updateMemory)
+                    CapabilityToggle("Live connectors", agent.connectors.any { it.connected }, null)
+                }
+                SettingsDialog.COLOR -> Column {
+                    Appearance.entries.forEach { choice ->
+                        RadioSetting(choice.name.lowercase().replaceFirstChar { it.uppercase() }, appearance == choice) { onAppearance(choice) }
+                    }
+                }
+                SettingsDialog.FONT -> Column {
+                    FontChoice.entries.forEach { choice ->
+                        RadioSetting(choice.name.lowercase().replaceFirstChar { it.uppercase() }, fontChoice == choice) { onFont(choice) }
+                    }
+                }
+                SettingsDialog.VOICE -> {
+                    val languages = remember {
+                        Locale.getAvailableLocales().filter { it.language.isNotBlank() }
+                            .distinctBy { it.toLanguageTag() }.sortedBy { it.displayName }.take(80)
+                    }
+                    Column {
+                        Text("Speech input language", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        LazyColumn(Modifier.heightIn(max = 280.dp)) {
+                            items(languages, key = { it.toLanguageTag() }) { locale ->
+                                RadioSetting(locale.displayName, voiceLanguage == locale.toLanguageTag()) {
+                                    onVoiceLanguage(locale.toLanguageTag())
+                                }
+                            }
+                        }
+                        Button(onClick = onStartVoice, modifier = Modifier.fillMaxWidth()) {
+                            Icon(Icons.Default.Mic, null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Test voice input")
+                        }
+                    }
+                }
+                SettingsDialog.PRIVACY -> Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Chats, task results, preferences, and repositories are stored locally on this device. Incognito chats bypass saved history and memory.")
+                    OutlinedButton(onClick = agent::clearMemory, modifier = Modifier.fillMaxWidth()) { Text("Clear memory") }
+                    OutlinedButton(onClick = agent::clearSavedChats, modifier = Modifier.fillMaxWidth()) { Text("Clear saved chats") }
+                }
+                SettingsDialog.DEVICE -> Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(bridgeUrl, { bridgeUrl = it }, label = { Text("Bridge URL") }, singleLine = true)
+                    Text(agent.connectorStatus, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Button(onClick = {
+                        agent.updateBridgeUrl(bridgeUrl)
+                        agent.checkBridge()
+                    }, modifier = Modifier.fillMaxWidth()) { Text("Save and test") }
+                }
+                SettingsDialog.NONE -> Unit
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } }
+    )
+}
+
+@Composable private fun CapabilityToggle(label: String, enabled: Boolean, onChange: ((Boolean) -> Unit)?) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, Modifier.weight(1f))
+        if (onChange == null) Icon(if (enabled) Icons.Default.CheckCircle else Icons.Default.Cancel, null, tint = if (enabled) Color(0xFF2EAD5B) else MaterialTheme.colorScheme.error)
+        else Switch(enabled, onChange)
+    }
+}
+
+@Composable private fun RadioSetting(label: String, selected: Boolean, onClick: () -> Unit) =
+    Row(Modifier.fillMaxWidth().clickable(onClick = onClick), verticalAlignment = Alignment.CenterVertically) {
+        RadioButton(selected, onClick)
+        Text(label)
+    }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun CreateCoworkTaskSheet(
+    repositories: List<String>,
+    onCreate: (String, String, String?) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var title by rememberSaveable { mutableStateOf("") }
+    var instruction by rememberSaveable { mutableStateOf("") }
+    var repository by rememberSaveable { mutableStateOf<String?>(null) }
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(22.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Text("Create a Cowork task", style = MaterialTheme.typography.headlineSmall)
+            OutlinedTextField(title, { title = it }, Modifier.fillMaxWidth(), label = { Text("Task name") }, singleLine = true)
+            OutlinedTextField(instruction, { instruction = it }, Modifier.fillMaxWidth().height(150.dp), label = { Text("What should the model achieve?") })
+            if (repositories.isNotEmpty()) {
+                Text("Repository context", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    item { FilterChip(repository == null, { repository = null }, { Text("None") }) }
+                    items(repositories) { name -> FilterChip(repository == name, { repository = name }, { Text(name) }) }
+                }
+            }
+            Button(
+                onClick = { onCreate(title.trim(), instruction.trim(), repository) },
+                enabled = title.isNotBlank() && instruction.isNotBlank(),
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Start real task") }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun CreateProjectSheet(
+    busy: Boolean,
+    onCreate: (String, String) -> Unit,
+    onClone: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    var name by rememberSaveable { mutableStateOf("") }
+    var goal by rememberSaveable { mutableStateOf("") }
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(22.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Text("Create a project", style = MaterialTheme.typography.headlineSmall)
+            OutlinedTextField(name, { name = it }, Modifier.fillMaxWidth(), label = { Text("Project name") }, singleLine = true)
+            OutlinedTextField(goal, { goal = it }, Modifier.fillMaxWidth().height(150.dp), label = { Text("Goals and context") })
+            Button(
+                onClick = { onCreate(name.trim(), goal.trim()) },
+                enabled = name.matches(Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,79}")) && !busy,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text(if (busy) "Creating…" else "Create Git project") }
+            TextButton(onClick = onClone, modifier = Modifier.fillMaxWidth()) { Text("Clone an existing repository instead") }
+        }
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable private fun ConnectorsSheet(agent: AgentViewModel, onDismiss: () -> Unit) {
