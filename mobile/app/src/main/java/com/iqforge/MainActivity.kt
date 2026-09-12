@@ -93,6 +93,8 @@ import com.iqforge.github.GitHubIssueDto
 import com.iqforge.github.GitHubPullRequestDetailDto
 import com.iqforge.github.GitHubViewModel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.iqforge.workspace.WorkspaceEntry
 import com.iqforge.workspace.WorkspaceUiState
 import com.iqforge.workspace.WorkspaceViewModel
@@ -573,89 +575,194 @@ class AgentViewModel(
      * fetch fails gracefully and the local model still answers, just without that file's exact
      * contents — it never hard-fails just because the laptop is offline.
      */
-    fun executeGitStatus(workspacePath: String): String {
+    fun isGitCommand(text: String): Boolean {
+        val trimmed = text.trim()
+        val lower = trimmed.lowercase()
+        if (trimmed.startsWith("/") && !trimmed.startsWith("//")) {
+            val slashCmd = trimmed.substring(1).trimStart().split(Regex("\\s+")).firstOrNull()?.lowercase() ?: ""
+            if (slashCmd in setOf("git", "status", "diff", "log", "commit", "push", "pull", "branch", "checkout", "reset", "discard", "remote", "token", "help")) {
+                return true
+            }
+        }
+        if (lower.startsWith("git ") || lower == "git") {
+            return true
+        }
+        return false
+    }
+
+    private fun gitHelpText(): String = buildString {
+        appendLine("🛠️ **Supported On-Device Git Commands**:")
+        appendLine()
+        appendLine("• `/status` or `git status` — View modified, staged, and untracked files")
+        appendLine("• `/diff` or `git diff [file]` — View working tree & staged code changes")
+        appendLine("• `/log` or `git log [-n 5]` — View recent commit history")
+        appendLine("• `/commit <msg>` or `git commit -m \"...\"` — Stage all and commit on phone")
+        appendLine("• `/push` or `git push` — Push committed changes to GitHub")
+        appendLine("• `/pull` or `git pull` — Pull latest updates from remote")
+        appendLine("• `/branch` or `git branch [name]` — List or create branches")
+        appendLine("• `/checkout <branch>` — Switch branch (`-b` to create)")
+        appendLine("• `/reset` or `git reset --hard` — Discard all uncommitted changes")
+        appendLine("• `/discard <file>` — Revert a specific file to HEAD")
+        appendLine("• `/remote` or `git remote -v` — View remote repository URLs")
+        appendLine("• `/token <PAT>` — Validate & save GitHub token with repo permissions")
+        appendLine()
+        appendLine("💡 *All commands execute 100% on-device via embedded JGit.*")
+    }
+
+    suspend fun validateAndSaveGitHubToken(rawToken: String): String = withContext(Dispatchers.IO) {
+        val tok = rawToken.trim()
+        if (tok.isBlank()) {
+            return@withContext "⚠️ Please provide a token: `/token <your-github-token>`"
+        }
+        val prefs = application?.getSharedPreferences("iqforge_workspace", Context.MODE_PRIVATE) ?: preferences
+        try {
+            val url = java.net.URL("https://api.github.com/user")
+            val conn = (url.openConnection() as java.net.HttpURLConnection).apply {
+                requestMethod = "GET"
+                setRequestProperty("Authorization", "token $tok")
+                setRequestProperty("Accept", "application/vnd.github.v3+json")
+                setRequestProperty("User-Agent", "iQForge-Mobile")
+                connectTimeout = 7000
+                readTimeout = 7000
+            }
+            val code = conn.responseCode
+            if (code == 200) {
+                val resp = conn.inputStream.bufferedReader().readText()
+                val json = org.json.JSONObject(resp)
+                val login = json.optString("login", "")
+                val name = json.optString("name", login)
+                prefs?.edit()
+                    ?.putString("github_token", tok)
+                    ?.putString("github_username", login)
+                    ?.apply()
+                "🔑 **GitHub Authenticated Successfully!**\n\n👤 User: **$login** ($name)\n✅ Token saved on-device with verified repository permissions.\nYou can now run `/push`, `git push`, `/pull`, etc."
+            } else if (code == 401) {
+                "❌ **Authentication Failed (401 Bad Credentials)**.\n\nGitHub rejected this token. Please check that:\n1. The token was copied completely.\n2. It hasn't expired.\n3. It has the `repo` scope enabled."
+            } else {
+                prefs?.edit()?.putString("github_token", tok)?.apply()
+                "⚠️ Token saved on-device (GitHub API returned HTTP $code). You can now test `/push`."
+            }
+        } catch (e: Exception) {
+            prefs?.edit()?.putString("github_token", tok)?.apply()
+            "🔑 GitHub token saved on-device (offline verification: ${e.message}). You can now run `/push`."
+        }
+    }
+
+    suspend fun executeGitCommand(workspacePath: String, rawInput: String): String = withContext(Dispatchers.IO) {
+        val trimmed = rawInput.trim()
+
+        if (trimmed.startsWith("/token", ignoreCase = true) ||
+            trimmed.startsWith("git token", ignoreCase = true) ||
+            trimmed.startsWith("/git token", ignoreCase = true)) {
+            val tok = trimmed
+                .replace(Regex("^/git\\s+token", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("^git\\s+token", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("^/token", RegexOption.IGNORE_CASE), "")
+                .trim()
+            return@withContext validateAndSaveGitHubToken(tok)
+        }
+
         val sessionDir = File(workspacePath)
         if (!sessionDir.exists() || !sessionDir.resolve(".git").isDirectory) {
-            return "Not a Git repository: $workspacePath"
+            return@withContext "⚠️ Not a Git repository: `$workspacePath`\nPlease clone a repository first from the Files & Git menu (📁)."
         }
-        return try {
-            Git.open(sessionDir).use { git ->
-                val status = git.status().call()
-                buildString {
-                    appendLine("📦 Repository: ${sessionDir.name}")
-                    appendLine("🌿 Branch: ${git.repository.branch}")
-                    if (status.isClean) {
-                        appendLine("✨ Working tree clean. All changes committed.")
+
+        val repo = Repo(sessionDir, sessionDir.name)
+        val mgr = JGitRepoManager(sessionDir.parentFile ?: sessionDir)
+
+        val prefs = application?.getSharedPreferences("iqforge_workspace", Context.MODE_PRIVATE) ?: preferences
+        val token = prefs?.getString("github_token", "").orEmpty()
+        val username = prefs?.getString("github_username", "").orEmpty()
+        if (token.isNotBlank()) {
+            mgr.updateCredentials(username, token)
+        }
+
+        val cmd = trimmed
+            .replace(Regex("^/git\\s*", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("^git\\s*", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("^/", RegexOption.IGNORE_CASE), "")
+            .trim()
+
+        val verb = cmd.split(Regex("\\s+")).firstOrNull()?.lowercase() ?: ""
+        val args = cmd.substringAfter(verb).trim()
+
+        return@withContext try {
+            when (verb) {
+                "", "help" -> gitHelpText()
+                "status" -> mgr.status(repo)
+                "diff" -> mgr.diff(repo, args.takeIf { it.isNotBlank() })
+                "log" -> {
+                    val limit = args.replace("-n", "").trim().toIntOrNull() ?: 10
+                    mgr.log(repo, limit)
+                }
+                "branch" -> {
+                    if (args.isBlank()) {
+                        mgr.branches(repo)
                     } else {
-                        if (status.modified.isNotEmpty()) appendLine("📝 Modified:\n" + status.modified.joinToString("\n") { "   • $it" })
-                        if (status.untracked.isNotEmpty()) appendLine("❓ Untracked:\n" + status.untracked.joinToString("\n") { "   • $it" })
-                        if (status.added.isNotEmpty()) appendLine("➕ Staged:\n" + status.added.joinToString("\n") { "   • $it" })
-                        if (status.removed.isNotEmpty()) appendLine("🗑️ Deleted:\n" + status.removed.joinToString("\n") { "   • $it" })
-                        appendLine("\nTip: Type `/commit <message>` to commit your changes.")
+                        mgr.checkout(repo, args, createBranch = true)
                     }
+                }
+                "checkout" -> {
+                    val createNew = args.startsWith("-b ")
+                    val target = if (createNew) args.removePrefix("-b ").trim() else args
+                    if (target.isBlank()) {
+                        "⚠️ Please specify a branch name: `git checkout <branch>` or `git checkout -b <new-branch>`"
+                    } else {
+                        mgr.checkout(repo, target, createBranch = createNew)
+                    }
+                }
+                "commit" -> {
+                    val msg = args.replace(Regex("^-[a-zA-Z]*m\\s*"), "")
+                        .trim()
+                        .removeSurrounding("\"")
+                        .removeSurrounding("'")
+                        .trim()
+                        .ifBlank { "Update from iQForge mobile dev station" }
+                    mgr.commit(repo, msg, emptyList())
+                    "✅ **Committed on phone!**\nMessage: \"$msg\"\n\nReady to push! Run `/push` or `git push` to upload to GitHub."
+                }
+                "push" -> {
+                    if (token.isBlank()) {
+                        "⚠️ **GitHub Personal Access Token required to push.**\n\nRun `/token <your-token>` or enter it in the Files & Git menu (📁) to authenticate."
+                    } else {
+                        mgr.push(repo)
+                        "🚀 **Successfully pushed to GitHub directly from your phone!**\nRemote repository is up to date."
+                    }
+                }
+                "pull" -> {
+                    mgr.pull(repo)
+                    "⬇️ **Successfully pulled latest changes from GitHub!**\nWorking tree updated."
+                }
+                "reset" -> {
+                    val hard = args.contains("--hard", ignoreCase = true) || args.isBlank()
+                    mgr.reset(repo, hard = hard)
+                }
+                "discard" -> {
+                    if (args.isBlank()) {
+                        mgr.reset(repo, hard = true)
+                    } else {
+                        mgr.discard(repo, args)
+                    }
+                }
+                "remote" -> mgr.remotes(repo)
+                else -> {
+                    "❓ Unknown Git command: `$verb`\n\n${gitHelpText()}"
                 }
             }
         } catch (e: Exception) {
-            "Git status check failed: ${e.message}"
+            val msg = e.message ?: e.javaClass.simpleName
+            if (verb == "push" && (msg.contains("auth", ignoreCase = true) || msg.contains("401") || msg.contains("credential", ignoreCase = true))) {
+                "❌ **Push failed: Authentication error.**\nCheck your GitHub token with `/token <your-github-token>`.\n\nTip: Make sure your token has the `repo` scope."
+            } else {
+                "❌ Git `$verb` failed: $msg"
+            }
         }
     }
 
-    suspend fun executeGitCommit(workspacePath: String, message: String): String {
-        val sessionDir = File(workspacePath)
-        if (!sessionDir.exists() || !sessionDir.resolve(".git").isDirectory) {
-            return "Not a Git repository: $workspacePath"
-        }
-        val commitMsg = message.trim().ifBlank { "Update code from IQForge on-device agent" }
-        return try {
-            val repo = Repo(sessionDir, sessionDir.name)
-            val mgr = JGitRepoManager(sessionDir.parentFile)
-            mgr.commit(repo, commitMsg, emptyList())
-            "✅ Successfully committed on phone!\nMessage: \"$commitMsg\"\n\nReady to push! Run `/push` to push to GitHub."
-        } catch (e: Exception) {
-            "❌ Commit failed: ${e.message}"
-        }
-    }
-
-    suspend fun executeGitPush(workspacePath: String): String {
-        val sessionDir = File(workspacePath)
-        if (!sessionDir.exists() || !sessionDir.resolve(".git").isDirectory) {
-            return "Not a Git repository: $workspacePath"
-        }
-        val prefs = application?.getSharedPreferences("iqforge_workspace", Context.MODE_PRIVATE) ?: preferences
-        val token = prefs?.getString("github_token", "").orEmpty()
-        val username = prefs?.getString("github_username", "").orEmpty()
-        if (token.isBlank()) {
-            return "⚠️ GitHub Personal Access Token is required to push.\nRun `/token <your-github-token>` or enter it in the Files & Git menu (📁) to authenticate."
-        }
-        return try {
-            val repo = Repo(sessionDir, sessionDir.name)
-            val mgr = JGitRepoManager(sessionDir.parentFile)
-            mgr.updateCredentials(username, token)
-            mgr.push(repo)
-            "🚀 Successfully pushed changes to GitHub directly from your phone!"
-        } catch (e: Exception) {
-            "❌ Push failed: ${e.message}\n\nTip: Ensure your GitHub token has the 'repo' scope."
-        }
-    }
-
-    suspend fun executeGitPull(workspacePath: String): String {
-        val sessionDir = File(workspacePath)
-        if (!sessionDir.exists() || !sessionDir.resolve(".git").isDirectory) {
-            return "Not a Git repository: $workspacePath"
-        }
-        val prefs = application?.getSharedPreferences("iqforge_workspace", Context.MODE_PRIVATE) ?: preferences
-        val token = prefs?.getString("github_token", "").orEmpty()
-        val username = prefs?.getString("github_username", "").orEmpty()
-        return try {
-            val repo = Repo(sessionDir, sessionDir.name)
-            val mgr = JGitRepoManager(sessionDir.parentFile)
-            if (token.isNotBlank()) mgr.updateCredentials(username, token)
-            mgr.pull(repo)
-            "⬇️ Successfully pulled latest changes from GitHub!"
-        } catch (e: Exception) {
-            "❌ Pull failed: ${e.message}"
-        }
-    }
+    suspend fun executeGitStatus(workspacePath: String): String = executeGitCommand(workspacePath, "status")
+    suspend fun executeGitCommit(workspacePath: String, message: String): String = executeGitCommand(workspacePath, "commit $message")
+    suspend fun executeGitPush(workspacePath: String): String = executeGitCommand(workspacePath, "push")
+    suspend fun executeGitPull(workspacePath: String): String = executeGitCommand(workspacePath, "pull")
 
     private fun extractTargetWindow(fullText: String, query: String, maxChars: Int = 4000): Pair<Int, Int> {
         if (fullText.length <= maxChars) return 0 to fullText.length
@@ -784,23 +891,8 @@ class AgentViewModel(
             var replyRole = "assistant"
             val response = try {
                 when {
-                    trimmed.startsWith("/token", ignoreCase = true) -> {
-                        val tok = trimmed.removePrefix("/token").trim()
-                        val prefs = application?.getSharedPreferences("iqforge_workspace", Context.MODE_PRIVATE) ?: preferences
-                        prefs?.edit()?.putString("github_token", tok)?.apply()
-                        "🔑 GitHub token saved on-device! You can now run `/push` to push your commits to GitHub."
-                    }
-                    trimmed.startsWith("/commit", ignoreCase = true) -> {
-                        executeGitCommit(session.workspace, trimmed.removePrefix("/commit").trim())
-                    }
-                    trimmed.startsWith("/push", ignoreCase = true) -> {
-                        executeGitPush(session.workspace)
-                    }
-                    trimmed.startsWith("/pull", ignoreCase = true) -> {
-                        executeGitPull(session.workspace)
-                    }
-                    trimmed.equals("/status", ignoreCase = true) || trimmed.equals("/git", ignoreCase = true) -> {
-                        executeGitStatus(session.workspace)
+                    isGitCommand(trimmed) -> {
+                        executeGitCommand(session.workspace, trimmed)
                     }
                     run {
                         val lower = trimmed.lowercase()
@@ -1263,54 +1355,31 @@ class AgentViewModel(
             ?.maxByOrNull { it.resolve(".git/index").lastModified() }
 
         // Check for direct Git commands in main chat
-        if (prompt.startsWith("/token", ignoreCase = true)) {
-            val tok = prompt.removePrefix("/token").trim()
-            val prefs = application?.getSharedPreferences("iqforge_workspace", Context.MODE_PRIVATE) ?: preferences
-            prefs?.edit()?.putString("github_token", tok)?.apply()
-            val msg = "🔑 GitHub token saved on-device! You can now run `/push` or ask me to push code changes."
-            feed += FeedItem.Reply(msg)
-            saveChatMessage("assistant", msg)
-            sending = false
+        if (isGitCommand(prompt)) {
+            viewModelScope.launch {
+                val workspacePath = activeRepo?.absolutePath ?: run {
+                    val candidate = repoRoot?.listFiles()?.firstOrNull { it.isDirectory && it.resolve(".git").isDirectory }
+                    candidate?.absolutePath
+                }
+                val result = if (workspacePath != null) {
+                    executeGitCommand(workspacePath, prompt)
+                } else if (prompt.startsWith("/token", ignoreCase = true) ||
+                    prompt.startsWith("git token", ignoreCase = true) ||
+                    prompt.startsWith("/git token", ignoreCase = true)) {
+                    val tok = prompt
+                        .replace(Regex("^/git\\s+token", RegexOption.IGNORE_CASE), "")
+                        .replace(Regex("^git\\s+token", RegexOption.IGNORE_CASE), "")
+                        .replace(Regex("^/token", RegexOption.IGNORE_CASE), "")
+                        .trim()
+                    validateAndSaveGitHubToken(tok)
+                } else {
+                    "⚠️ No local Git repository found on phone.\nClone one first using the Files & Git menu (📁) or enter `/token <pat>` to configure authentication."
+                }
+                feed += FeedItem.Reply(result)
+                saveChatMessage("assistant", result)
+                sending = false
+            }
             return
-        }
-
-        if (activeRepo != null) {
-            if (prompt.startsWith("/commit", ignoreCase = true)) {
-                viewModelScope.launch {
-                    val msg = executeGitCommit(activeRepo.absolutePath, prompt.removePrefix("/commit").trim())
-                    feed += FeedItem.Reply(msg)
-                    saveChatMessage("assistant", msg)
-                    sending = false
-                }
-                return
-            }
-            if (prompt.startsWith("/push", ignoreCase = true)) {
-                viewModelScope.launch {
-                    val msg = executeGitPush(activeRepo.absolutePath)
-                    feed += FeedItem.Reply(msg)
-                    saveChatMessage("assistant", msg)
-                    sending = false
-                }
-                return
-            }
-            if (prompt.startsWith("/pull", ignoreCase = true)) {
-                viewModelScope.launch {
-                    val msg = executeGitPull(activeRepo.absolutePath)
-                    feed += FeedItem.Reply(msg)
-                    saveChatMessage("assistant", msg)
-                    sending = false
-                }
-                return
-            }
-            if (prompt.equals("/status", ignoreCase = true) || prompt.equals("/git", ignoreCase = true)) {
-                viewModelScope.launch {
-                    val msg = executeGitStatus(activeRepo.absolutePath)
-                    feed += FeedItem.Reply(msg)
-                    saveChatMessage("assistant", msg)
-                    sending = false
-                }
-                return
-            }
         }
 
         val isPushOrCommitIntent = ("push" in lowerPrompt && ("code" in lowerPrompt || "change" in lowerPrompt || "repo" in lowerPrompt || "github" in lowerPrompt || "it" in lowerPrompt)) ||

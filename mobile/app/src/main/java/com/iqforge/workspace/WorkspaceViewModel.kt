@@ -295,7 +295,8 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
         runOperation("Pushing to remote…") {
             if (token.isNotBlank()) {
                 preferences.edit().putString("github_token", token.trim()).apply()
-                repoManager.updateCredentials("", token.trim())
+                val savedUser = preferences.getString("github_username", "").orEmpty()
+                repoManager.updateCredentials(savedUser, token.trim())
             } else {
                 applyCredentials()
             }
