@@ -48,6 +48,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -826,7 +829,7 @@ class AgentViewModel(
                             }.orEmpty()
                         }
                         if (fileText.length > MAX_LOCAL_FILE_CHARS) {
-                            if (bridgeUrl.isNotBlank() && !bridgeUrl.contains("localhost")) {
+                            if (modelServiceReady && bridgeUrl.isNotBlank() && !bridgeUrl.contains("localhost") && !bridgeUrl.contains("127.0.0.1")) {
                                 replyRole = "laptop"
                                 bridgeClient.escalateWithOptions(
                                     bridgeUrl, task,
@@ -1728,7 +1731,12 @@ class AgentViewModel(
                     onAddDevice = { settingsDialog = SettingsDialog.DEVICE }
                 )
                 AppDestination.ARTIFACTS -> ArtifactsPage(state, workspace)
-                AppDestination.REVIEW -> ReviewPage()
+                AppDestination.REVIEW -> ReviewPage(
+                    agent = agent,
+                    workspace = workspace,
+                    state = state,
+                    onOpenCode = { destination = AppDestination.CODE }
+                )
                 AppDestination.SETTINGS -> SettingsPage(
                     appearance = appearance,
                     fontChoice = fontChoice,
@@ -2020,6 +2028,66 @@ class AgentViewModel(
 
 private fun displayModelText(text: String): String = text.trim()
 
+/** Renders **bold**, `inline code`, fenced code blocks, and bullet/numbered lists from raw model output as styled text instead of literal markdown syntax. */
+@Composable private fun MarkdownText(
+    text: String,
+    modifier: Modifier = Modifier,
+    style: androidx.compose.ui.text.TextStyle = MaterialTheme.typography.bodyLarge,
+    color: Color = Color.Unspecified
+) {
+    Text(text = remember(text) { parseSimpleMarkdown(text) }, modifier = modifier, style = style, color = color)
+}
+
+private val boldOrCodePattern = Regex("\\*\\*(.+?)\\*\\*|`(.+?)`")
+
+private fun androidx.compose.ui.text.AnnotatedString.Builder.appendInlineMarkdown(line: String) {
+    var lastIndex = 0
+    for (match in boldOrCodePattern.findAll(line)) {
+        append(line.substring(lastIndex, match.range.first))
+        val bold = match.groupValues[1]
+        val code = match.groupValues[2]
+        if (bold.isNotEmpty()) {
+            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(bold) }
+        } else {
+            withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = Color(0x22FFFFFF))) { append(code) }
+        }
+        lastIndex = match.range.last + 1
+    }
+    append(line.substring(lastIndex))
+}
+
+private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.AnnotatedString = buildAnnotatedString {
+    val lines = raw.trim().lines()
+    var i = 0
+    while (i < lines.size) {
+        val line = lines[i]
+        if (line.trim().startsWith("```")) {
+            i++
+            val codeLines = mutableListOf<String>()
+            while (i < lines.size && !lines[i].trim().startsWith("```")) {
+                codeLines.add(lines[i]); i++
+            }
+            withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = Color(0x22FFFFFF))) {
+                append(codeLines.joinToString("\n"))
+            }
+            if (i < lines.size) i++ // skip closing fence
+            if (i < lines.size) append("\n\n")
+            continue
+        }
+        val bulletMatch = Regex("^\\s*[-*]\\s+(.*)").find(line)
+        val numberedMatch = Regex("^\\s*(\\d+)[.)]\\s+(.*)").find(line)
+        val headingMatch = Regex("^#{1,6}\\s+(.*)").find(line)
+        when {
+            headingMatch != null -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(headingMatch.groupValues[1]) }
+            bulletMatch != null -> { append("•  "); appendInlineMarkdown(bulletMatch.groupValues[1]) }
+            numberedMatch != null -> { append("${numberedMatch.groupValues[1]}.  "); appendInlineMarkdown(numberedMatch.groupValues[2]) }
+            else -> appendInlineMarkdown(line)
+        }
+        if (i != lines.lastIndex) append("\n")
+        i++
+    }
+}
+
 @Composable private fun EmptyAgentState(modifier: Modifier, repositoryName: String?, incognito: Boolean) =
     Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(
@@ -2191,7 +2259,7 @@ private fun displayModelText(text: String): String = text.trim()
                 )
             }
             Spacer(Modifier.height(6.dp))
-            Text(displayModelText(text), style = MaterialTheme.typography.bodyLarge)
+            MarkdownText(displayModelText(text), style = MaterialTheme.typography.bodyLarge)
         }
     }
 }
@@ -2219,7 +2287,7 @@ private fun displayModelText(text: String): String = text.trim()
                 )
             }
             Spacer(Modifier.height(6.dp))
-            Text(displayModelText(text), style = MaterialTheme.typography.bodyLarge)
+            MarkdownText(displayModelText(text), style = MaterialTheme.typography.bodyLarge)
         }
     }
 }
@@ -3264,10 +3332,34 @@ private fun displayModelText(text: String): String = text.trim()
     }
 }
 
-@Composable private fun ReviewPage() {
+@Composable private fun ReviewPage(
+    agent: AgentViewModel,
+    workspace: WorkspaceViewModel,
+    state: WorkspaceUiState,
+    onOpenCode: () -> Unit
+) {
     val github: GitHubViewModel = viewModel()
     var repoInput by rememberSaveable { mutableStateOf("") }
     var tab by rememberSaveable { mutableStateOf(0) } // 0 = PRs, 1 = Issues
+    val startReview: (String) -> Unit = { prompt ->
+        val ref = github.repoRef
+        if (ref != null) {
+            val existing = state.repositories.firstOrNull {
+                it.name.equals(ref.repo, ignoreCase = true) || it.name.startsWith("${ref.repo}-", ignoreCase = true)
+            }
+            if (existing != null) {
+                agent.createCodeSession(existing.root.absolutePath)
+                agent.sendCodeSessionMessage(prompt)
+                onOpenCode()
+            } else {
+                workspace.cloneRepository("https://github.com/${ref.owner}/${ref.repo}") { repo ->
+                    agent.createCodeSession(repo.root.absolutePath)
+                    agent.sendCodeSessionMessage(prompt)
+                    onOpenCode()
+                }
+            }
+        }
+    }
 
     Column(Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 10.dp)) {
         Text("Review", style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 14.dp, bottom = 4.dp))
@@ -3324,8 +3416,20 @@ private fun displayModelText(text: String): String = text.trim()
         if (github.loadingDetail) StatusCard("Loading…")
         github.detailError?.let { StatusCard(it, error = true) }
     }
-    github.selectedPullRequest?.let { PullRequestDetailDialog(it, onDismiss = github::clearSelection) }
-    github.selectedIssue?.let { IssueDetailDialog(it, onDismiss = github::clearSelection) }
+    github.selectedPullRequest?.let { pr ->
+        PullRequestDetailDialog(
+            pr,
+            onDismiss = github::clearSelection,
+            onReview = { startReview(buildPullRequestReviewPrompt(github.repoRef!!.fullName, pr)) }
+        )
+    }
+    github.selectedIssue?.let { issue ->
+        IssueDetailDialog(
+            issue,
+            onDismiss = github::clearSelection,
+            onReview = { startReview(buildIssueReviewPrompt(github.repoRef!!.fullName, issue)) }
+        )
+    }
 }
 
 @Composable private fun CodeSessionsPage(
@@ -3384,7 +3488,7 @@ private fun displayModelText(text: String): String = text.trim()
             return@Column
         }
         if (githubOpen && state.repo != null) {
-            GitHubPanel(github, state.repo)
+            GitHubPanel(github, state.repo, agent)
             return@Column
         }
         Text("Devices", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 24.dp))
@@ -4667,8 +4771,13 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
         state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
     }
 
-@Composable private fun GitHubPanel(github: GitHubViewModel, repo: com.iqforge.git.Repo) {
+@Composable private fun GitHubPanel(github: GitHubViewModel, repo: com.iqforge.git.Repo, agent: AgentViewModel) {
     var tab by rememberSaveable { mutableStateOf(0) } // 0 = PRs, 1 = Issues
+    val repoFullName = github.repoRef?.fullName ?: repo.name
+    val startReview: (String) -> Unit = { prompt ->
+        agent.createCodeSession(repo.root.absolutePath)
+        agent.sendCodeSessionMessage(prompt)
+    }
     Column {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
@@ -4697,8 +4806,20 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
         if (github.loadingDetail) StatusCard("Loading…")
         github.detailError?.let { StatusCard(it, error = true) }
     }
-    github.selectedPullRequest?.let { PullRequestDetailDialog(it, onDismiss = github::clearSelection) }
-    github.selectedIssue?.let { IssueDetailDialog(it, onDismiss = github::clearSelection) }
+    github.selectedPullRequest?.let { pr ->
+        PullRequestDetailDialog(
+            pr,
+            onDismiss = github::clearSelection,
+            onReview = { startReview(buildPullRequestReviewPrompt(repoFullName, pr)) }
+        )
+    }
+    github.selectedIssue?.let { issue ->
+        IssueDetailDialog(
+            issue,
+            onDismiss = github::clearSelection,
+            onReview = { startReview(buildIssueReviewPrompt(repoFullName, issue)) }
+        )
+    }
 }
 
 @Composable private fun ColumnScope.PullRequestList(
@@ -4766,7 +4887,20 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
     }
 }
 
-@Composable private fun PullRequestDetailDialog(pr: GitHubPullRequestDetailDto, onDismiss: () -> Unit) {
+private fun buildPullRequestReviewPrompt(repoFullName: String, pr: GitHubPullRequestDetailDto): String = buildString {
+    append("Review GitHub pull request #${pr.number} in $repoFullName: \"${pr.title}\"\n")
+    append("Branch: ${pr.head.ref} -> ${pr.base.ref} · +${pr.additions} -${pr.deletions} across ${pr.changedFiles} files\n\n")
+    if (!pr.body.isNullOrBlank()) append("${pr.body}\n\n")
+    append("Explore this repository's code relevant to this branch and give a thorough review: correctness, edge cases, and style. Suggest concrete improvements.")
+}
+
+private fun buildIssueReviewPrompt(repoFullName: String, issue: GitHubIssueDto): String = buildString {
+    append("Review GitHub issue #${issue.number} in $repoFullName: \"${issue.title}\"\n\n")
+    if (!issue.body.isNullOrBlank()) append("${issue.body}\n\n")
+    append("Explore this repository, find the root cause, and propose a concrete fix.")
+}
+
+@Composable private fun PullRequestDetailDialog(pr: GitHubPullRequestDetailDto, onDismiss: () -> Unit, onReview: (() -> Unit)? = null) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("#${pr.number} ${pr.title}") },
@@ -4787,11 +4921,18 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                 if (!pr.body.isNullOrBlank()) Text(pr.body)
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } }
+        confirmButton = {
+            if (onReview != null) Button(onClick = { onDismiss(); onReview() }) {
+                Icon(Icons.Default.Code, null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Review")
+            } else TextButton(onClick = onDismiss) { Text("Done") }
+        },
+        dismissButton = { if (onReview != null) TextButton(onClick = onDismiss) { Text("Close") } }
     )
 }
 
-@Composable private fun IssueDetailDialog(issue: GitHubIssueDto, onDismiss: () -> Unit) {
+@Composable private fun IssueDetailDialog(issue: GitHubIssueDto, onDismiss: () -> Unit, onReview: (() -> Unit)? = null) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("#${issue.number} ${issue.title}") },
@@ -4807,7 +4948,14 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                 if (!issue.body.isNullOrBlank()) Text(issue.body)
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } }
+        confirmButton = {
+            if (onReview != null) Button(onClick = { onDismiss(); onReview() }) {
+                Icon(Icons.Default.Code, null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Review")
+            } else TextButton(onClick = onDismiss) { Text("Done") }
+        },
+        dismissButton = { if (onReview != null) TextButton(onClick = onDismiss) { Text("Close") } }
     )
 }
 
