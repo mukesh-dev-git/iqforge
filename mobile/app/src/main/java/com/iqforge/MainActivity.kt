@@ -131,7 +131,7 @@ private val ForgeLightColors = lightColorScheme(primary = Color(0xFFB38600), bac
 private enum class Appearance { SYSTEM, LIGHT, DARK }
 private enum class FontChoice { DEFAULT, SERIF, MONOSPACE }
 private enum class AppDestination { CHATS, DISPATCH, COWORK, PROJECTS, PROJECT_DETAIL, CODE, ARTIFACTS, REVIEW, SETTINGS }
-private enum class SettingsDialog { NONE, USAGE, CAPABILITIES, COLOR, FONT, VOICE, PRIVACY, DEVICE }
+private enum class SettingsDialog { NONE, USAGE, CAPABILITIES, GITHUB, COLOR, FONT, VOICE, PRIVACY, DEVICE }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) = super.onCreate(savedInstanceState).also {
@@ -1945,6 +1945,7 @@ class AgentViewModel(
                     fontChoice = fontChoice,
                     hapticEnabled = hapticEnabled,
                     agent = agent,
+                    workspace = workspace,
                     onDialog = { settingsDialog = it },
                     onConnectors = {
                         showConnectors = true
@@ -2097,6 +2098,9 @@ class AgentViewModel(
             voicePace = voicePace,
             agent = agent,
             workspace = state,
+            githubTokenSaved = workspace.hasSavedToken(),
+            onSaveGitHubToken = { workspace.saveGitHubToken(it) },
+            onClearGitHubToken = { workspace.saveGitHubToken("") },
             onAppearance = onAppearanceChange,
             onFont = onFontChoiceChange,
             onVoiceLanguage = {
@@ -4265,6 +4269,7 @@ private fun formatProjectDate(timestamp: Long): String = if (timestamp <= 0L) "u
     fontChoice: FontChoice,
     hapticEnabled: Boolean,
     agent: AgentViewModel,
+    workspace: WorkspaceViewModel,
     onDialog: (SettingsDialog) -> Unit,
     onConnectors: () -> Unit,
     onHaptic: (Boolean) -> Unit
@@ -4285,6 +4290,12 @@ private fun formatProjectDate(timestamp: Long): String = if (timestamp <= 0L) "u
         item {
             SettingsGroup {
                 SettingsRow(Icons.Default.Tune, "Capabilities", "${enabledCapabilityCount(agent)} enabled") { onDialog(SettingsDialog.CAPABILITIES) }
+                HorizontalDivider()
+                SettingsRow(
+                    Icons.Default.Key,
+                    "GitHub personal access token",
+                    if (workspace.hasSavedToken()) "Saved on this device" else "Required to approve and merge pull requests"
+                ) { onDialog(SettingsDialog.GITHUB) }
                 HorizontalDivider()
                 SettingsRow(Icons.Default.Link, "Connectors", "$connected connected", onConnectors)
                 HorizontalDivider()
@@ -4374,6 +4385,9 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
     voicePace: Float,
     agent: AgentViewModel,
     workspace: WorkspaceUiState,
+    githubTokenSaved: Boolean,
+    onSaveGitHubToken: (String) -> Unit,
+    onClearGitHubToken: () -> Unit,
     onAppearance: (Appearance) -> Unit,
     onFont: (FontChoice) -> Unit,
     onVoiceLanguage: (String) -> Unit,
@@ -4383,9 +4397,14 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
     onDismiss: () -> Unit
 ) {
     var bridgeUrl by remember(dialog) { mutableStateOf(agent.bridgeUrl) }
+    var githubToken by remember(dialog) { mutableStateOf("") }
+    var githubTokenVisible by remember(dialog) { mutableStateOf(false) }
+    var tokenSaved by remember(dialog, githubTokenSaved) { mutableStateOf(githubTokenSaved) }
+    var tokenMessage by remember(dialog) { mutableStateOf<String?>(null) }
     val title = when (dialog) {
         SettingsDialog.USAGE -> "Usage"
         SettingsDialog.CAPABILITIES -> "Capabilities"
+        SettingsDialog.GITHUB -> "GitHub access"
         SettingsDialog.COLOR -> "Color mode"
         SettingsDialog.FONT -> "Font style"
         SettingsDialog.VOICE -> "Voice"
@@ -4411,6 +4430,59 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                     CapabilityToggle("Web search", agent.webSearchEnabled, agent::updateWebSearch)
                     CapabilityToggle("Memory", agent.memoryEnabled, agent::updateMemory)
                     CapabilityToggle("Live connectors", agent.connectors.any { it.connected }, null)
+                }
+                SettingsDialog.GITHUB -> Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        if (tokenSaved) "A GitHub token is saved on this device." else "Add a GitHub personal access token to approve and merge pull requests.",
+                        color = if (tokenSaved) Color(0xFF63C174) else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    OutlinedTextField(
+                        value = githubToken,
+                        onValueChange = {
+                            githubToken = it
+                            tokenMessage = null
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Personal access token") },
+                        placeholder = { Text("github_pat_… or ghp_…") },
+                        singleLine = true,
+                        visualTransformation = if (githubTokenVisible) androidx.compose.ui.text.input.VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { githubTokenVisible = !githubTokenVisible }) {
+                                Icon(if (githubTokenVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility, if (githubTokenVisible) "Hide token" else "Show token")
+                            }
+                        }
+                    )
+                    Text(
+                        "Use a fine-grained token with Pull requests: Read and write and Contents: Read and write access. The token is stored locally and is never displayed again.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Button(
+                        onClick = {
+                            onSaveGitHubToken(githubToken.trim())
+                            githubToken = ""
+                            githubTokenVisible = false
+                            tokenSaved = true
+                            tokenMessage = "Token saved. You can now return to Review and approve a pull request."
+                        },
+                        enabled = githubToken.trim().length >= 20,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text(if (tokenSaved) "Replace token" else "Save token") }
+                    if (tokenSaved) {
+                        OutlinedButton(
+                            onClick = {
+                                onClearGitHubToken()
+                                githubToken = ""
+                                tokenSaved = false
+                                tokenMessage = "Saved GitHub token removed."
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("Remove saved token") }
+                    }
+                    tokenMessage?.let {
+                        Text(it, color = if (tokenSaved) Color(0xFF63C174) else MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
+                    }
                 }
                 SettingsDialog.COLOR -> Column {
                     Appearance.entries.forEach { choice ->
