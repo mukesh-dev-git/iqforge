@@ -31,6 +31,8 @@ import subprocess
 import platform
 import shlex
 import shutil
+import threading
+import uuid
 from pathlib import Path
 import requests
 import html
@@ -39,6 +41,7 @@ import xml.etree.ElementTree as ET
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -828,3 +831,196 @@ def status() -> StatusResponse:
         uptime_s=round(time.time() - _server_start, 1),
         ollama_reachable=ollama_ok,
     )
+
+
+# ---------------------------------------------------------------------------
+# Deploy pipeline demo — mimics a real CI/CD pipeline (build/test/deploy/live)
+# so the "fix it on the phone, push it, watch it go live" incident-response
+# story has something real to point at without standing up actual cloud infra.
+# Triggered from the phone (POST /deploy, e.g. via a `/deploy` chat command);
+# watched on a laptop browser at GET /deploy, which polls GET /deploy/status.
+# ---------------------------------------------------------------------------
+
+class DeployRequest(BaseModel):
+    repo: str = "iqforge"
+    commit_sha: str = ""
+    message: str = "Hotfix from iQForge"
+
+
+class DeployStatusResponse(BaseModel):
+    deploy_id: str
+    stage: str
+    stage_label: str
+    percent: int
+    logs: list[str]
+    done: bool
+    repo: str
+    commit_sha: str
+    message: str
+    started_at: float
+
+
+_deploy_lock = threading.Lock()
+_latest_deploy: dict | None = None
+
+_DEPLOY_STEPS = [
+    ("build", "Building", [
+        "Cloning repository at {commit}...",
+        "Installing dependencies...",
+        "Compiling...",
+        "Build succeeded.",
+    ], 2.4),
+    ("test", "Running tests", [
+        "Running unit tests...",
+        "42 passed, 0 failed.",
+        "Running integration tests...",
+        "All checks passed.",
+    ], 2.4),
+    ("deploy", "Deploying", [
+        "Uploading build artifact...",
+        "Rolling out to production (canary 10%)...",
+        "Canary healthy, promoting to 100%...",
+    ], 2.4),
+    ("live", "Live", [
+        "Deployment complete.",
+        "{repo} is live — {message}",
+    ], 1.0),
+]
+
+
+def _run_deploy_pipeline(repo: str, commit_sha: str, message: str) -> None:
+    commit = commit_sha[:7] if commit_sha else "HEAD"
+    time.sleep(1.0)  # queued
+    for stage, label, lines, duration in _DEPLOY_STEPS:
+        with _deploy_lock:
+            if _latest_deploy is None:
+                return
+            _latest_deploy["stage"] = stage
+            _latest_deploy["stage_label"] = label
+        per_line = duration / len(lines)
+        for i, line in enumerate(lines):
+            time.sleep(per_line)
+            text = line.format(commit=commit, repo=repo, message=message)
+            with _deploy_lock:
+                if _latest_deploy is None:
+                    return
+                _latest_deploy["logs"].append(text)
+                stage_index = next(idx for idx, s in enumerate(_DEPLOY_STEPS) if s[0] == stage)
+                overall = (stage_index + (i + 1) / len(lines)) / len(_DEPLOY_STEPS)
+                _latest_deploy["percent"] = round(overall * 100)
+    with _deploy_lock:
+        if _latest_deploy is not None:
+            _latest_deploy["done"] = True
+            _latest_deploy["percent"] = 100
+
+
+@app.post("/deploy", response_model=DeployStatusResponse)
+def trigger_deploy(req: DeployRequest) -> DeployStatusResponse:
+    global _latest_deploy
+    with _deploy_lock:
+        _latest_deploy = {
+            "deploy_id": uuid.uuid4().hex[:8],
+            "stage": "queued",
+            "stage_label": "Queued",
+            "percent": 0,
+            "logs": ["Queued for deploy..."],
+            "done": False,
+            "repo": req.repo,
+            "commit_sha": req.commit_sha,
+            "message": req.message,
+            "started_at": time.time(),
+        }
+        snapshot = dict(_latest_deploy)
+    threading.Thread(
+        target=_run_deploy_pipeline, args=(req.repo, req.commit_sha, req.message), daemon=True
+    ).start()
+    return DeployStatusResponse(**snapshot)
+
+
+@app.get("/deploy/status", response_model=DeployStatusResponse)
+def deploy_status() -> DeployStatusResponse:
+    with _deploy_lock:
+        if _latest_deploy is None:
+            raise HTTPException(status_code=404, detail="No deploy has been triggered yet")
+        return DeployStatusResponse(**_latest_deploy)
+
+
+_DEPLOY_DASHBOARD_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>iQForge Deploy Pipeline</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#14120E; --surface:#1E1B16; --border:rgba(242,237,228,.14); --text:#F2EDE4;
+          --muted:#A79C89; --accent:#F5B400; --npu:#25A38D; --cpu:#E8622E; --good:#5FD68A; }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:ui-sans-serif,system-ui,Archivo,sans-serif;padding:40px 24px;}
+  .wrap{max-width:760px;margin:0 auto;}
+  h1{font-family:Georgia,serif;font-size:1.8rem;margin:0 0 6px;}
+  .sub{color:var(--muted);font-size:.9rem;margin-bottom:28px;}
+  .meta{font-family:ui-monospace,monospace;font-size:.8rem;color:var(--muted);margin-bottom:20px;}
+  .meta b{color:var(--text);}
+  .steps{display:flex;gap:8px;margin-bottom:22px;}
+  .step{flex:1;padding:12px 10px;border-radius:10px;border:1px solid var(--border);background:var(--surface);text-align:center;font-size:.78rem;font-weight:600;transition:all .3s;}
+  .step.pending{color:var(--muted);}
+  .step.active{border-color:var(--accent);color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset;}
+  .step.done{border-color:var(--good);color:var(--good);}
+  .bar{height:8px;border-radius:4px;background:var(--surface);border:1px solid var(--border);overflow:hidden;margin-bottom:22px;}
+  .bar-fill{height:100%;background:linear-gradient(90deg,var(--npu),var(--good));width:0%;transition:width .4s;}
+  .log{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px;height:280px;overflow-y:auto;font-family:ui-monospace,monospace;font-size:.82rem;line-height:1.7;}
+  .log div{opacity:0;animation:in .3s forwards;}
+  @keyframes in{to{opacity:1;}}
+  .idle{color:var(--muted);text-align:center;padding:60px 0;}
+  .live-badge{display:inline-block;padding:2px 10px;border-radius:99px;background:rgba(95,214,138,.15);color:var(--good);font-size:.72rem;font-weight:700;letter-spacing:.04em;}
+</style></head>
+<body><div class="wrap">
+  <h1>🚀 iQForge Deploy Pipeline</h1>
+  <div class="sub">Triggered from the phone. Watched here.</div>
+  <div id="meta" class="meta">Waiting for a deploy to be triggered from the phone...</div>
+  <div class="steps" id="steps"></div>
+  <div class="bar"><div class="bar-fill" id="barfill"></div></div>
+  <div class="log" id="log"><div class="idle">No deploy running yet.</div></div>
+</div>
+<script>
+const STAGES = [["queued","Queued"],["build","Build"],["test","Test"],["deploy","Deploy"],["live","Live"]];
+let lastLogCount = 0;
+let lastDeployId = null;
+function render(data) {
+  if (data.deploy_id !== lastDeployId) { lastLogCount = 0; document.getElementById('log').innerHTML = ''; lastDeployId = data.deploy_id; }
+  document.getElementById('meta').innerHTML =
+    `<b>${data.repo}</b> @ <b>${(data.commit_sha || 'HEAD').slice(0,7)}</b> — ${data.message}` +
+    (data.done ? '  <span class="live-badge">LIVE</span>' : '');
+  const stepsEl = document.getElementById('steps');
+  stepsEl.innerHTML = '';
+  const currentIdx = STAGES.findIndex(s => s[0] === data.stage);
+  STAGES.forEach((s, i) => {
+    const div = document.createElement('div');
+    const cls = data.done || i < currentIdx ? 'done' : (i === currentIdx ? 'active' : 'pending');
+    div.className = 'step ' + cls;
+    div.textContent = s[1];
+    stepsEl.appendChild(div);
+  });
+  document.getElementById('barfill').style.width = data.percent + '%';
+  const logEl = document.getElementById('log');
+  if (data.logs.length > 0 && lastLogCount === 0) logEl.innerHTML = '';
+  for (let i = lastLogCount; i < data.logs.length; i++) {
+    const line = document.createElement('div');
+    line.textContent = '> ' + data.logs[i];
+    logEl.appendChild(line);
+  }
+  lastLogCount = data.logs.length;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+async function poll() {
+  try {
+    const res = await fetch('/deploy/status');
+    if (res.ok) render(await res.json());
+  } catch (e) {}
+  setTimeout(poll, 700);
+}
+poll();
+</script>
+</body></html>"""
+
+
+@app.get("/deploy", response_class=HTMLResponse)
+def deploy_dashboard() -> str:
+    return _DEPLOY_DASHBOARD_HTML
