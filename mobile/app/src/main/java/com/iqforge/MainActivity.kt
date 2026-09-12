@@ -96,6 +96,9 @@ import com.iqforge.engine.OfflineEngine
 import com.iqforge.github.GitHubIssueDto
 import com.iqforge.github.GitHubPullRequestDetailDto
 import com.iqforge.github.GitHubViewModel
+import com.iqforge.github.cleanPullRequestSummary
+import com.iqforge.github.fallbackPullRequestSummary
+import com.iqforge.github.pullRequestSummaryPrompt
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -415,6 +418,15 @@ class AgentViewModel(
     }
 
     suspend fun reviewPullRequestPatch(patch: String): List<Finding> = codeEngine.review(patch)
+
+    suspend fun summarizePullRequest(
+        pr: GitHubPullRequestDetailDto,
+        files: List<com.iqforge.github.GitHubPullRequestFileDto>
+    ): String {
+        val fallback = fallbackPullRequestSummary(pr.title, files)
+        val generated = codeEngine.explain(pullRequestSummaryPrompt(pr.title, pr.body, files))
+        return cleanPullRequestSummary(generated, fallback)
+    }
 
     fun selectOfflineModel() {
         if (offlineModelReady) selectedModel = (codeEngine as? NativeEngine)?.displayName
@@ -5229,12 +5241,17 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
     var reviewBusy by remember(pr.head.sha) { mutableStateOf(true) }
     var reviewError by remember(pr.head.sha) { mutableStateOf<String?>(null) }
     var findings by remember(pr.head.sha) { mutableStateOf<List<PullRequestFinding>?>(null) }
+    var plainEnglishSummary by remember(pr.head.sha) {
+        mutableStateOf(fallbackPullRequestSummary(pr.title, files))
+    }
 
     LaunchedEffect(pr.head.sha, files) {
         reviewBusy = true
         reviewError = null
         findings = null
+        plainEnglishSummary = fallbackPullRequestSummary(pr.title, files)
         try {
+            plainEnglishSummary = agent.summarizePullRequest(pr, files)
             findings = files.flatMap { file ->
                 val patch = file.patch ?: return@flatMap emptyList()
                 agent.reviewPullRequestPatch(patch).map { PullRequestFinding(file.filename, it) }
@@ -5254,19 +5271,26 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
         null -> "Conflict status pending"
     }
     val stages = listOf("Summary", "Findings", "Changes", "Checks")
+    val reviewColors = MaterialTheme.colorScheme
 
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            Column(Modifier.fillMaxSize()) {
+        MaterialTheme(colorScheme = reviewColors, typography = forgeTypography(FontChoice.DEFAULT)) {
+            Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                Column(Modifier.fillMaxSize()) {
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(onClick = onDismiss) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Close review") }
                     Column(Modifier.weight(1f)) {
-                        Text("#${pr.number} ${pr.title}", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
                         Text(
-                            "${pr.head.ref} → ${pr.base.ref} · ${readiness?.changedLines ?: pr.additions + pr.deletions} lines",
+                            "PR ${pr.number}: ${pr.title}",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+                        )
+                        Text(
+                            "${pr.head.ref} into ${pr.base.ref}. ${readiness?.changedLines ?: pr.additions + pr.deletions} changed lines.",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.labelSmall
                         )
@@ -5276,13 +5300,25 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
 
                 TabRow(selectedTabIndex = selectedStage) {
                     stages.forEachIndexed { index, label ->
-                        Tab(selected = selectedStage == index, onClick = { selectedStage = index }, text = { Text(label) })
+                        Tab(
+                            selected = selectedStage == index,
+                            onClick = { selectedStage = index },
+                            text = {
+                                Text(
+                                    label.uppercase(),
+                                    maxLines = 1,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.SansSerif
+                                )
+                            }
+                        )
                     }
                 }
 
                 if (reviewBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
                 when (selectedStage) {
-                    0 -> PullRequestSummaryStage(pr, files, readiness, reviewBusy, reviewError, blockers, warnings, conflictLabel, mergeState, mergeMessage, mergedCommitSha)
+                    0 -> PullRequestSummaryStage(pr, files, readiness, plainEnglishSummary, reviewBusy, reviewError, blockers, warnings, conflictLabel, mergeState, mergeMessage, mergedCommitSha)
                     1 -> PullRequestFindingsStage(reviewBusy, reviewError, findings)
                     2 -> PullRequestChangesStage(files)
                     else -> PullRequestChecksStage(pr, readiness, checks, reviewBusy, reviewError, blockers, conflictLabel, mergeState)
@@ -5306,7 +5342,7 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    OutlinedButton(onClick = { selectedStage = 1 }, modifier = Modifier.weight(1f)) { Text("Inspect findings") }
+                    OutlinedButton(onClick = { selectedStage = 1 }, modifier = Modifier.weight(1f)) { Text("Inspect Findings", fontWeight = FontWeight.Bold) }
                     val mergeBusy = mergeState in setOf(
                         com.iqforge.github.MergeState.REVALIDATING,
                         com.iqforge.github.MergeState.APPROVING,
@@ -5322,16 +5358,17 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
                         else Text(
                             when {
                                 mergeState == com.iqforge.github.MergeState.MERGED -> "Merged"
-                                blockers > 0 -> "Merge blocked"
-                                else -> "Approve & merge"
+                                blockers > 0 -> "Merge Blocked"
+                                else -> "Approve and Merge"
                             }
                         )
                     }
                 }
                 if (onOpenDeepReview != null) {
                     TextButton(onClick = { onDismiss(); onOpenDeepReview() }, modifier = Modifier.align(Alignment.CenterHorizontally)) {
-                        Text("Open deep review in Code")
+                        Text("Open Detailed Review", fontWeight = FontWeight.Bold)
                     }
+                }
                 }
             }
         }
@@ -5342,6 +5379,7 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
     pr: GitHubPullRequestDetailDto,
     files: List<com.iqforge.github.GitHubPullRequestFileDto>,
     readiness: com.iqforge.github.PullRequestReadiness?,
+    plainEnglishSummary: String,
     reviewBusy: Boolean,
     reviewError: String?,
     blockers: Int,
@@ -5356,8 +5394,12 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         item {
-            Text("Understand the change", style = MaterialTheme.typography.headlineSmall)
-            Text(pr.body?.takeIf { it.isNotBlank() } ?: "No description was provided by the author.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                "PLAIN-ENGLISH SUMMARY",
+                style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(plainEnglishSummary, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface)
         }
         if (mergeState == com.iqforge.github.MergeState.MERGED) {
             item {
@@ -5373,7 +5415,7 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
         item {
             ElevatedCard(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("IQ review", style = MaterialTheme.typography.titleMedium)
+                    Text("IQ REVIEW RESULT", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold))
                     when {
                         reviewBusy -> Text("Reviewing ${files.size} changed file${if (files.size == 1) "" else "s"} on device…")
                         reviewError != null -> Text(reviewError, color = MaterialTheme.colorScheme.error)
@@ -5381,7 +5423,7 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
                         warnings > 0 -> Text("Medium risk · $warnings warning${if (warnings == 1) "" else "s"} to inspect")
                         else -> Text("Low risk · no blocking findings detected")
                     }
-                    Text("${files.size} files · +${pr.additions} −${pr.deletions} · $conflictLabel")
+                    Text("${files.size} files changed. ${pr.additions} lines added and ${pr.deletions} removed. $conflictLabel.")
                 }
             }
         }
@@ -5401,7 +5443,7 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
     findings: List<PullRequestFinding>?
 ) {
     LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        item { Text("Inspect findings", style = MaterialTheme.typography.headlineSmall) }
+        item { Text("REVIEW FINDINGS", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)) }
         when {
             reviewBusy -> item { Text("The on-device reviewer is checking the changed lines…") }
             reviewError != null -> item { StatusCard(reviewError, error = true) }
@@ -5410,7 +5452,7 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
                 ElevatedCard(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text(
-                            "${item.finding.severity} · ${item.path}:${item.finding.line}",
+                            "${if (item.finding.severity == Severity.BUG) "BLOCKING ISSUE" else item.finding.severity.name}: ${item.path}, line ${item.finding.line}",
                             color = if (item.finding.severity == Severity.BUG) MaterialTheme.colorScheme.error else IqfYellow,
                             style = MaterialTheme.typography.labelLarge
                         )
@@ -5424,12 +5466,12 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
 
 @Composable private fun ColumnScope.PullRequestChangesStage(files: List<com.iqforge.github.GitHubPullRequestFileDto>) {
     LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        item { Text("Review changed lines", style = MaterialTheme.typography.headlineSmall) }
+        item { Text("CHANGED FILES", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)) }
         items(files, key = { it.filename }) { file ->
             ElevatedCard(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(file.filename, style = MaterialTheme.typography.titleSmall)
-                    Text("${file.status} · +${file.additions} −${file.deletions}", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(file.filename, style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold))
+                    Text("${file.status.replaceFirstChar { it.uppercase() }} file. ${file.additions} additions and ${file.deletions} deletions.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Text(file.patch ?: "Patch unavailable for this file.", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
                 }
             }
@@ -5448,17 +5490,17 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
     mergeState: com.iqforge.github.MergeState
 ) {
     LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        item { Text("Verify before merge", style = MaterialTheme.typography.headlineSmall) }
+        item { Text("MERGE READINESS", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)) }
         item { ReviewCheckRow("Pull request is not a draft", !pr.draft, if (pr.draft) "Draft PRs cannot be merged" else "Ready for review") }
         item { ReviewCheckRow("No merge conflicts", readiness?.hasConflicts == false, conflictLabel) }
         item {
             val checksPassed = readiness?.checksState in setOf(com.iqforge.github.ChecksState.PASSED, com.iqforge.github.ChecksState.NONE)
-            ReviewCheckRow("Automated checks", checksPassed, readiness?.checksState?.name?.lowercase() ?: "pending")
+            ReviewCheckRow("Automated checks", checksPassed, readiness?.checksState?.name?.lowercase()?.replaceFirstChar { it.uppercase() } ?: "Pending")
         }
         checks.forEach { check ->
             item {
                 val passed = check.conclusion in setOf("success", "neutral", "skipped")
-                ReviewCheckRow(check.name, passed, check.conclusion ?: check.status)
+                ReviewCheckRow(check.name, passed, (check.conclusion ?: check.status).replaceFirstChar { it.uppercase() })
             }
         }
         item { ReviewCheckRow("Complete patch available", readiness?.patchAvailable == true, if (readiness?.patchAvailable == true) "All changed lines loaded" else "One or more patches unavailable") }
@@ -5484,7 +5526,7 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
             )
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                Text(label, style = MaterialTheme.typography.titleSmall)
+                Text(label, style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold))
                 Text(detail, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
             }
         }
