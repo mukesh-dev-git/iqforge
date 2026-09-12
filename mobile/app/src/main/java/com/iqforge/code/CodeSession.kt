@@ -6,7 +6,11 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
 
-/** One turn in a code session's conversation. `role` is "user" or "assistant". */
+/**
+ * One turn in a code session's conversation. `role` is "user", "assistant" (answered by the
+ * on-device model — the default path), or "laptop" (answered via the laptop bridge, for an
+ * explicit "/" command, an explicit "/escalate", or a detected bigger task like a test run).
+ */
 @Serializable
 data class CodeSessionMessage(
     val role: String,
