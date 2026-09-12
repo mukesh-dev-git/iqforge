@@ -2228,41 +2228,68 @@ private fun displayModelText(text: String): String = text.trim()
 /**
  * Minimal, dependency-free markdown for model replies: fenced ```code``` blocks render as their
  * own monospace surface (with the language tag if the model gave one), **bold** and `inline code`
- * render inline. No external markdown library — the model's output only ever uses this handful of
- * constructs, and a tiny hand-rolled parser is far less risk than adding a dependency this late.
+ * render inline, `#`/`##`/`###` become distinct heading styles, and `- `/`1. ` lines become a
+ * bulleted/numbered list block. No external markdown library — the model's output only ever uses
+ * this handful of constructs, and a tiny hand-rolled parser is far less risk than adding a
+ * dependency this late.
  */
 private sealed class MdBlock {
     data class Paragraph(val text: String) : MdBlock()
     data class Heading(val level: Int, val text: String) : MdBlock()
     data class Code(val code: String, val language: String?) : MdBlock()
+    data class ListBlock(val items: List<String>, val ordered: Boolean) : MdBlock()
 }
 
 private val CODE_FENCE = Regex("```([a-zA-Z0-9_+-]*)\\n?([\\s\\S]*?)```")
 private val HEADING_LINE = Regex("^(#{1,6})\\s+(.*)$")
+private val BULLET_LINE = Regex("^\\s*[-*]\\s+(.*)")
+private val NUMBERED_LINE = Regex("^\\s*\\d+[.)]\\s+(.*)")
 
-/** Splits a prose chunk (no code fences in it) into Heading blocks on `#`/`##`/`###` lines and
- *  Paragraph blocks for everything else, grouping consecutive plain lines into one paragraph. */
+/** Splits a prose chunk (no code fences in it) into Heading, ListBlock, and Paragraph blocks,
+ *  grouping consecutive plain lines into one paragraph and consecutive list lines into one list. */
 private fun parseProseBlocks(text: String): List<MdBlock> {
     val out = mutableListOf<MdBlock>()
     val paragraphLines = mutableListOf<String>()
+    val listItems = mutableListOf<String>()
+    var listOrdered = false
     fun flushParagraph() {
         if (paragraphLines.isNotEmpty()) {
             out.add(MdBlock.Paragraph(paragraphLines.joinToString("\n")))
             paragraphLines.clear()
         }
     }
+    fun flushList() {
+        if (listItems.isNotEmpty()) {
+            out.add(MdBlock.ListBlock(listItems.toList(), listOrdered))
+            listItems.clear()
+        }
+    }
     for (line in text.split("\n")) {
         val heading = HEADING_LINE.find(line)
+        val bullet = BULLET_LINE.find(line)
+        val numbered = NUMBERED_LINE.find(line)
         when {
             heading != null -> {
-                flushParagraph()
+                flushParagraph(); flushList()
                 out.add(MdBlock.Heading(heading.groupValues[1].length, heading.groupValues[2].trim()))
             }
-            line.isBlank() -> flushParagraph()
+            bullet != null -> {
+                flushParagraph()
+                if (listOrdered) flushList()
+                listOrdered = false
+                listItems.add(bullet.groupValues[1])
+            }
+            numbered != null -> {
+                flushParagraph()
+                if (!listOrdered) flushList()
+                listOrdered = true
+                listItems.add(numbered.groupValues[1])
+            }
+            line.isBlank() -> { flushParagraph(); flushList() }
             else -> paragraphLines.add(line)
         }
     }
-    flushParagraph()
+    flushParagraph(); flushList()
     return out
 }
 
@@ -2320,6 +2347,18 @@ private fun MarkdownText(raw: String, style: androidx.compose.ui.text.TextStyle,
                     fontWeight = FontWeight.Bold,
                     color = color
                 )
+                is MdBlock.ListBlock -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    block.items.forEachIndexed { index, item ->
+                        Row {
+                            Text(
+                                if (block.ordered) "${index + 1}.  " else "•  ",
+                                style = style,
+                                color = color
+                            )
+                            Text(inlineMarkdown(item), style = style, color = color)
+                        }
+                    }
+                }
                 is MdBlock.Code -> Surface(
                     color = MaterialTheme.colorScheme.surfaceVariant,
                     shape = RoundedCornerShape(8.dp),
