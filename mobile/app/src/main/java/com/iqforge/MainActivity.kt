@@ -4819,6 +4819,12 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
     onEffort: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    LaunchedEffect(Unit) {
+        // Option 2 is the supported demo path: a shell-owned llama-server is started by
+        // scripts/start_npu_server.ps1. Recheck localhost whenever this sheet opens so a
+        // server started after app launch is reflected immediately.
+        agent.refreshOfflineModel()
+    }
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         containerColor = MaterialTheme.colorScheme.background,
@@ -4828,9 +4834,9 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
             SheetTitle("Select model", onDismiss)
             if (agent.availableModels.isEmpty()) {
                 if (!agent.offlineModelReady) Text(
-                    "No verified model is available. Install the on-device GGUF model or connect Ollama.",
+                    "NPU server is offline. Run scripts/start_npu_server.ps1 on the paired laptop, then refresh.",
                     color = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.padding(20.dp)
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp)
                 )
             } else {
                 Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
@@ -4863,30 +4869,31 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
             }
             val isNpu = agent.isNpuActive
             Spacer(Modifier.height(12.dp))
-            Text(
-                "On-device (Hexagon NPU)",
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(bottom = 8.dp)
-            )
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "On-device server (Hexagon NPU)",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f).padding(bottom = 8.dp)
+                )
+                TextButton(onClick = agent::refreshOfflineModel) {
+                    Icon(Icons.Default.Refresh, null, modifier = Modifier.size(17.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("Refresh")
+                }
+            }
             Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
                 Column {
-                    agent.catalogModels.forEachIndexed { index, model ->
+                    val supportedModels = agent.catalogModels.filter { it.id == ModelCatalog.QWEN_1_5B.id }
+                    supportedModels.forEachIndexed { index, model ->
                         val isActive = model.id == agent.activeCatalogModelId
                         val isDownloaded = agent.isCatalogModelDownloaded(model)
-                        val isDownloadingThis = agent.isDownloadingModel && isActive
-                        val isActivatingThis = agent.isActivatingModel && isActive
                         Surface(
                             onClick = {
-                                if (agent.isDownloadingModel || agent.isActivatingModel) return@Surface
-                                if (isActive && agent.offlineModelReady) {
+                                if (isNpu && isActive) {
                                     agent.selectOfflineModel(); onDismiss()
-                                } else if (isDownloaded) {
-                                    // Don't dismiss yet — stay open showing "Activating…" until
-                                    // selectCatalogModel's coroutine resolves, success or failure.
-                                    agent.selectCatalogModel(model)
                                 } else {
-                                    agent.selectCatalogModel(model)
+                                    agent.refreshOfflineModel()
                                 }
                             },
                             color = Color.Transparent
@@ -4909,10 +4916,8 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                                                 "Hardware accelerated on Hexagon HTP • ${String.format(java.util.Locale.US, "%.1f", it)} tokens/sec"
                                             } ?: "Hardware accelerated on Hexagon HTP • Pure NPU"
                                             isActive && agent.offlineModelReady -> "Active • ${agent.offlineModelBytes / 1_000_000} MB GGUF • Pure NPU execution"
-                                            isActivatingThis -> "Activating on Hexagon NPU… this can take a few seconds"
-                                            isDownloadingThis -> "Downloading: ${(agent.downloadProgress * 100).toInt()}% (${agent.downloadProgressStatus})"
-                                            isDownloaded -> "Downloaded • tap to activate"
-                                            else -> "Tap to download (${String.format(java.util.Locale.US, "%.1f", model.approxSizeBytes / 1_000_000_000.0)} GB)"
+                                            isDownloaded -> "Model installed • start the shell NPU server to activate"
+                                            else -> "Model not installed in /data/local/tmp/gguf"
                                         },
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         style = MaterialTheme.typography.bodySmall
@@ -4920,14 +4925,11 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                                 }
                                 when {
                                     isActive && (agent.offlineModelReady || isNpu) -> Icon(Icons.Default.Check, "Active", tint = Color(0xFF54C878))
-                                    isActivatingThis -> CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                                    isDownloadingThis -> Unit
-                                    !isDownloaded -> Icon(Icons.Default.Download, "Download", tint = MaterialTheme.colorScheme.primary)
-                                    else -> Unit
+                                    else -> Icon(Icons.Default.Refresh, "Refresh NPU status", tint = MaterialTheme.colorScheme.primary)
                                 }
                             }
                         }
-                        if (index != agent.catalogModels.lastIndex) HorizontalDivider()
+                        if (index != supportedModels.lastIndex) HorizontalDivider()
                     }
                 }
             }
