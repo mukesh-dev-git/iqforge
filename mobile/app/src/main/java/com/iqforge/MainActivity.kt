@@ -576,24 +576,38 @@ class AgentViewModel(
                         val fileText = mentionedFile?.let {
                             runCatching { bridgeClient.workspaceFile(bridgeUrl, session.workspace, it) }.getOrNull()
                         }.orEmpty()
-                        val header = "Repository: ${session.repository}\nWorkspace: ${session.workspace}" +
-                            (mentionedFile?.let { "\nFile: $it" } ?: "")
-                        val enrichedContext = if (fileText.isNotBlank()) "$header\n\n$fileText" else header
-                        val local = when (task) {
-                            BridgeTask.REVIEW -> {
-                                val findings = codeEngine.review(fileText.ifBlank { trimmed })
-                                if (findings.isEmpty()) "No issues found."
-                                else findings.joinToString("\n") { "Line ${it.line}: [${it.severity}] ${it.message}" }
-                            }
-                            BridgeTask.DEBUG -> codeEngine.debug(trimmed, enrichedContext)
-                            BridgeTask.EXPLAIN -> codeEngine.explain(
-                                if (enrichedContext.isNotBlank()) "Context:\n$enrichedContext\n\nQuestion:\n$trimmed" else trimmed
+                        if (fileText.length > MAX_LOCAL_FILE_CHARS) {
+                            // The on-device model's context window is fixed at 4096 tokens
+                            // (LlamaEngine.cpp). A file this size overflows it and hits a native
+                            // GGML_ASSERT abort — a hard process crash, uncatchable from Kotlin,
+                            // not a normal exception. A file this large is a genuinely bigger
+                            // task, so it goes to the laptop model instead of risking a crash.
+                            replyRole = "laptop"
+                            bridgeClient.escalateWithOptions(
+                                bridgeUrl, task,
+                                "Repository: ${session.repository}\nWorkspace: ${session.workspace}\nFile: $mentionedFile\n\n$fileText",
+                                trimmed, effort.wireName
                             )
-                            BridgeTask.WRITE -> codeEngine.write(trimmed, enrichedContext)
+                        } else {
+                            val header = "Repository: ${session.repository}\nWorkspace: ${session.workspace}" +
+                                (mentionedFile?.let { "\nFile: $it" } ?: "")
+                            val enrichedContext = if (fileText.isNotBlank()) "$header\n\n$fileText" else header
+                            val local = when (task) {
+                                BridgeTask.REVIEW -> {
+                                    val findings = codeEngine.review(fileText.ifBlank { trimmed })
+                                    if (findings.isEmpty()) "No issues found."
+                                    else findings.joinToString("\n") { "Line ${it.line}: [${it.severity}] ${it.message}" }
+                                }
+                                BridgeTask.DEBUG -> codeEngine.debug(trimmed, enrichedContext)
+                                BridgeTask.EXPLAIN -> codeEngine.explain(
+                                    if (enrichedContext.isNotBlank()) "Context:\n$enrichedContext\n\nQuestion:\n$trimmed" else trimmed
+                                )
+                                BridgeTask.WRITE -> codeEngine.write(trimmed, enrichedContext)
+                            }
+                            if (fileText.lines().size > 40) {
+                                "$local\n\n(This file is large — reply with \"/escalate\" to ask the laptop for a deeper pass.)"
+                            } else local
                         }
-                        if (fileText.lines().size > 40) {
-                            "$local\n\n(This file is large — reply with \"/escalate\" to ask the laptop for a deeper pass.)"
-                        } else local
                     }
                 }
             } catch (error: Exception) { "ERROR: ${error.message ?: "Code agent failed"}" }
@@ -602,6 +616,14 @@ class AgentViewModel(
             refreshRemoteFiles(session.workspace)
         }
     }
+
+    /**
+     * Conservative char budget for a file handed to the on-device model, well under the
+     * ~4096-token hard cap in LlamaEngine.cpp once the review/debug system prompt, ChatML
+     * wrapping, and reserved output tokens are accounted for. Found via a live crash: a real
+     * 1,901-line/73KB HTML file overflowed the context and hit a native abort.
+     */
+    private val MAX_LOCAL_FILE_CHARS = 8_000
 
     private fun looksLikeBigTask(text: String): Boolean {
         val lower = text.lowercase()
