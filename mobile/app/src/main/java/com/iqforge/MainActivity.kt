@@ -3708,7 +3708,14 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
     onOpenCode: () -> Unit
 ) {
     val github: GitHubViewModel = viewModel()
-    var repoInput by rememberSaveable { mutableStateOf("") }
+    // Keyed on the loaded repo's name, not just remembered once: GitHubViewModel.repoRef survives
+    // leaving and returning to this page (confirmed — the PR list below does too), but this
+    // composable's own rememberSaveable slot was found NOT to on this navigation pattern, so the
+    // field went blank on every return even though a repo was still actually loaded. Re-deriving
+    // the seed value from the ViewModel (the real source of truth) whenever repoRef changes means
+    // the field can never drift from what's actually loaded, regardless of why the plain
+    // rememberSaveable didn't survive.
+    var repoInput by rememberSaveable(github.repoRef?.fullName) { mutableStateOf(github.repoRef?.fullName.orEmpty()) }
     val startReview: (String) -> Unit = { prompt ->
         val ref = github.repoRef
         if (ref != null) {
