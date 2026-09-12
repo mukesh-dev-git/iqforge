@@ -124,7 +124,7 @@ private val ForgeLightColors = lightColorScheme(primary = Color(0xFFB38600), bac
 
 private enum class Appearance { SYSTEM, LIGHT, DARK }
 private enum class FontChoice { DEFAULT, SERIF, MONOSPACE }
-private enum class AppDestination { CHATS, DISPATCH, COWORK, PROJECTS, PROJECT_DETAIL, CODE, ARTIFACTS, SETTINGS }
+private enum class AppDestination { CHATS, DISPATCH, COWORK, PROJECTS, PROJECT_DETAIL, CODE, ARTIFACTS, REVIEW, SETTINGS }
 private enum class SettingsDialog { NONE, USAGE, CAPABILITIES, COLOR, FONT, VOICE, PRIVACY, DEVICE }
 
 class MainActivity : ComponentActivity() {
@@ -1835,6 +1835,7 @@ class AgentViewModel(
                     onAddDevice = { settingsDialog = SettingsDialog.DEVICE }
                 )
                 AppDestination.ARTIFACTS -> ArtifactsPage(state, workspace)
+                AppDestination.REVIEW -> ReviewPage()
                 AppDestination.SETTINGS -> SettingsPage(
                     appearance = appearance,
                     fontChoice = fontChoice,
@@ -2994,6 +2995,7 @@ private fun MarkdownText(raw: String, style: androidx.compose.ui.text.TextStyle,
                 // finals-30hr/MVP_PLAN.md.
                 item { NavigationItem("Chats", Icons.Default.Forum) { onDestination(AppDestination.CHATS) } }
                 item { NavigationItem("Code", Icons.Default.Code) { onDestination(AppDestination.CODE) } }
+                item { NavigationItem("Review", Icons.Default.RateReview) { onDestination(AppDestination.REVIEW) } }
                 item { NavigationItem("Settings", Icons.Default.Settings) { onDestination(AppDestination.SETTINGS) } }
                 item { HorizontalDivider(Modifier.padding(vertical = 12.dp)) }
                 if (state.pinnedRepositoryNames.isNotEmpty()) {
@@ -3485,6 +3487,70 @@ private fun MarkdownText(raw: String, style: androidx.compose.ui.text.TextStyle,
             }
         )
     }
+}
+
+@Composable private fun ReviewPage() {
+    val github: GitHubViewModel = viewModel()
+    var repoInput by rememberSaveable { mutableStateOf("") }
+    var tab by rememberSaveable { mutableStateOf(0) } // 0 = PRs, 1 = Issues
+
+    Column(Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 10.dp)) {
+        Text("Review", style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 14.dp, bottom = 4.dp))
+        Text(
+            "Enter a public GitHub repository to review its open pull requests and issues.",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.padding(bottom = 14.dp)
+        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = repoInput,
+                onValueChange = { repoInput = it },
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("owner/repo or GitHub URL") },
+                singleLine = true
+            )
+            Spacer(Modifier.width(8.dp))
+            IconButton(
+                onClick = { github.loadForInput(repoInput) },
+                enabled = repoInput.isNotBlank() && !github.loadingList
+            ) { Icon(Icons.Default.Search, "Load repository") }
+        }
+        if (github.repoRef != null) {
+            Spacer(Modifier.height(14.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    github.repoRef!!.fullName,
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                IconButton(onClick = { github.loadForInput(repoInput) }, enabled = !github.loadingList) {
+                    Icon(Icons.Default.Refresh, "Refresh")
+                }
+            }
+            Row(Modifier.padding(top = 8.dp, bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = tab == 0, onClick = { tab = 0 }, label = { Text("Pull requests (${github.pullRequests.size})") })
+                FilterChip(selected = tab == 1, onClick = { tab = 1 }, label = { Text("Issues (${github.issues.size})") })
+            }
+        }
+        when {
+            github.loadingList -> Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator()
+            }
+            github.listError != null -> StatusCard(github.listError!!, error = true)
+            github.repoRef == null -> Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text("Enter a GitHub repository above to get started.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            tab == 0 -> PullRequestList(github.pullRequests, onOpen = github::openPullRequest)
+            else -> IssueList(github.issues, onOpen = github::openIssue)
+        }
+        if (github.loadingDetail) StatusCard("Loading…")
+        github.detailError?.let { StatusCard(it, error = true) }
+    }
+    github.selectedPullRequest?.let { PullRequestDetailDialog(it, onDismiss = github::clearSelection) }
+    github.selectedIssue?.let { IssueDetailDialog(it, onDismiss = github::clearSelection) }
 }
 
 @Composable private fun CodeSessionsPage(
@@ -4850,65 +4916,79 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                 CircularProgressIndicator()
             }
             github.listError != null -> StatusCard(github.listError!!, error = true)
-            tab == 0 -> LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(github.pullRequests, key = { "pr-${it.number}" }) { pr ->
-                    ElevatedCard(onClick = { github.openPullRequest(pr.number) }, modifier = Modifier.fillMaxWidth()) {
-                        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.Code, null, tint = if (pr.draft) MaterialTheme.colorScheme.onSurfaceVariant else IqfYellow)
-                            Spacer(Modifier.width(12.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text("#${pr.number} ${pr.title}", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
-                                Text(
-                                    "${pr.user?.login ?: "unknown"} · ${pr.state}${if (pr.draft) " · draft" else ""}",
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                            Text(
-                                formatProjectDate(runCatching { java.time.Instant.parse(pr.updatedAt).toEpochMilli() }.getOrDefault(0L)),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                }
-                if (github.pullRequests.isEmpty()) item {
-                    Text("No open pull requests.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 24.dp))
-                }
-            }
-            else -> LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(github.issues, key = { "issue-${it.number}" }) { issue ->
-                    ElevatedCard(onClick = { github.openIssue(issue) }, modifier = Modifier.fillMaxWidth()) {
-                        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.ErrorOutline, null, tint = IqfYellow)
-                            Spacer(Modifier.width(12.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text("#${issue.number} ${issue.title}", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
-                                Text(
-                                    listOfNotNull(
-                                        issue.user?.login,
-                                        issue.labels.joinToString(", ") { it.name }.takeIf { it.isNotBlank() }
-                                    ).joinToString(" · "),
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                            Text(
-                                formatProjectDate(runCatching { java.time.Instant.parse(issue.updatedAt).toEpochMilli() }.getOrDefault(0L)),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                }
-                if (github.issues.isEmpty()) item {
-                    Text("No open issues.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 24.dp))
-                }
-            }
+            tab == 0 -> PullRequestList(github.pullRequests, onOpen = github::openPullRequest)
+            else -> IssueList(github.issues, onOpen = github::openIssue)
         }
         if (github.loadingDetail) StatusCard("Loading…")
         github.detailError?.let { StatusCard(it, error = true) }
     }
     github.selectedPullRequest?.let { PullRequestDetailDialog(it, onDismiss = github::clearSelection) }
     github.selectedIssue?.let { IssueDetailDialog(it, onDismiss = github::clearSelection) }
+}
+
+@Composable private fun ColumnScope.PullRequestList(
+    pullRequests: List<com.iqforge.github.GitHubPullRequestSummaryDto>,
+    onOpen: (Int) -> Unit
+) {
+    LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        items(pullRequests, key = { "pr-${it.number}" }) { pr ->
+            ElevatedCard(onClick = { onOpen(pr.number) }, modifier = Modifier.fillMaxWidth()) {
+                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Code, null, tint = if (pr.draft) MaterialTheme.colorScheme.onSurfaceVariant else IqfYellow)
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("#${pr.number} ${pr.title}", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "${pr.user?.login ?: "unknown"} · ${pr.state}${if (pr.draft) " · draft" else ""}",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Text(
+                        formatProjectDate(runCatching { java.time.Instant.parse(pr.updatedAt).toEpochMilli() }.getOrDefault(0L)),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+        if (pullRequests.isEmpty()) item {
+            Text("No open pull requests.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 24.dp))
+        }
+    }
+}
+
+@Composable private fun ColumnScope.IssueList(
+    issues: List<com.iqforge.github.GitHubIssueDto>,
+    onOpen: (com.iqforge.github.GitHubIssueDto) -> Unit
+) {
+    LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        items(issues, key = { "issue-${it.number}" }) { issue ->
+            ElevatedCard(onClick = { onOpen(issue) }, modifier = Modifier.fillMaxWidth()) {
+                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.ErrorOutline, null, tint = IqfYellow)
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("#${issue.number} ${issue.title}", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            listOfNotNull(
+                                issue.user?.login,
+                                issue.labels.joinToString(", ") { it.name }.takeIf { it.isNotBlank() }
+                            ).joinToString(" · "),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Text(
+                        formatProjectDate(runCatching { java.time.Instant.parse(issue.updatedAt).toEpochMilli() }.getOrDefault(0L)),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+        if (issues.isEmpty()) item {
+            Text("No open issues.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 24.dp))
+        }
+    }
 }
 
 @Composable private fun PullRequestDetailDialog(pr: GitHubPullRequestDetailDto, onDismiss: () -> Unit) {
