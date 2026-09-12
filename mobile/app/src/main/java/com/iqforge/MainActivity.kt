@@ -682,7 +682,7 @@ class AgentViewModel(
         val lower = trimmed.lowercase()
         if (trimmed.startsWith("/") && !trimmed.startsWith("//")) {
             val slashCmd = trimmed.substring(1).trimStart().split(Regex("\\s+")).firstOrNull()?.lowercase() ?: ""
-            if (slashCmd in setOf("git", "status", "diff", "log", "commit", "push", "pull", "branch", "checkout", "reset", "discard", "remote", "token", "deploy", "help")) {
+            if (slashCmd in setOf("git", "status", "diff", "log", "commit", "push", "pull", "branch", "checkout", "reset", "discard", "remote", "token", "deploy", "diagnose", "help")) {
                 return true
             }
         }
@@ -708,6 +708,7 @@ class AgentViewModel(
         appendLine("• `/remote` or `git remote -v` — View remote repository URLs")
         appendLine("• `/token <PAT>` — Validate & save GitHub token with repo permissions")
         appendLine("• `/deploy [message]` — Trigger the laptop bridge's deploy pipeline, watch live at `<bridgeUrl>/deploy`")
+        appendLine("• `/diagnose <log>` — Self-heal: paste a failed CI log, find the real root cause, auto-fix + commit + push + re-deploy if it's a real regression")
         appendLine()
         appendLine("💡 *All commands execute 100% on-device via embedded JGit.*")
     }
@@ -885,6 +886,7 @@ class AgentViewModel(
                     }
                 }
                 "remote" -> mgr.remotes(repo)
+                "diagnose" -> diagnoseCiFailure(sessionDir, args)
                 else -> {
                     "❓ Unknown Git command: `$verb`\n\n${gitHelpText()}"
                 }
@@ -905,6 +907,102 @@ class AgentViewModel(
     suspend fun executeGitCommit(workspacePath: String, message: String): String = executeGitCommand(workspacePath, "commit $message")
     suspend fun executeGitPush(workspacePath: String): String = executeGitCommand(workspacePath, "push")
     suspend fun executeGitPull(workspacePath: String): String = executeGitCommand(workspacePath, "pull")
+
+    private data class CiDiagnosis(val classification: String, val file: String?, val line: Int?, val explanation: String)
+
+    /** Parses the model's response to the structured /diagnose prompt below. Falls back to
+     *  UNKNOWN/whole-response-as-explanation if the model didn't follow the format — never throws,
+     *  since a malformed diagnosis should just skip the auto-fix step, not crash the command. */
+    private fun parseCiDiagnosis(raw: String): CiDiagnosis {
+        val classification = Regex("CLASSIFICATION:\\s*(FLAKY|REGRESSION)", RegexOption.IGNORE_CASE)
+            .find(raw)?.groupValues?.get(1)?.uppercase() ?: "UNKNOWN"
+        val file = Regex("FILE:\\s*(\\S+)").find(raw)?.groupValues?.get(1)?.takeUnless { it.equals("NONE", ignoreCase = true) }
+        val line = Regex("LINE:\\s*(\\d+)").find(raw)?.groupValues?.get(1)?.toIntOrNull()
+        val explanation = Regex("EXPLANATION:\\s*([\\s\\S]*)").find(raw)?.groupValues?.get(1)?.trim()?.ifBlank { null } ?: raw.trim()
+        return CiDiagnosis(classification, file, line, explanation)
+    }
+
+    /**
+     * Self-healing CI: `/diagnose <paste a failed build/test log>`. Real CI logs cascade — the
+     * first visible error is often a side effect, not the root cause, and separating the two is
+     * exactly the "log archaeology" cost the research turned up (45 min of reading logs after a
+     * 5-min build). This asks the model to find the ROOT cause and classify flaky-vs-regression;
+     * for a regression with a locatable file, it goes one step further than every read-only CI
+     * dashboard we found — it writes an actual fix (same fail-closed extraction as the quick-edit
+     * path, so a bad response skips the fix instead of corrupting the file), commits, pushes, and
+     * re-triggers the deploy pipeline so the loop actually closes instead of just naming the bug.
+     */
+    private suspend fun diagnoseCiFailure(sessionDir: File, logText: String): String {
+        if (logText.isBlank()) {
+            return "⚠️ Paste the failed CI log after the command, e.g. `/diagnose <paste log here>`"
+        }
+        val prompt = buildString {
+            appendLine("You are diagnosing a failed CI/CD pipeline run from its raw log.")
+            appendLine("Real CI logs cascade: a later failure is often a side effect of one root cause earlier in")
+            appendLine("the log, not a separate bug. Find the ROOT cause, not just the last error shown.")
+            appendLine()
+            appendLine("Respond in EXACTLY this format and nothing else:")
+            appendLine("CLASSIFICATION: FLAKY or REGRESSION")
+            appendLine("FILE: <filename the root cause is in, or NONE>")
+            appendLine("LINE: <line number if shown in the log, or NONE>")
+            appendLine("EXPLANATION: <one or two plain-English sentences on what actually went wrong>")
+            appendLine()
+            appendLine("Log:")
+            appendLine(logText.take(6000))
+        }
+        val diagnosis = parseCiDiagnosis(codeEngine.debug(prompt, ""))
+
+        val header = buildString {
+            appendLine(if (diagnosis.classification == "FLAKY") "🔁 **Likely flaky** — recommend re-running rather than changing code." else "🔍 **Root cause found**" + (diagnosis.file?.let { " in `$it`" + (diagnosis.line?.let { l -> ":$l" } ?: "") } ?: ""))
+            appendLine()
+            appendLine(diagnosis.explanation)
+        }
+
+        val targetFile = diagnosis.file?.let { name ->
+            sessionDir.walkTopDown().firstOrNull { it.isFile && !it.path.contains("/.git/") && it.name.equals(File(name).name, ignoreCase = true) }
+        }
+
+        val body = if (diagnosis.classification == "REGRESSION" && targetFile != null) {
+            val currentText = targetFile.readText()
+            val (winStart, winEnd) = extractTargetWindow(currentText, diagnosis.explanation, maxChars = 1200)
+            val targetSnippet = currentText.substring(winStart, winEnd)
+            val fixPrompt = "Fix this code based on the CI failure diagnosis below. Output ONLY the corrected code snippet — no explanation, no diff syntax, nothing before or after the code fence:\nDiagnosis: ${diagnosis.explanation}"
+            val updatedSnippet = codeEngine.write(fixPrompt, "Code snippet:\n$targetSnippet").trim().let(::extractModelCodeUpdate)
+
+            if (updatedSnippet == null) {
+                "⚠️ Found the root cause but couldn't safely generate a clean fix — the model's reply wasn't a single clean code block. Nothing was changed. You'll need to fix `${targetFile.name}` by hand."
+            } else {
+                targetFile.writeText(applySmartSnippetReplacement(currentText, winStart, winEnd, targetSnippet, updatedSnippet, isGreenBtn = false))
+                val commitResult = executeGitCommit(sessionDir.absolutePath, "Auto-fix: ${diagnosis.explanation.take(72)}")
+                val pushResult = executeGitPush(sessionDir.absolutePath)
+                val deployResult = runCatching { bridgeClient.triggerDeploy(bridgeUrl, sessionDir.name, "", "Auto-fix: ${diagnosis.explanation.take(72)}") }
+                    .fold(
+                        { "🚀 Pipeline re-triggered — watch it go green at `$bridgeUrl/deploy`." },
+                        { e -> "⚠️ Fix committed and pushed, but couldn't reach the laptop bridge to re-trigger the pipeline: ${e.message}" }
+                    )
+                buildString {
+                    appendLine("```")
+                    appendLine(updatedSnippet.take(1200))
+                    appendLine("```")
+                    appendLine()
+                    appendLine(commitResult)
+                    appendLine()
+                    appendLine(pushResult)
+                    appendLine()
+                    appendLine(deployResult)
+                }
+            }
+        } else {
+            val deployResult = runCatching { bridgeClient.triggerDeploy(bridgeUrl, sessionDir.name, "", "Re-run after ${diagnosis.classification.lowercase()} failure") }
+                .fold(
+                    { "🔁 Re-run triggered — watch it at `$bridgeUrl/deploy`." },
+                    { e -> "⚠️ Couldn't reach the laptop bridge to re-trigger the pipeline: ${e.message}" }
+                )
+            deployResult
+        }
+
+        return header + "\n" + body
+    }
 
     /**
      * Pulls a clean code update out of a model's raw response for the quick-edit path, or
