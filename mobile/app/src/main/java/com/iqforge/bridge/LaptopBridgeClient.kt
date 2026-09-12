@@ -120,6 +120,23 @@ open class LaptopBridgeClient(
     open suspend fun connectors(laptopUrl: String): List<BridgeConnector> =
         json.decodeFromString(ConnectorsResponse.serializer(), get(laptopUrl, "connectors")).connectors
 
+    /** Kicks off the bridge's simulated deploy pipeline; progress is watched live at
+     *  <laptopUrl>/deploy in a browser, not returned here — this just starts it. */
+    open suspend fun triggerDeploy(
+        laptopUrl: String,
+        repo: String,
+        commitSha: String,
+        message: String
+    ): DeployStatus = request(
+        laptopUrl = laptopUrl,
+        endpoint = "deploy",
+        body = json.encodeToString(DeployRequest.serializer(), DeployRequest(repo, commitSha, message))
+    ) { response ->
+        json.decodeFromString(DeployStatusDto.serializer(), response).let {
+            DeployStatus(it.deployId, it.stage, it.stageLabel, it.percent, it.done)
+        }
+    }
+
     private suspend fun get(laptopUrl: String, endpoint: String): String = withContext(Dispatchers.IO) {
         val request = Request.Builder().url("${normalizeUrl(laptopUrl)}/$endpoint").get().build()
         client.newCall(request).execute().use { response ->
@@ -251,6 +268,24 @@ private data class WorkspaceWriteResponse(
 )
 
 data class RepositoryResult(val path: String, val output: String)
+
+data class DeployStatus(val deployId: String, val stage: String, val stageLabel: String, val percent: Int, val done: Boolean)
+
+@Serializable
+private data class DeployRequest(
+    val repo: String,
+    @kotlinx.serialization.SerialName("commit_sha") val commitSha: String,
+    val message: String
+)
+
+@Serializable
+private data class DeployStatusDto(
+    @kotlinx.serialization.SerialName("deploy_id") val deployId: String,
+    val stage: String,
+    @kotlinx.serialization.SerialName("stage_label") val stageLabel: String,
+    val percent: Int,
+    val done: Boolean
+)
 
 @Serializable
 private data class RepositoryRequest(

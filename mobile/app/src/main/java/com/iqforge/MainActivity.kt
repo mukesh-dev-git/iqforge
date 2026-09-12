@@ -682,7 +682,7 @@ class AgentViewModel(
         val lower = trimmed.lowercase()
         if (trimmed.startsWith("/") && !trimmed.startsWith("//")) {
             val slashCmd = trimmed.substring(1).trimStart().split(Regex("\\s+")).firstOrNull()?.lowercase() ?: ""
-            if (slashCmd in setOf("git", "status", "diff", "log", "commit", "push", "pull", "branch", "checkout", "reset", "discard", "remote", "token", "help")) {
+            if (slashCmd in setOf("git", "status", "diff", "log", "commit", "push", "pull", "branch", "checkout", "reset", "discard", "remote", "token", "deploy", "help")) {
                 return true
             }
         }
@@ -707,6 +707,7 @@ class AgentViewModel(
         appendLine("• `/discard <file>` — Revert a specific file to HEAD")
         appendLine("• `/remote` or `git remote -v` — View remote repository URLs")
         appendLine("• `/token <PAT>` — Validate & save GitHub token with repo permissions")
+        appendLine("• `/deploy [message]` — Trigger the laptop bridge's deploy pipeline, watch live at `<bridgeUrl>/deploy`")
         appendLine()
         appendLine("💡 *All commands execute 100% on-device via embedded JGit.*")
     }
@@ -762,6 +763,29 @@ class AgentViewModel(
                 .replace(Regex("^/token", RegexOption.IGNORE_CASE), "")
                 .trim()
             return@withContext validateAndSaveGitHubToken(tok)
+        }
+
+        // Demo pipeline: /deploy asks the laptop bridge to run its simulated CI/CD (build ->
+        // test -> deploy -> live) and returns immediately — the actual progress is watched live
+        // at <bridgeUrl>/deploy on the laptop. Not a real deploy: there's no production infra to
+        // deploy to yet, this exists so the "fix it, push it, watch it go live" incident-response
+        // story has something real to point at during a demo.
+        if (trimmed.startsWith("/deploy", ignoreCase = true) || trimmed.startsWith("git deploy", ignoreCase = true)) {
+            val message = trimmed
+                .replace(Regex("^/deploy", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("^git\\s+deploy", RegexOption.IGNORE_CASE), "")
+                .trim()
+                .ifBlank { "Deployed from iQForge mobile" }
+            val repoName = File(workspacePath).name.ifBlank { "iqforge" }
+            val commitSha = runCatching {
+                Regex("[0-9a-f]{7,40}").find(executeGitCommand(workspacePath, "log -n 1"))?.value.orEmpty()
+            }.getOrDefault("")
+            return@withContext try {
+                bridgeClient.triggerDeploy(bridgeUrl, repoName, commitSha, message)
+                "🚀 **Deploy triggered!** Watch it go live at `$bridgeUrl/deploy` on the laptop.\n\nRepo: `$repoName` · Commit: `${commitSha.take(7).ifBlank { "HEAD" }}`"
+            } catch (e: Exception) {
+                "⚠️ Could not reach the laptop bridge to trigger a deploy: ${e.message}\n\nMake sure the bridge is running (`uvicorn server:app`) and the phone is on the same network."
+            }
         }
 
         val sessionDir = File(workspacePath)
