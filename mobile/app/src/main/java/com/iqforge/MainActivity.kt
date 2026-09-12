@@ -445,6 +445,7 @@ class AgentViewModel(
         (codeEngine as? NativeEngine)?.isCatalogModelAvailable(model) == true
 
     var isActivatingModel by mutableStateOf(false); private set
+    var activatingModelId by mutableStateOf<String?>(null); private set
     var downloadingModelId by mutableStateOf<String?>(null); private set
     private var downloadJob: kotlinx.coroutines.Job? = null
 
@@ -472,18 +473,23 @@ class AgentViewModel(
                 cancelModelDownload()
             }
             isActivatingModel = true
+            activatingModelId = model.id
             viewModelScope.launch {
-                val ready = nativeEngine.switchActiveModel(model)
-                offlineModelReady = ready
-                offlineModelBytes = nativeEngine.installedModelBytes()
-                offlineModelName = if (ready) nativeEngine.displayName else null
-                if (ready) selectedModel = nativeEngine.displayName
-                isActivatingModel = false
-                if (!ready) {
-                    feed += FeedItem.Status(
-                        "Couldn't start ${model.displayName} on the Hexagon NPU — the daemon didn't come up in time.",
-                        error = true
-                    )
+                try {
+                    val ready = nativeEngine.switchActiveModel(model)
+                    offlineModelReady = ready
+                    offlineModelBytes = nativeEngine.installedModelBytes()
+                    offlineModelName = if (ready) nativeEngine.displayName else null
+                    if (ready) selectedModel = nativeEngine.displayName
+                    if (!ready) {
+                        feed += FeedItem.Status(
+                            "Couldn't start ${model.displayName} on the Hexagon NPU — the daemon didn't come up in time.",
+                            error = true
+                        )
+                    }
+                } finally {
+                    isActivatingModel = false
+                    activatingModelId = null
                 }
             }
         } else {
@@ -5235,7 +5241,7 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                         val isActive = model.id == agent.activeCatalogModelId && agent.offlineModelReady
                         val isDownloaded = agent.isCatalogModelDownloaded(model)
                         val isDownloadingThis = agent.isDownloadingModel && model.id == agent.downloadingModelId
-                        val isActivatingThis = agent.isActivatingModel && model.id == agent.activeCatalogModelId
+                        val isActivatingThis = agent.isActivatingModel && model.id == agent.activatingModelId
                         Surface(
                             onClick = {
                                 if (agent.isActivatingModel) return@Surface

@@ -99,6 +99,7 @@ object NpuDaemonManager {
      * Terminates the running Hexagon HTP daemon via Shizuku shell.
      */
     suspend fun stopServer(): Boolean = withContext(Dispatchers.IO) {
+        if (!waitForShizuku()) return@withContext false
         if (!hasShizukuPermission()) return@withContext false
         try {
             Log.i(TAG, "Stopping NPU daemon via Shizuku...")
@@ -109,8 +110,13 @@ object NpuDaemonManager {
                 String::class.java
             ).apply { isAccessible = true }
             newProcessMethod.invoke(null, arrayOf("sh", "-c", "pkill -9 -f llama-server"), null, null)
-            delay(400)
-            Log.i(TAG, "NPU daemon stop command dispatched")
+            for (i in 1..15) {
+                delay(150)
+                if (!isServerAlive()) {
+                    Log.i(TAG, "NPU daemon successfully stopped")
+                    return@withContext true
+                }
+            }
             true
         } catch (t: Throwable) {
             Log.e(TAG, "Error stopping NPU daemon via Shizuku", t)
@@ -133,10 +139,24 @@ object NpuDaemonManager {
             return@withContext false
         }
 
+        // Clean up any stale llama-server process first
+        try {
+            val newProcessMethod = Shizuku::class.java.getDeclaredMethod(
+                "newProcess",
+                Array<String>::class.java,
+                Array<String>::class.java,
+                String::class.java
+            ).apply { isAccessible = true }
+            newProcessMethod.invoke(null, arrayOf("sh", "-c", "pkill -9 -f llama-server"), null, null)
+            delay(200)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Stale process cleanup notice", t)
+        }
+
         val launchCommand = "export LD_LIBRARY_PATH=/data/local/tmp/llama.cpp/lib; " +
             "export ADSP_LIBRARY_PATH=/data/local/tmp/llama.cpp/lib; " +
             "nohup /data/local/tmp/llama.cpp/bin/llama-server " +
-            "-m $modelPath " +
+            "-m \"$modelPath\" " +
             "--host 127.0.0.1 --port 8080 -ngl 99 --device HTP0 " +
             "</dev/null >/data/local/tmp/llama-server.log 2>&1 &"
 
@@ -155,9 +175,9 @@ object NpuDaemonManager {
             return@withContext false
         }
 
-        // Poll for health check
-        for (i in 1..10) {
-            delay(500)
+        // Poll for health check (HTP model initialization typically takes 1.5 - 3 seconds)
+        for (i in 1..20) {
+            delay(300)
             if (isServerAlive()) {
                 Log.i(TAG, "NPU server is alive and responding on port 8080!")
                 return@withContext true
