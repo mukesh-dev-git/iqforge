@@ -3543,7 +3543,6 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
 ) {
     val github: GitHubViewModel = viewModel()
     var repoInput by rememberSaveable { mutableStateOf("") }
-    var tab by rememberSaveable { mutableStateOf(0) } // 0 = PRs, 1 = Issues
     val startReview: (String) -> Unit = { prompt ->
         val ref = github.repoRef
         if (ref != null) {
@@ -3567,7 +3566,7 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
     Column(Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 10.dp)) {
         Text("Review", style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 14.dp, bottom = 4.dp))
         Text(
-            "Enter a public GitHub repository to review its open pull requests and issues.",
+            "Open a small pull request, review its real patch on device, verify conflicts and checks, then merge the exact commit you reviewed.",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodyMedium,
             modifier = Modifier.padding(bottom = 14.dp)
@@ -3600,10 +3599,12 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
                     Icon(Icons.Default.Refresh, "Refresh")
                 }
             }
-            Row(Modifier.padding(top = 8.dp, bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = tab == 0, onClick = { tab = 0 }, label = { Text("Pull requests (${github.pullRequests.size})") })
-                FilterChip(selected = tab == 1, onClick = { tab = 1 }, label = { Text("Issues (${github.issues.size})") })
-            }
+            Text(
+                "Open pull requests (${github.pullRequests.size})",
+                modifier = Modifier.padding(top = 8.dp, bottom = 8.dp),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
         when {
             github.loadingList -> Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -3613,8 +3614,7 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
             github.repoRef == null -> Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 Text("Enter a GitHub repository above to get started.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            tab == 0 -> PullRequestList(github.pullRequests, onOpen = github::openPullRequest)
-            else -> IssueList(github.issues, onOpen = github::openIssue)
+            else -> PullRequestList(github.pullRequests, onOpen = github::openPullRequest)
         }
         if (github.loadingDetail) StatusCard("Loading…")
         github.detailError?.let { StatusCard(it, error = true) }
@@ -3636,13 +3636,6 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
             onOpenDeepReview = {
                 startReview(buildPullRequestReviewPrompt(github.repoRef!!.fullName, pr, github.selectedPullRequestFiles))
             }
-        )
-    }
-    github.selectedIssue?.let { issue ->
-        IssueDetailDialog(
-            issue,
-            onDismiss = github::clearSelection,
-            onReview = { startReview(buildIssueReviewPrompt(github.repoRef!!.fullName, issue)) }
         )
     }
 }
