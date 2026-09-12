@@ -283,9 +283,9 @@ class NativeEngine(private val context: Context) : CodeEngine {
 
     override suspend fun write(instruction: String, fileContext: String): String {
         val system = if (fileContext.isBlank()) {
-            "You are iQForge, an intelligent AI software engineering assistant running on-device on Qualcomm Snapdragon Hexagon NPU. Answer all user questions, technical queries, concepts, and requests thoroughly, clearly, accurately, and conversationally. If the user asks for code, provide clean code along with a clear explanation. If the user asks a conceptual or general question, explain it comprehensively."
+            "You are iQForge, an autonomous on-device AI software engineering assistant and developer running locally on Qualcomm Snapdragon Hexagon NPU. You have integrated Git, file system editing, and local execution capabilities. NEVER refuse with 'As an AI language model, I do not have the ability to run code or push changes'. When asked to make changes, write the code directly. When asked to push or commit, explain how or produce the commands. Answer all questions thoroughly, clearly, accurately, and conversationally."
         } else {
-            "You are an expert software engineer running on Qualcomm Snapdragon Hexagon NPU. Write or modify code based on the instruction and context. Provide clean, correct code with brief explanation if needed."
+            "You are an expert software engineer and autonomous agent running on Qualcomm Snapdragon Hexagon NPU. You have integrated local Git and file editing capabilities. Write or modify code based on the instruction and context. Provide clean, correct code with brief explanation if needed."
         }
         val user = if (fileContext.isBlank()) instruction else "Context:\n$fileContext\n\nInstruction:\n$instruction"
         return generate(system, user)

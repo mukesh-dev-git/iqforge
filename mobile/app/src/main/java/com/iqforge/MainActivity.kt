@@ -1145,6 +1145,132 @@ class AgentViewModel(
         attachmentMessage = null
         feed += FeedItem.User(prompt)
         saveChatMessage("user", prompt)
+
+        val lowerPrompt = prompt.lowercase()
+        val repoRoot = application?.filesDir?.resolve("repositories")
+        val activeRepo = repoRoot?.listFiles()?.filter { it.isDirectory && it.resolve(".git").isDirectory }
+            ?.maxByOrNull { it.resolve(".git/index").lastModified() }
+
+        // Check for direct Git commands in main chat
+        if (prompt.startsWith("/token", ignoreCase = true)) {
+            val tok = prompt.removePrefix("/token").trim()
+            val prefs = application?.getSharedPreferences("iqforge_workspace", Context.MODE_PRIVATE) ?: preferences
+            prefs?.edit()?.putString("github_token", tok)?.apply()
+            val msg = "🔑 GitHub token saved on-device! You can now run `/push` or ask me to push code changes."
+            feed += FeedItem.Reply(msg)
+            saveChatMessage("assistant", msg)
+            sending = false
+            return
+        }
+
+        if (activeRepo != null) {
+            if (prompt.startsWith("/commit", ignoreCase = true)) {
+                viewModelScope.launch {
+                    val msg = executeGitCommit(activeRepo.absolutePath, prompt.removePrefix("/commit").trim())
+                    feed += FeedItem.Reply(msg)
+                    saveChatMessage("assistant", msg)
+                    sending = false
+                }
+                return
+            }
+            if (prompt.startsWith("/push", ignoreCase = true)) {
+                viewModelScope.launch {
+                    val msg = executeGitPush(activeRepo.absolutePath)
+                    feed += FeedItem.Reply(msg)
+                    saveChatMessage("assistant", msg)
+                    sending = false
+                }
+                return
+            }
+            if (prompt.startsWith("/pull", ignoreCase = true)) {
+                viewModelScope.launch {
+                    val msg = executeGitPull(activeRepo.absolutePath)
+                    feed += FeedItem.Reply(msg)
+                    saveChatMessage("assistant", msg)
+                    sending = false
+                }
+                return
+            }
+            if (prompt.equals("/status", ignoreCase = true) || prompt.equals("/git", ignoreCase = true)) {
+                viewModelScope.launch {
+                    val msg = executeGitStatus(activeRepo.absolutePath)
+                    feed += FeedItem.Reply(msg)
+                    saveChatMessage("assistant", msg)
+                    sending = false
+                }
+                return
+            }
+        }
+
+        val isPushOrCommitIntent = ("push" in lowerPrompt && ("code" in lowerPrompt || "change" in lowerPrompt || "repo" in lowerPrompt || "github" in lowerPrompt || "it" in lowerPrompt)) ||
+            ("commit" in lowerPrompt && ("code" in lowerPrompt || "change" in lowerPrompt || "it" in lowerPrompt)) ||
+            "make the changes and push" in lowerPrompt
+
+        if (isPushOrCommitIntent) {
+            if (activeRepo != null) {
+                val targetFile = activeRepo.resolve("index.html").takeIf { it.exists() }
+                    ?: activeRepo.walkTopDown().filter { it.isFile && !it.path.contains("/.git/") && !it.name.endsWith(".lnk") }
+                        .firstOrNull { it.name.endsWith(".html") || it.name.endsWith(".js") || it.name.endsWith(".ts") || it.name.endsWith(".kt") }
+                    ?: activeRepo.walkTopDown().firstOrNull { it.isFile && !it.path.contains("/.git/") }
+
+                if (targetFile != null) {
+                    viewModelScope.launch {
+                        try {
+                            feed += FeedItem.Status("Modifying ${targetFile.name} on Qualcomm Snapdragon Hexagon NPU…")
+                            val currentText = targetFile.readText()
+                            val recentContext = feed.filterIsInstance<FeedItem.User>().takeLast(2).map { it.text }.joinToString("\n")
+                            val instruction = if (recentContext.isNotBlank()) "$recentContext\n$prompt" else prompt
+
+                            val (winStart, winEnd) = extractTargetWindow(currentText, instruction, maxChars = 3500)
+                            val targetSnippet = currentText.substring(winStart, winEnd)
+                            val updatedSnippet = codeEngine.write(
+                                "Modify this code snippet according to the user request. Apply the changes and return ONLY the updated code snippet:\nUser request: $instruction",
+                                "Code snippet:\n$targetSnippet"
+                            ).trim()
+                                .replace(Regex("^```[A-Za-z0-9_+.-]*\\s*"), "")
+                                .replace(Regex("\\s*```$"), "")
+                                .trim()
+
+                            if (updatedSnippet.isNotBlank() && !updatedSnippet.startsWith("ERROR:")) {
+                                val updatedFull = currentText.substring(0, winStart) + updatedSnippet + currentText.substring(winEnd)
+                                targetFile.writeText(updatedFull)
+                                val commitResult = executeGitCommit(activeRepo.absolutePath, "Updated ${targetFile.name} per user request")
+                                val pushResult = executeGitPush(activeRepo.absolutePath)
+                                val reply = buildString {
+                                    appendLine("✅ Applied changes to `${targetFile.name}` in repository **${activeRepo.name}** via Snapdragon Hexagon NPU.")
+                                    appendLine()
+                                    appendLine("```")
+                                    appendLine(updatedSnippet.take(1200))
+                                    appendLine("```")
+                                    appendLine()
+                                    appendLine(commitResult)
+                                    appendLine()
+                                    appendLine(pushResult)
+                                }
+                                feed += FeedItem.Reply(reply)
+                                saveChatMessage("assistant", reply)
+                            } else {
+                                val fallbackReply = codeEngine.write(prompt, currentText.take(4000))
+                                feed += FeedItem.Reply(fallbackReply)
+                                saveChatMessage("assistant", fallbackReply)
+                            }
+                        } catch (e: Exception) {
+                            feed += FeedItem.Status("Error applying and pushing code: ${e.message}", error = true)
+                        } finally {
+                            sending = false
+                        }
+                    }
+                    return
+                }
+            } else {
+                val msg = "⚠️ No local repository is currently open on your phone. Please go to the **Code** section -> **Repository** -> **Clone GitHub** to clone your repository to the phone first, and I will be able to edit and push your code directly!"
+                feed += FeedItem.Reply(msg)
+                saveChatMessage("assistant", msg)
+                sending = false
+                return
+            }
+        }
+
         viewModelScope.launch {
             try {
                 val task = inferTask(prompt)
