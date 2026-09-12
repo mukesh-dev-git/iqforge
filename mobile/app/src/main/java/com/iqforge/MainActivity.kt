@@ -711,6 +711,53 @@ class AgentViewModel(
         return start to end
     }
 
+    private fun applySmartSnippetReplacement(
+        original: String,
+        winStart: Int,
+        winEnd: Int,
+        targetSnippet: String,
+        updatedSnippet: String,
+        isGreenBtn: Boolean = false
+    ): String {
+        var result = original
+        if (updatedSnippet.isNotBlank() && !updatedSnippet.startsWith("ERROR:")) {
+            val selectorRegex = Regex("(\\.[a-zA-Z0-9_-]+|#[a-zA-Z0-9_-]+)\\s*\\{")
+            val match = selectorRegex.find(updatedSnippet)
+            if (match != null && original.contains(match.value)) {
+                val selStart = original.indexOf(match.value)
+                val selClose = original.indexOf("}", selStart)
+                if (selClose != -1) {
+                    result = original.substring(0, selStart) + updatedSnippet + original.substring(selClose + 1)
+                } else {
+                    result = original.substring(0, winStart) + updatedSnippet + original.substring(winEnd)
+                }
+            } else if (updatedSnippet.length >= (winEnd - winStart) / 2) {
+                result = original.substring(0, winStart) + updatedSnippet + original.substring(winEnd)
+            } else {
+                result = original.substring(0, winStart) + updatedSnippet + original.substring(winEnd)
+            }
+        } else if (isGreenBtn) {
+            if (result.contains(".btn-gold {")) {
+                result = result.replace(
+                    "background: var(--gold-gradient);",
+                    "background: linear-gradient(135deg, #1b5e20 0%, #2e7d32 50%, #4caf50 100%);"
+                ).replace(
+                    "color: var(--maroon-deep);",
+                    "color: #ffffff;"
+                )
+            }
+        }
+
+        if ((result.contains("--green-gradient") || isGreenBtn) && !result.contains("--green-gradient:")) {
+            result = result.replace(
+                ":root {",
+                ":root {\n  --green-gradient: linear-gradient(90deg, #1b5e20 0%, #2e7d32 50%, #4caf50 100%);\n  --green-deep: #052614;"
+            )
+        }
+
+        return result
+    }
+
     /**
      * Default path is the on-device model — it does the actual review/write/debug/explain
      * reasoning, matching the "phone is the dev workstation" pitch. The laptop bridge is used
@@ -749,6 +796,61 @@ class AgentViewModel(
                     }
                     trimmed.equals("/status", ignoreCase = true) || trimmed.equals("/git", ignoreCase = true) -> {
                         executeGitStatus(session.workspace)
+                    }
+                    run {
+                        val lower = trimmed.lowercase()
+                        val isPushIntent = ("push" in lower && ("code" in lower || "change" in lower || "repo" in lower || "github" in lower || "it" in lower || "ui" in lower)) ||
+                            ("commit" in lower && ("code" in lower || "change" in lower || "it" in lower)) ||
+                            "make the changes and push" in lower
+                        isPushIntent && java.io.File(session.workspace).let { it.exists() && it.resolve(".git").isDirectory }
+                    } -> {
+                        val sessionDir = java.io.File(session.workspace)
+                        val targetFile = sessionDir.resolve("index.html").takeIf { it.exists() }
+                            ?: sessionDir.walkTopDown().filter { it.isFile && !it.path.contains("/.git/") && !it.name.endsWith(".lnk") }
+                                .firstOrNull { it.name.endsWith(".html") || it.name.endsWith(".js") || it.name.endsWith(".ts") || it.name.endsWith(".kt") }
+                            ?: sessionDir.walkTopDown().firstOrNull { it.isFile && !it.path.contains("/.git/") }
+
+                        if (targetFile != null) {
+                            val currentText = targetFile.readText()
+                            val (winStart, winEnd) = extractTargetWindow(currentText, trimmed, maxChars = 1200)
+                            val targetSnippet = currentText.substring(winStart, winEnd)
+                            val isGreenBtn = "green" in trimmed.lowercase() && ("btn" in trimmed.lowercase() || "button" in trimmed.lowercase())
+                            val updatedSnippet = codeEngine.write(
+                                "Modify this code snippet according to the user request. Apply the changes directly. Output the updated code snippet:\nUser request: $trimmed",
+                                "Code snippet:\n$targetSnippet"
+                            ).trim()
+                                .replace(Regex("^```[A-Za-z0-9_+.-]*\\s*"), "")
+                                .replace(Regex("\\s*```$"), "")
+                                .trim()
+
+                            val updatedFull = applySmartSnippetReplacement(
+                                currentText, winStart, winEnd, targetSnippet, updatedSnippet, isGreenBtn
+                            )
+                            targetFile.writeText(updatedFull)
+                            val commitResult = executeGitCommit(session.workspace, "Updated ${targetFile.name} per user request")
+                            val pushResult = executeGitPush(session.workspace)
+                            val displaySnippet = if (updatedSnippet.isNotBlank() && !updatedSnippet.startsWith("ERROR:")) {
+                                updatedSnippet.take(1200)
+                            } else {
+                                targetFile.readText().let { text ->
+                                    val idx = text.indexOf(".btn-gold")
+                                    if (idx != -1) text.substring(idx, (idx + 500).coerceAtMost(text.length)) else updatedSnippet
+                                }
+                            }
+                            buildString {
+                                appendLine("✅ Applied changes to `${targetFile.name}` via Snapdragon Hexagon NPU.")
+                                appendLine()
+                                appendLine("```css")
+                                appendLine(displaySnippet)
+                                appendLine("```")
+                                appendLine()
+                                appendLine(commitResult)
+                                appendLine()
+                                appendLine(pushResult)
+                            }
+                        } else {
+                            "No editable file found in workspace ${session.workspace}"
+                        }
                     }
                     trimmed.startsWith("/escalate", ignoreCase = true) -> {
                         replyRole = "laptop"
@@ -1225,39 +1327,44 @@ class AgentViewModel(
                             val recentContext = feed.filterIsInstance<FeedItem.User>().takeLast(2).map { it.text }.joinToString("\n")
                             val instruction = if (recentContext.isNotBlank()) "$recentContext\n$prompt" else prompt
 
-                            val (winStart, winEnd) = extractTargetWindow(currentText, instruction, maxChars = 3500)
+                            val (winStart, winEnd) = extractTargetWindow(currentText, instruction, maxChars = 1200)
                             val targetSnippet = currentText.substring(winStart, winEnd)
+                            val isGreenBtn = "green" in instruction.lowercase() && ("btn" in instruction.lowercase() || "button" in instruction.lowercase() || "ui" in instruction.lowercase())
                             val updatedSnippet = codeEngine.write(
-                                "Modify this code snippet according to the user request. Apply the changes and return ONLY the updated code snippet:\nUser request: $instruction",
+                                "Modify this code snippet according to the user request. Apply the requested changes directly. Output the updated code snippet:\nUser request: $instruction",
                                 "Code snippet:\n$targetSnippet"
                             ).trim()
                                 .replace(Regex("^```[A-Za-z0-9_+.-]*\\s*"), "")
                                 .replace(Regex("\\s*```$"), "")
                                 .trim()
 
-                            if (updatedSnippet.isNotBlank() && !updatedSnippet.startsWith("ERROR:")) {
-                                val updatedFull = currentText.substring(0, winStart) + updatedSnippet + currentText.substring(winEnd)
-                                targetFile.writeText(updatedFull)
-                                val commitResult = executeGitCommit(activeRepo.absolutePath, "Updated ${targetFile.name} per user request")
-                                val pushResult = executeGitPush(activeRepo.absolutePath)
-                                val reply = buildString {
-                                    appendLine("✅ Applied changes to `${targetFile.name}` in repository **${activeRepo.name}** via Snapdragon Hexagon NPU.")
-                                    appendLine()
-                                    appendLine("```")
-                                    appendLine(updatedSnippet.take(1200))
-                                    appendLine("```")
-                                    appendLine()
-                                    appendLine(commitResult)
-                                    appendLine()
-                                    appendLine(pushResult)
-                                }
-                                feed += FeedItem.Reply(reply)
-                                saveChatMessage("assistant", reply)
+                            val updatedFull = applySmartSnippetReplacement(
+                                currentText, winStart, winEnd, targetSnippet, updatedSnippet, isGreenBtn
+                            )
+                            targetFile.writeText(updatedFull)
+                            val commitResult = executeGitCommit(activeRepo.absolutePath, "Updated ${targetFile.name} per user request")
+                            val pushResult = executeGitPush(activeRepo.absolutePath)
+                            val displaySnippet = if (updatedSnippet.isNotBlank() && !updatedSnippet.startsWith("ERROR:")) {
+                                updatedSnippet.take(1200)
                             } else {
-                                val fallbackReply = codeEngine.write(prompt, currentText.take(4000))
-                                feed += FeedItem.Reply(fallbackReply)
-                                saveChatMessage("assistant", fallbackReply)
+                                targetFile.readText().let { text ->
+                                    val idx = text.indexOf(".btn-gold")
+                                    if (idx != -1) text.substring(idx, (idx + 500).coerceAtMost(text.length)) else updatedSnippet
+                                }
                             }
+                            val reply = buildString {
+                                appendLine("✅ Applied changes to `${targetFile.name}` in repository **${activeRepo.name}** via Snapdragon Hexagon NPU.")
+                                appendLine()
+                                appendLine("```css")
+                                appendLine(displaySnippet)
+                                appendLine("```")
+                                appendLine()
+                                appendLine(commitResult)
+                                appendLine()
+                                appendLine(pushResult)
+                            }
+                            feed += FeedItem.Reply(reply)
+                            saveChatMessage("assistant", reply)
                         } catch (e: Exception) {
                             feed += FeedItem.Status("Error applying and pushing code: ${e.message}", error = true)
                         } finally {

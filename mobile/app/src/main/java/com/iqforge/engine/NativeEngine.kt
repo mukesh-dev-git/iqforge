@@ -56,8 +56,9 @@ class NativeEngine(private val context: Context) : CodeEngine {
     var lastNpuTokensPerSec: Double? = null; private set
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(2, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(180, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
         .build()
 
     private val json = Json { ignoreUnknownKeys = true }
@@ -100,51 +101,13 @@ class NativeEngine(private val context: Context) : CodeEngine {
     suspend fun ensureNpuDaemonRunning(): Boolean = withContext(Dispatchers.IO) {
         if (checkNpuHealth()) return@withContext true
 
-        val nativeDir = context.applicationInfo.nativeLibraryDir
-        val serverBinary = File(nativeDir, "libllama-server.so").takeIf { it.exists() }
-            ?: File("/data/local/tmp/llama.cpp/bin/llama-server").takeIf { it.exists() }
-
-        if (serverBinary == null) {
-            Log.w("NativeEngine", "Hexagon NPU server binary not found in $nativeDir")
-            return@withContext false
-        }
-
-        val modelFile = File(context.filesDir, activeModel.fileName).takeIf { it.exists() && it.length() > 50_000_000L }
-            ?: File("/data/local/tmp/gguf/${activeModel.fileName}").takeIf { it.exists() && it.length() > 50_000_000L }
-
-        if (modelFile == null) {
-            Log.w("NativeEngine", "Model ${activeModel.fileName} not yet present on device")
-            return@withContext false
-        }
-
-        try {
-            Log.i("NativeEngine", "Spawning autonomous on-device Hexagon NPU server: ${serverBinary.absolutePath}")
-            val pb = ProcessBuilder(
-                serverBinary.absolutePath,
-                "-m", modelFile.absolutePath,
-                "--host", "127.0.0.1",
-                "--port", "8080",
-                "-ngl", "99",
-                "--device", "HTP0",
-                "-c", "2048"
-            ).apply {
-                val env = environment()
-                env["ADSP_LIBRARY_PATH"] = nativeDir
-                env["LD_LIBRARY_PATH"] = "$nativeDir:/vendor/lib64"
-                redirectErrorStream(true)
+        // Retry quick health checks in case daemon was just launched or processing
+        for (attempt in 1..4) {
+            kotlinx.coroutines.delay(500)
+            if (checkNpuHealth()) {
+                isReady = true
+                return@withContext true
             }
-            serverProcess = pb.start()
-
-            for (attempt in 1..25) {
-                kotlinx.coroutines.delay(400)
-                if (checkNpuHealth()) {
-                    Log.i("NativeEngine", "Hexagon NPU daemon verified active and healthy on attempt $attempt")
-                    isReady = true
-                    return@withContext true
-                }
-            }
-        } catch (e: Exception) {
-            Log.e("NativeEngine", "Failed to launch internal Hexagon NPU daemon", e)
         }
         false
     }
