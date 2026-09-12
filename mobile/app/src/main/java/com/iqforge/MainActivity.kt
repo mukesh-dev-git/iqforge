@@ -90,6 +90,9 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import com.iqforge.sensors.SensorFeedback
+import com.iqforge.sensors.HapticCue
+import com.iqforge.sensors.buzz
 
 private val IqfYellow = Color(0xFFFFC400)
 private val ForgeDarkColors = darkColorScheme(
@@ -324,6 +327,11 @@ class AgentViewModel(
     var modelServiceReady by mutableStateOf(false); private set
     var offlineModelReady by mutableStateOf(false); private set
     var offlineModelBytes by mutableStateOf(0L); private set
+    /** The real on-device model's display name (e.g. "Qwen2.5 Coder 1.5B (on-device, fast)"
+     *  or "Phi-4-mini 3.8B (on-device, alternative)") — whichever ModelCatalog entry
+     *  NativeEngine actually detected and loaded. Independent of [selectedModel], which can
+     *  point at a different (laptop/Ollama) model while this still reflects what's on-device. */
+    var offlineModelName by mutableStateOf<String?>(null); private set
     var connectors by mutableStateOf<List<BridgeConnector>>(emptyList()); private set
     var chats by mutableStateOf<List<SavedChat>>(historyStore?.load().orEmpty()); private set
     var activeChatId by mutableStateOf<String?>(null); private set
@@ -378,6 +386,7 @@ class AgentViewModel(
         viewModelScope.launch {
             offlineModelReady = nativeEngine.initialize()
             offlineModelBytes = nativeEngine.installedModelBytes()
+            offlineModelName = if (offlineModelReady) nativeEngine.displayName else null
             if (offlineModelReady && selectedModel == null) selectedModel = nativeEngine.displayName
         }
     }
@@ -1385,10 +1394,21 @@ class AgentViewModel(
 @Composable private fun Feed(modifier: Modifier, agent: AgentViewModel, workspace: WorkspaceUiState) {
     val listState = rememberLazyListState()
     val feedSize = agent.feed.size
+    val context = LocalContext.current
     LaunchedEffect(feedSize, agent.sending) {
         val visibleItems = feedSize + if (agent.sending) 1 else 0
         if (visibleItems > 0) listState.animateScrollToItem(visibleItems - 1)
     }
+    // Feel a reply land, not just see it — and an escalation failure buzzes differently
+    // from a normal one. Fires once per new item, only once the model has actually replied.
+    LaunchedEffect(feedSize) {
+        if (feedSize > 0 && !agent.sending) {
+            val cue = if (agent.feed.lastOrNull() is FeedItem.EscalateError) HapticCue.ERROR else HapticCue.REPLY
+            context.buzz(cue)
+        }
+    }
+    // Tilt the phone to scroll a long diff/feed hands-free — real sensor input, not decoration.
+    SensorFeedback(onTilt = { pitch -> listState.dispatchRawDelta(pitch * 30f) })
 
     if (agent.feed.isEmpty()) {
         EmptyAgentState(modifier, workspace.repo?.name, agent.incognito)
@@ -1716,7 +1736,7 @@ private fun displayModelText(text: String): String = text
                         )
                         Spacer(Modifier.weight(1f))
                         Text(
-                            if (isOffline) "Qwen 1.5B active" else if (agent.modelServiceReady) "Real model ready" else "Offline fallback",
+                            if (isOffline) "${agent.offlineModelName?.substringBefore(" (") ?: "On-device"} active" else if (agent.modelServiceReady) "Real model ready" else "Offline fallback",
                             color = if (isOffline) Color(0xFF54C878) else MaterialTheme.colorScheme.primary,
                             fontWeight = FontWeight.SemiBold,
                             style = MaterialTheme.typography.bodyMedium
@@ -1782,7 +1802,8 @@ private fun displayModelText(text: String): String = text
                             Spacer(Modifier.width(6.dp))
                             val displayModelName = when {
                                 agent.selectedModel == null -> "Select model"
-                                agent.selectedModel?.contains("on-device", ignoreCase = true) == true -> "Qwen 1.5B"
+                                agent.selectedModel?.contains("on-device", ignoreCase = true) == true ->
+                                    agent.offlineModelName?.substringBefore(" (") ?: "On-device"
                                 else -> agent.selectedModel?.substringBefore(':') ?: "Select model"
                             }
                             Text(
@@ -3491,7 +3512,7 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                         Icon(Icons.Default.PhoneAndroid, null, tint = Color(0xFF54C878))
                         Spacer(Modifier.width(14.dp))
                         Column(Modifier.weight(1f)) {
-                            Text("Qwen2.5 Coder 1.5B", style = MaterialTheme.typography.titleMedium)
+                            Text(agent.offlineModelName ?: "On-device model", style = MaterialTheme.typography.titleMedium)
                             Text("On-device • ${agent.offlineModelBytes / 1_000_000} MB GGUF • works without internet", color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         if (agent.selectedModel?.contains("on-device") == true) Icon(Icons.Default.Check, "Selected", tint = Color(0xFF54C878))
