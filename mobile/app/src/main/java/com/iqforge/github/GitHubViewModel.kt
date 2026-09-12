@@ -54,6 +54,31 @@ class GitHubViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    /** Standalone entry point for the Review page: user types a repo, no local clone required. */
+    fun loadForInput(input: String) {
+        loadedForRoot = null
+        val ref = GitHubRepoRef.parseFlexible(input)
+        repoRef = ref
+        pullRequests = emptyList()
+        issues = emptyList()
+        if (ref == null) {
+            listError = "Enter a valid GitHub repository, e.g. owner/repo or https://github.com/owner/repo"
+            return
+        }
+        loadingList = true
+        listError = null
+        viewModelScope.launch {
+            try {
+                pullRequests = client.listPullRequests(ref.owner, ref.repo)
+                issues = client.listIssues(ref.owner, ref.repo)
+            } catch (error: Exception) {
+                listError = error.message ?: "Could not reach GitHub."
+            } finally {
+                loadingList = false
+            }
+        }
+    }
+
     fun openPullRequest(number: Int) {
         val ref = repoRef ?: return
         loadingDetail = true
