@@ -880,6 +880,30 @@ class AgentViewModel(
     suspend fun executeGitPush(workspacePath: String): String = executeGitCommand(workspacePath, "push")
     suspend fun executeGitPull(workspacePath: String): String = executeGitCommand(workspacePath, "pull")
 
+    /**
+     * Pulls a clean code update out of a model's raw response for the quick-edit path, or
+     * returns null if it can't be done safely. The old code stripped a fence only when the
+     * ENTIRE response started/ended with ``` — the moment a model adds any prose before or
+     * after the block (which happens often, e.g. "To modify this... Here's the code: ``` ```
+     * Explanation: ..."), that anchored regex matches nothing and the whole raw response,
+     * explanation and all, got written straight to the file and committed. This instead
+     * searches for a fenced block anywhere in the text, and refuses to apply anything that
+     * doesn't reduce to exactly one clean block — never writes raw prose to a file.
+     */
+    private fun extractModelCodeUpdate(raw: String): String? {
+        val fences = Regex("```[A-Za-z0-9_+.-]*\\n?([\\s\\S]*?)```").findAll(raw).map { it.groupValues[1].trim() }.toList()
+        val candidate = when (fences.size) {
+            0 -> raw.trim().takeIf { it.isNotBlank() && it.lineSequence().count() <= 4 } // short, fence-less one-liners are fine
+            1 -> fences.single()
+            else -> null // multiple blocks (e.g. a diff block plus a shell-command block) — ambiguous, refuse
+        } ?: return null
+        // A real diff/patch isn't raw file content — applying it verbatim would corrupt the file.
+        val looksLikeDiff = candidate.lineSequence().any {
+            it.startsWith("diff --git") || it.startsWith("@@") || it.startsWith("--- ") || it.startsWith("+++ ")
+        }
+        return candidate.takeIf { it.isNotBlank() && !looksLikeDiff }
+    }
+
     private fun extractTargetWindow(fullText: String, query: String, maxChars: Int = 4000): Pair<Int, Int> {
         if (fullText.length <= maxChars) return 0 to fullText.length
         val stopwords = setOf(
@@ -1028,38 +1052,33 @@ class AgentViewModel(
                             val (winStart, winEnd) = extractTargetWindow(currentText, trimmed, maxChars = 1200)
                             val targetSnippet = currentText.substring(winStart, winEnd)
                             val isGreenBtn = "green" in trimmed.lowercase() && ("btn" in trimmed.lowercase() || "button" in trimmed.lowercase())
-                            val updatedSnippet = codeEngine.write(
-                                "Modify this code snippet according to the user request. Apply the changes directly. Output the updated code snippet:\nUser request: $trimmed",
+                            val rawResponse = codeEngine.write(
+                                "Modify this code snippet according to the user request. Apply the changes directly. Output ONLY the updated code snippet — no explanation, no reasoning, no diff syntax, nothing before or after the code fence:\nUser request: $trimmed",
                                 "Code snippet:\n$targetSnippet"
                             ).trim()
-                                .replace(Regex("^```[A-Za-z0-9_+.-]*\\s*"), "")
-                                .replace(Regex("\\s*```$"), "")
-                                .trim()
+                            val updatedSnippet = rawResponse.takeUnless { it.startsWith("ERROR:", ignoreCase = true) }?.let(::extractModelCodeUpdate)
 
-                            val updatedFull = applySmartSnippetReplacement(
-                                currentText, winStart, winEnd, targetSnippet, updatedSnippet, isGreenBtn
-                            )
-                            targetFile.writeText(updatedFull)
-                            val commitResult = executeGitCommit(session.workspace, "Updated ${targetFile.name} per user request")
-                            val pushResult = executeGitPush(session.workspace)
-                            val displaySnippet = if (updatedSnippet.isNotBlank() && !updatedSnippet.startsWith("ERROR:")) {
-                                updatedSnippet.take(1200)
+                            if (updatedSnippet == null) {
+                                "⚠️ Couldn't safely apply that edit — the model's reply included explanation text or diff syntax instead of just the updated code, and writing it as-is would have corrupted `${targetFile.name}`. Nothing was changed or committed. Try rephrasing more directly (e.g. \"just output the new file content\")."
                             } else {
-                                targetFile.readText().let { text ->
-                                    val idx = text.indexOf(".btn-gold")
-                                    if (idx != -1) text.substring(idx, (idx + 500).coerceAtMost(text.length)) else updatedSnippet
+                                val updatedFull = applySmartSnippetReplacement(
+                                    currentText, winStart, winEnd, targetSnippet, updatedSnippet, isGreenBtn
+                                )
+                                targetFile.writeText(updatedFull)
+                                val commitResult = executeGitCommit(session.workspace, "Updated ${targetFile.name} per user request")
+                                val declinedPush = Regex("\\b(do not|don't|dont|without|never)\\s+push", RegexOption.IGNORE_CASE).containsMatchIn(trimmed)
+                                val pushResult = if (declinedPush) "Skipped push — you asked not to push." else executeGitPush(session.workspace)
+                                buildString {
+                                    appendLine("✅ Applied changes to `${targetFile.name}` via Snapdragon Hexagon NPU.")
+                                    appendLine()
+                                    appendLine("```")
+                                    appendLine(updatedSnippet.take(1200))
+                                    appendLine("```")
+                                    appendLine()
+                                    appendLine(commitResult)
+                                    appendLine()
+                                    appendLine(pushResult)
                                 }
-                            }
-                            buildString {
-                                appendLine("✅ Applied changes to `${targetFile.name}` via Snapdragon Hexagon NPU.")
-                                appendLine()
-                                appendLine("```css")
-                                appendLine(displaySnippet)
-                                appendLine("```")
-                                appendLine()
-                                appendLine(commitResult)
-                                appendLine()
-                                appendLine(pushResult)
                             }
                         } else {
                             "No editable file found in workspace ${session.workspace}"
