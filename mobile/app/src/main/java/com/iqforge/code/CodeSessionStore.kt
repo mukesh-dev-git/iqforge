@@ -27,7 +27,9 @@ class CodeSessionStore(
     }.getOrDefault(emptyList()).sortedByDescending { it.updatedAt }
 
     fun create(workspace: String, title: String = "New Session"): CodeSession {
-        val session = CodeSession("code-${System.currentTimeMillis()}", title, workspace, workspace.substringAfterLast('\\'))
+        val repoName = workspace.replace('\\', '/').trimEnd('/').substringAfterLast('/').ifBlank { "Workspace" }
+        val sessionTitle = if (title == "New Session") "$repoName Session" else title
+        val session = CodeSession("code-${System.currentTimeMillis()}", sessionTitle, workspace, repoName)
         save(listOf(session) + load())
         return session
     }
@@ -40,6 +42,12 @@ class CodeSessionStore(
                 updatedAt = System.currentTimeMillis()
             ) else it
         }.sortedByDescending { it.updatedAt }
+        save(updated)
+        return updated
+    }
+
+    fun delete(id: String): List<CodeSession> {
+        val updated = load().filterNot { it.id == id }
         save(updated)
         return updated
     }
