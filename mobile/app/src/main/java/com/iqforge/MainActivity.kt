@@ -2129,10 +2129,38 @@ private fun displayModelText(text: String): String = text.trim()
  */
 private sealed class MdBlock {
     data class Paragraph(val text: String) : MdBlock()
+    data class Heading(val level: Int, val text: String) : MdBlock()
     data class Code(val code: String, val language: String?) : MdBlock()
 }
 
 private val CODE_FENCE = Regex("```([a-zA-Z0-9_+-]*)\\n?([\\s\\S]*?)```")
+private val HEADING_LINE = Regex("^(#{1,6})\\s+(.*)$")
+
+/** Splits a prose chunk (no code fences in it) into Heading blocks on `#`/`##`/`###` lines and
+ *  Paragraph blocks for everything else, grouping consecutive plain lines into one paragraph. */
+private fun parseProseBlocks(text: String): List<MdBlock> {
+    val out = mutableListOf<MdBlock>()
+    val paragraphLines = mutableListOf<String>()
+    fun flushParagraph() {
+        if (paragraphLines.isNotEmpty()) {
+            out.add(MdBlock.Paragraph(paragraphLines.joinToString("\n")))
+            paragraphLines.clear()
+        }
+    }
+    for (line in text.split("\n")) {
+        val heading = HEADING_LINE.find(line)
+        when {
+            heading != null -> {
+                flushParagraph()
+                out.add(MdBlock.Heading(heading.groupValues[1].length, heading.groupValues[2].trim()))
+            }
+            line.isBlank() -> flushParagraph()
+            else -> paragraphLines.add(line)
+        }
+    }
+    flushParagraph()
+    return out
+}
 
 private fun parseMarkdownBlocks(raw: String): List<MdBlock> {
     val blocks = mutableListOf<MdBlock>()
@@ -2140,14 +2168,14 @@ private fun parseMarkdownBlocks(raw: String): List<MdBlock> {
     for (match in CODE_FENCE.findAll(raw)) {
         if (match.range.first > lastEnd) {
             val before = raw.substring(lastEnd, match.range.first).trim('\n', ' ')
-            if (before.isNotBlank()) blocks.add(MdBlock.Paragraph(before))
+            if (before.isNotBlank()) blocks.addAll(parseProseBlocks(before))
         }
         blocks.add(MdBlock.Code(match.groupValues[2].trimEnd('\n'), match.groupValues[1].ifBlank { null }))
         lastEnd = match.range.last + 1
     }
     if (lastEnd < raw.length) {
         val rest = raw.substring(lastEnd).trim('\n', ' ')
-        if (rest.isNotBlank()) blocks.add(MdBlock.Paragraph(rest))
+        if (rest.isNotBlank()) blocks.addAll(parseProseBlocks(rest))
     }
     return blocks.ifEmpty { if (raw.isNotBlank()) listOf(MdBlock.Paragraph(raw)) else emptyList() }
 }
@@ -2178,6 +2206,16 @@ private fun MarkdownText(raw: String, style: androidx.compose.ui.text.TextStyle,
         blocks.forEach { block ->
             when (block) {
                 is MdBlock.Paragraph -> Text(inlineMarkdown(block.text), style = style, color = color)
+                is MdBlock.Heading -> Text(
+                    inlineMarkdown(block.text),
+                    style = when {
+                        block.level <= 1 -> MaterialTheme.typography.titleLarge
+                        block.level == 2 -> MaterialTheme.typography.titleMedium
+                        else -> MaterialTheme.typography.titleSmall
+                    },
+                    fontWeight = FontWeight.Bold,
+                    color = color
+                )
                 is MdBlock.Code -> Surface(
                     color = MaterialTheme.colorScheme.surfaceVariant,
                     shape = RoundedCornerShape(8.dp),
