@@ -916,7 +916,12 @@ class AgentViewModel(
     private fun parseCiDiagnosis(raw: String): CiDiagnosis {
         val classification = Regex("CLASSIFICATION:\\s*(FLAKY|REGRESSION)", RegexOption.IGNORE_CASE)
             .find(raw)?.groupValues?.get(1)?.uppercase() ?: "UNKNOWN"
-        val file = Regex("FILE:\\s*(\\S+)").find(raw)?.groupValues?.get(1)?.takeUnless { it.equals("NONE", ignoreCase = true) }
+        // Capture the whole rest of the line, not just \S+ — found live: the model sometimes
+        // writes a camelCase filename as two words ("User Profile.kt" instead of
+        // "UserProfile.kt"), which \S+ truncated at the space, so the file lookup always missed
+        // and silently fell back to the safe re-run path instead of attempting the real fix.
+        val file = Regex("FILE:\\s*([^\\n]+)").find(raw)?.groupValues?.get(1)?.trim()?.replace(" ", "")
+            ?.takeUnless { it.isBlank() || it.equals("NONE", ignoreCase = true) }
         val line = Regex("LINE:\\s*(\\d+)").find(raw)?.groupValues?.get(1)?.toIntOrNull()
         val explanation = Regex("EXPLANATION:\\s*([\\s\\S]*)").find(raw)?.groupValues?.get(1)?.trim()?.ifBlank { null } ?: raw.trim()
         return CiDiagnosis(classification, file, line, explanation)
