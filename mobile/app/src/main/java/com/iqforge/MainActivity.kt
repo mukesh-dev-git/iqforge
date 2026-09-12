@@ -1068,6 +1068,9 @@ class AgentViewModel(
     var voiceName by rememberSaveable { mutableStateOf(settingsPreferences.getString("tts_voice", "").orEmpty()) }
     var voicePace by rememberSaveable { mutableStateOf(settingsPreferences.getFloat("voice_pace", 1f)) }
     var navigationOpen by remember { mutableStateOf(false) }
+    // Tilt right opens the sidebar, tilt left closes it — app-wide, not just on the chat
+    // screen. Replaces the old tilt-to-scroll gesture (removed from Feed).
+    SensorFeedback(onTiltRight = { navigationOpen = true }, onTiltLeft = { navigationOpen = false })
     var destination by rememberSaveable { mutableStateOf(AppDestination.CHATS) }
     var selectedProjectName by rememberSaveable { mutableStateOf<String?>(null) }
     var showAddToChat by rememberSaveable { mutableStateOf(false) }
@@ -1419,8 +1422,6 @@ class AgentViewModel(
             context.buzz(cue)
         }
     }
-    // Tilt the phone to scroll a long diff/feed hands-free — real sensor input, not decoration.
-    SensorFeedback(onTilt = { pitch -> listState.dispatchRawDelta(pitch * 30f) })
 
     if (agent.feed.isEmpty()) {
         EmptyAgentState(modifier, workspace.repo?.name, agent.incognito)

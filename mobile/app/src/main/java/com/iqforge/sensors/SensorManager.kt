@@ -15,7 +15,8 @@ class SensorManager(context: Context) : SensorEventListener {
     private val proximity: Sensor? = sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY)
 
     var onShakeCallback: (() -> Unit)? = null
-    var onTiltCallback: ((Float) -> Unit)? = null
+    var onTiltRightCallback: (() -> Unit)? = null
+    var onTiltLeftCallback: (() -> Unit)? = null
     var onFaceDownCallback: ((Boolean) -> Unit)? = null
 
     // Shake detection vars
@@ -24,6 +25,12 @@ class SensorManager(context: Context) : SensorEventListener {
     private var lastY: Float = 0f
     private var lastZ: Float = 0f
     private val SHAKE_THRESHOLD = 800
+
+    // Tilt left/right: a discrete gesture (open/close the sidebar), not a continuous signal —
+    // debounced so one physical tilt fires once instead of on every sensor frame while held.
+    private var lastTiltFire: Long = 0
+    private val TILT_THRESHOLD = 1.8f
+    private val TILT_COOLDOWN_MS = 800L
 
     fun startListening() {
         accelerometer?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL) }
@@ -61,9 +68,19 @@ class SensorManager(context: Context) : SensorEventListener {
                 }
             }
             Sensor.TYPE_GYROSCOPE -> {
-                val pitch = event.values[0]
-                if (abs(pitch) > 0.5f) {
-                    onTiltCallback?.invoke(pitch)
+                // Y-axis rotation = rolling the phone left/right while held upright.
+                // Sign convention (positive = right) is untested on real hardware — flip the
+                // comparison below if right/left come out swapped once you try it.
+                val roll = event.values[1]
+                val now = System.currentTimeMillis()
+                if (now - lastTiltFire > TILT_COOLDOWN_MS) {
+                    if (roll > TILT_THRESHOLD) {
+                        lastTiltFire = now
+                        onTiltRightCallback?.invoke()
+                    } else if (roll < -TILT_THRESHOLD) {
+                        lastTiltFire = now
+                        onTiltLeftCallback?.invoke()
+                    }
                 }
             }
             Sensor.TYPE_PROXIMITY -> {
