@@ -698,13 +698,12 @@ class AgentViewModel(
             feed += FeedItem.Status("Cloned $name", success = true)
     }
 
-    /** Infer the BridgeTask from a plain-text user prompt. */
     internal fun inferTask(prompt: String): BridgeTask {
         val lower = prompt.lowercase()
         return when {
-            "review" in lower -> BridgeTask.REVIEW
-            "debug" in lower || "crash" in lower -> BridgeTask.DEBUG
-            "explain" in lower -> BridgeTask.EXPLAIN
+            "review" in lower || "check diff" in lower || "audit" in lower -> BridgeTask.REVIEW
+            "debug" in lower || "crash" in lower || "fix" in lower || "error" in lower || "exception" in lower -> BridgeTask.DEBUG
+            "explain" in lower || "what is" in lower || "what does" in lower || "why" in lower || "how" in lower || "tell me" in lower || "describe" in lower || "meaning" in lower || "define" in lower || "difference" in lower -> BridgeTask.EXPLAIN
             else -> BridgeTask.WRITE
         }
     }
@@ -754,12 +753,15 @@ class AgentViewModel(
                 } else {
                     when (task) {
                         BridgeTask.REVIEW  -> {
-                            val findings = codeEngine.review(enrichedContext)
+                            val target = if (enrichedContext.isNotBlank()) enrichedContext else prompt
+                            val findings = codeEngine.review(target)
                             if (findings.isEmpty()) "No issues found."
                             else findings.joinToString("\n") { "Line ${it.line}: [${it.severity}] ${it.message}" }
                         }
                         BridgeTask.DEBUG   -> codeEngine.debug(prompt, enrichedContext)
-                        BridgeTask.EXPLAIN -> codeEngine.explain(enrichedContext)
+                        BridgeTask.EXPLAIN -> codeEngine.explain(
+                            if (enrichedContext.isNotBlank()) "Context:\n$enrichedContext\n\nQuestion/Instruction:\n$prompt" else prompt
+                        )
                         BridgeTask.WRITE   -> codeEngine.write(prompt, enrichedContext)
                     }.also { feed += FeedItem.Reply(it) }
                 }
@@ -1372,12 +1374,7 @@ class AgentViewModel(
     }
 }
 
-private fun displayModelText(text: String): String = text
-    .replace(Regex("```[A-Za-z0-9_+.-]*"), "")
-    .replace("```", "")
-    .replace("**", "")
-    .replace("`", "")
-    .trim()
+private fun displayModelText(text: String): String = text.trim()
 
 @Composable private fun EmptyAgentState(modifier: Modifier, repositoryName: String?, incognito: Boolean) =
     Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

@@ -18,8 +18,8 @@ import kotlinx.serialization.json.Json
 @Serializable
 private data class LlamaCompletionRequest(
     val prompt: String,
-    val n_predict: Int = 512,
-    val temperature: Float = 0.2f,
+    val n_predict: Int = 768,
+    val temperature: Float = 0.7f,
     val stop: List<String> = listOf("<|im_end|>", "<|end|>", "</s>")
 )
 
@@ -200,8 +200,12 @@ class NativeEngine(private val context: Context) : CodeEngine {
     }
 
     override suspend fun write(instruction: String, fileContext: String): String {
-        val system = "You are an expert software engineer. Write or modify code based on the instruction and context. Output only the resulting code snippet or diff, without any markdown formatting or explanations unless requested."
-        val user = "Context:\n$fileContext\n\nInstruction:\n$instruction"
+        val system = if (fileContext.isBlank()) {
+            "You are iQForge, an intelligent AI software engineering assistant running on-device on Qualcomm Snapdragon Hexagon NPU. Answer all user questions, technical queries, concepts, and requests thoroughly, clearly, accurately, and conversationally. If the user asks for code, provide clean code along with a clear explanation. If the user asks a conceptual or general question, explain it comprehensively."
+        } else {
+            "You are an expert software engineer running on Qualcomm Snapdragon Hexagon NPU. Write or modify code based on the instruction and context. Provide clean, correct code with brief explanation if needed."
+        }
+        val user = if (fileContext.isBlank()) instruction else "Context:\n$fileContext\n\nInstruction:\n$instruction"
         return generate(system, user)
     }
 
@@ -221,14 +225,14 @@ class NativeEngine(private val context: Context) : CodeEngine {
     }
 
     override suspend fun debug(stackTrace: String, fileContext: String): String {
-        val system = "You are an expert debugger. Find the root cause of the problem described by the instruction or stack trace based on the context. Provide a concise explanation of the root cause and a proposed fix."
-        val user = "Context:\n$fileContext\n\nInstruction/Stack Trace:\n$stackTrace"
+        val system = "You are an expert debugger and software engineer running on Qualcomm Snapdragon Hexagon NPU. Analyze the issue, error, or stack trace thoroughly. Identify the root cause, explain why it happens, and provide a clear, step-by-step fix with corrected code."
+        val user = if (fileContext.isBlank()) stackTrace else "Context:\n$fileContext\n\nInstruction/Stack Trace:\n$stackTrace"
         return generate(system, user)
     }
 
     override suspend fun explain(snippet: String): String {
-        val system = "You are an expert code explainer. Explain the provided code context clearly and concisely."
-        val user = "Context:\n$snippet\n\nInstruction:\nExplain this"
+        val system = "You are iQForge, an intelligent AI software engineering assistant running on-device on Qualcomm Snapdragon Hexagon NPU. Answer the user's question or explain the provided concept, code, or topic thoroughly, clearly, and helpfully with examples where appropriate."
+        val user = snippet
         return generate(system, user)
     }
 }
