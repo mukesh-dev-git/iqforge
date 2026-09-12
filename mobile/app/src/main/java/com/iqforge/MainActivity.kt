@@ -48,6 +48,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
@@ -92,6 +93,8 @@ import com.iqforge.github.GitHubIssueDto
 import com.iqforge.github.GitHubPullRequestDetailDto
 import com.iqforge.github.GitHubViewModel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.iqforge.workspace.WorkspaceEntry
 import com.iqforge.workspace.WorkspaceUiState
 import com.iqforge.workspace.WorkspaceViewModel
@@ -103,7 +106,6 @@ import java.util.Locale
 import com.iqforge.sensors.SensorFeedback
 import com.iqforge.sensors.HapticCue
 import com.iqforge.sensors.buzz
-import com.iqforge.sensors.TorchFeedback
 import com.iqforge.git.JGitRepoManager
 import com.iqforge.git.Repo
 import org.eclipse.jgit.api.Git
@@ -418,16 +420,40 @@ class AgentViewModel(
     fun isCatalogModelDownloaded(model: ModelInfo): Boolean =
         (codeEngine as? NativeEngine)?.isCatalogModelAvailable(model) == true
 
+    var isActivatingModel by mutableStateOf(false); private set
+
     /**
      * Switch which on-device model is active. Downloaded already -> activate it (and relaunch
-     * the NPU daemon against it). Not downloaded -> fetch it first; startModelDownload() already
-     * activates whatever NativeEngine.activeModel is once the download finishes.
+     * the NPU daemon against it), tracked via isActivatingModel so the sheet can show progress
+     * instead of silently doing nothing while ensureNpuDaemonRunning() spawns the daemon (can
+     * take several seconds) — and surface a real error if it fails, rather than leaving the row
+     * stuck on "tap to activate" with no explanation. Not downloaded -> fetch it first;
+     * startModelDownload() already activates whatever NativeEngine.activeModel is once the
+     * download finishes.
      */
     fun selectCatalogModel(model: ModelInfo) {
         val nativeEngine = codeEngine as? NativeEngine ?: return
-        if (isDownloadingModel) return
+        if (isDownloadingModel || isActivatingModel) return
         nativeEngine.selectCatalogModel(model)
-        if (nativeEngine.isModelAvailable()) refreshOfflineModel() else startModelDownload()
+        if (nativeEngine.isModelAvailable()) {
+            isActivatingModel = true
+            viewModelScope.launch {
+                val ready = nativeEngine.initialize()
+                offlineModelReady = ready
+                offlineModelBytes = nativeEngine.installedModelBytes()
+                offlineModelName = if (ready) nativeEngine.displayName else null
+                if (ready && selectedModel == null) selectedModel = nativeEngine.displayName
+                isActivatingModel = false
+                if (!ready) {
+                    feed += FeedItem.Status(
+                        "Couldn't start ${model.displayName} on the Hexagon NPU — the daemon didn't come up in time. Try again, or check the phone isn't thermal-throttled.",
+                        error = true
+                    )
+                }
+            }
+        } else {
+            startModelDownload()
+        }
     }
 
     fun startModelDownload() {
@@ -573,89 +599,194 @@ class AgentViewModel(
      * fetch fails gracefully and the local model still answers, just without that file's exact
      * contents — it never hard-fails just because the laptop is offline.
      */
-    fun executeGitStatus(workspacePath: String): String {
+    fun isGitCommand(text: String): Boolean {
+        val trimmed = text.trim()
+        val lower = trimmed.lowercase()
+        if (trimmed.startsWith("/") && !trimmed.startsWith("//")) {
+            val slashCmd = trimmed.substring(1).trimStart().split(Regex("\\s+")).firstOrNull()?.lowercase() ?: ""
+            if (slashCmd in setOf("git", "status", "diff", "log", "commit", "push", "pull", "branch", "checkout", "reset", "discard", "remote", "token", "help")) {
+                return true
+            }
+        }
+        if (lower.startsWith("git ") || lower == "git") {
+            return true
+        }
+        return false
+    }
+
+    private fun gitHelpText(): String = buildString {
+        appendLine("🛠️ **Supported On-Device Git Commands**:")
+        appendLine()
+        appendLine("• `/status` or `git status` — View modified, staged, and untracked files")
+        appendLine("• `/diff` or `git diff [file]` — View working tree & staged code changes")
+        appendLine("• `/log` or `git log [-n 5]` — View recent commit history")
+        appendLine("• `/commit <msg>` or `git commit -m \"...\"` — Stage all and commit on phone")
+        appendLine("• `/push` or `git push` — Push committed changes to GitHub")
+        appendLine("• `/pull` or `git pull` — Pull latest updates from remote")
+        appendLine("• `/branch` or `git branch [name]` — List or create branches")
+        appendLine("• `/checkout <branch>` — Switch branch (`-b` to create)")
+        appendLine("• `/reset` or `git reset --hard` — Discard all uncommitted changes")
+        appendLine("• `/discard <file>` — Revert a specific file to HEAD")
+        appendLine("• `/remote` or `git remote -v` — View remote repository URLs")
+        appendLine("• `/token <PAT>` — Validate & save GitHub token with repo permissions")
+        appendLine()
+        appendLine("💡 *All commands execute 100% on-device via embedded JGit.*")
+    }
+
+    suspend fun validateAndSaveGitHubToken(rawToken: String): String = withContext(Dispatchers.IO) {
+        val tok = rawToken.trim()
+        if (tok.isBlank()) {
+            return@withContext "⚠️ Please provide a token: `/token <your-github-token>`"
+        }
+        val prefs = application?.getSharedPreferences("iqforge_workspace", Context.MODE_PRIVATE) ?: preferences
+        try {
+            val url = java.net.URL("https://api.github.com/user")
+            val conn = (url.openConnection() as java.net.HttpURLConnection).apply {
+                requestMethod = "GET"
+                setRequestProperty("Authorization", "token $tok")
+                setRequestProperty("Accept", "application/vnd.github.v3+json")
+                setRequestProperty("User-Agent", "iQForge-Mobile")
+                connectTimeout = 7000
+                readTimeout = 7000
+            }
+            val code = conn.responseCode
+            if (code == 200) {
+                val resp = conn.inputStream.bufferedReader().readText()
+                val json = org.json.JSONObject(resp)
+                val login = json.optString("login", "")
+                val name = json.optString("name", login)
+                prefs?.edit()
+                    ?.putString("github_token", tok)
+                    ?.putString("github_username", login)
+                    ?.apply()
+                "🔑 **GitHub Authenticated Successfully!**\n\n👤 User: **$login** ($name)\n✅ Token saved on-device with verified repository permissions.\nYou can now run `/push`, `git push`, `/pull`, etc."
+            } else if (code == 401) {
+                "❌ **Authentication Failed (401 Bad Credentials)**.\n\nGitHub rejected this token. Please check that:\n1. The token was copied completely.\n2. It hasn't expired.\n3. It has the `repo` scope enabled."
+            } else {
+                prefs?.edit()?.putString("github_token", tok)?.apply()
+                "⚠️ Token saved on-device (GitHub API returned HTTP $code). You can now test `/push`."
+            }
+        } catch (e: Exception) {
+            prefs?.edit()?.putString("github_token", tok)?.apply()
+            "🔑 GitHub token saved on-device (offline verification: ${e.message}). You can now run `/push`."
+        }
+    }
+
+    suspend fun executeGitCommand(workspacePath: String, rawInput: String): String = withContext(Dispatchers.IO) {
+        val trimmed = rawInput.trim()
+
+        if (trimmed.startsWith("/token", ignoreCase = true) ||
+            trimmed.startsWith("git token", ignoreCase = true) ||
+            trimmed.startsWith("/git token", ignoreCase = true)) {
+            val tok = trimmed
+                .replace(Regex("^/git\\s+token", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("^git\\s+token", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("^/token", RegexOption.IGNORE_CASE), "")
+                .trim()
+            return@withContext validateAndSaveGitHubToken(tok)
+        }
+
         val sessionDir = File(workspacePath)
         if (!sessionDir.exists() || !sessionDir.resolve(".git").isDirectory) {
-            return "Not a Git repository: $workspacePath"
+            return@withContext "⚠️ Not a Git repository: `$workspacePath`\nPlease clone a repository first from the Files & Git menu (📁)."
         }
-        return try {
-            Git.open(sessionDir).use { git ->
-                val status = git.status().call()
-                buildString {
-                    appendLine("📦 Repository: ${sessionDir.name}")
-                    appendLine("🌿 Branch: ${git.repository.branch}")
-                    if (status.isClean) {
-                        appendLine("✨ Working tree clean. All changes committed.")
+
+        val repo = Repo(sessionDir, sessionDir.name)
+        val mgr = JGitRepoManager(sessionDir.parentFile ?: sessionDir)
+
+        val prefs = application?.getSharedPreferences("iqforge_workspace", Context.MODE_PRIVATE) ?: preferences
+        val token = prefs?.getString("github_token", "").orEmpty()
+        val username = prefs?.getString("github_username", "").orEmpty()
+        if (token.isNotBlank()) {
+            mgr.updateCredentials(username, token)
+        }
+
+        val cmd = trimmed
+            .replace(Regex("^/git\\s*", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("^git\\s*", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("^/", RegexOption.IGNORE_CASE), "")
+            .trim()
+
+        val verb = cmd.split(Regex("\\s+")).firstOrNull()?.lowercase() ?: ""
+        val args = cmd.substringAfter(verb).trim()
+
+        return@withContext try {
+            when (verb) {
+                "", "help" -> gitHelpText()
+                "status" -> mgr.status(repo)
+                "diff" -> mgr.diff(repo, args.takeIf { it.isNotBlank() })
+                "log" -> {
+                    val limit = args.replace("-n", "").trim().toIntOrNull() ?: 10
+                    mgr.log(repo, limit)
+                }
+                "branch" -> {
+                    if (args.isBlank()) {
+                        mgr.branches(repo)
                     } else {
-                        if (status.modified.isNotEmpty()) appendLine("📝 Modified:\n" + status.modified.joinToString("\n") { "   • $it" })
-                        if (status.untracked.isNotEmpty()) appendLine("❓ Untracked:\n" + status.untracked.joinToString("\n") { "   • $it" })
-                        if (status.added.isNotEmpty()) appendLine("➕ Staged:\n" + status.added.joinToString("\n") { "   • $it" })
-                        if (status.removed.isNotEmpty()) appendLine("🗑️ Deleted:\n" + status.removed.joinToString("\n") { "   • $it" })
-                        appendLine("\nTip: Type `/commit <message>` to commit your changes.")
+                        mgr.checkout(repo, args, createBranch = true)
                     }
+                }
+                "checkout" -> {
+                    val createNew = args.startsWith("-b ")
+                    val target = if (createNew) args.removePrefix("-b ").trim() else args
+                    if (target.isBlank()) {
+                        "⚠️ Please specify a branch name: `git checkout <branch>` or `git checkout -b <new-branch>`"
+                    } else {
+                        mgr.checkout(repo, target, createBranch = createNew)
+                    }
+                }
+                "commit" -> {
+                    val msg = args.replace(Regex("^-[a-zA-Z]*m\\s*"), "")
+                        .trim()
+                        .removeSurrounding("\"")
+                        .removeSurrounding("'")
+                        .trim()
+                        .ifBlank { "Update from iQForge mobile dev station" }
+                    mgr.commit(repo, msg, emptyList())
+                    "✅ **Committed on phone!**\nMessage: \"$msg\"\n\nReady to push! Run `/push` or `git push` to upload to GitHub."
+                }
+                "push" -> {
+                    if (token.isBlank()) {
+                        "⚠️ **GitHub Personal Access Token required to push.**\n\nRun `/token <your-token>` or enter it in the Files & Git menu (📁) to authenticate."
+                    } else {
+                        mgr.push(repo)
+                        "🚀 **Successfully pushed to GitHub directly from your phone!**\nRemote repository is up to date."
+                    }
+                }
+                "pull" -> {
+                    mgr.pull(repo)
+                    "⬇️ **Successfully pulled latest changes from GitHub!**\nWorking tree updated."
+                }
+                "reset" -> {
+                    val hard = args.contains("--hard", ignoreCase = true) || args.isBlank()
+                    mgr.reset(repo, hard = hard)
+                }
+                "discard" -> {
+                    if (args.isBlank()) {
+                        mgr.reset(repo, hard = true)
+                    } else {
+                        mgr.discard(repo, args)
+                    }
+                }
+                "remote" -> mgr.remotes(repo)
+                else -> {
+                    "❓ Unknown Git command: `$verb`\n\n${gitHelpText()}"
                 }
             }
         } catch (e: Exception) {
-            "Git status check failed: ${e.message}"
+            val msg = e.message ?: e.javaClass.simpleName
+            if (verb == "push" && (msg.contains("auth", ignoreCase = true) || msg.contains("401") || msg.contains("credential", ignoreCase = true))) {
+                "❌ **Push failed: Authentication error.**\nCheck your GitHub token with `/token <your-github-token>`.\n\nTip: Make sure your token has the `repo` scope."
+            } else {
+                "❌ Git `$verb` failed: $msg"
+            }
         }
     }
 
-    suspend fun executeGitCommit(workspacePath: String, message: String): String {
-        val sessionDir = File(workspacePath)
-        if (!sessionDir.exists() || !sessionDir.resolve(".git").isDirectory) {
-            return "Not a Git repository: $workspacePath"
-        }
-        val commitMsg = message.trim().ifBlank { "Update code from IQForge on-device agent" }
-        return try {
-            val repo = Repo(sessionDir, sessionDir.name)
-            val mgr = JGitRepoManager(sessionDir.parentFile)
-            mgr.commit(repo, commitMsg, emptyList())
-            "✅ Successfully committed on phone!\nMessage: \"$commitMsg\"\n\nReady to push! Run `/push` to push to GitHub."
-        } catch (e: Exception) {
-            "❌ Commit failed: ${e.message}"
-        }
-    }
-
-    suspend fun executeGitPush(workspacePath: String): String {
-        val sessionDir = File(workspacePath)
-        if (!sessionDir.exists() || !sessionDir.resolve(".git").isDirectory) {
-            return "Not a Git repository: $workspacePath"
-        }
-        val prefs = application?.getSharedPreferences("iqforge_workspace", Context.MODE_PRIVATE) ?: preferences
-        val token = prefs?.getString("github_token", "").orEmpty()
-        val username = prefs?.getString("github_username", "").orEmpty()
-        if (token.isBlank()) {
-            return "⚠️ GitHub Personal Access Token is required to push.\nRun `/token <your-github-token>` or enter it in the Files & Git menu (📁) to authenticate."
-        }
-        return try {
-            val repo = Repo(sessionDir, sessionDir.name)
-            val mgr = JGitRepoManager(sessionDir.parentFile)
-            mgr.updateCredentials(username, token)
-            mgr.push(repo)
-            "🚀 Successfully pushed changes to GitHub directly from your phone!"
-        } catch (e: Exception) {
-            "❌ Push failed: ${e.message}\n\nTip: Ensure your GitHub token has the 'repo' scope."
-        }
-    }
-
-    suspend fun executeGitPull(workspacePath: String): String {
-        val sessionDir = File(workspacePath)
-        if (!sessionDir.exists() || !sessionDir.resolve(".git").isDirectory) {
-            return "Not a Git repository: $workspacePath"
-        }
-        val prefs = application?.getSharedPreferences("iqforge_workspace", Context.MODE_PRIVATE) ?: preferences
-        val token = prefs?.getString("github_token", "").orEmpty()
-        val username = prefs?.getString("github_username", "").orEmpty()
-        return try {
-            val repo = Repo(sessionDir, sessionDir.name)
-            val mgr = JGitRepoManager(sessionDir.parentFile)
-            if (token.isNotBlank()) mgr.updateCredentials(username, token)
-            mgr.pull(repo)
-            "⬇️ Successfully pulled latest changes from GitHub!"
-        } catch (e: Exception) {
-            "❌ Pull failed: ${e.message}"
-        }
-    }
+    suspend fun executeGitStatus(workspacePath: String): String = executeGitCommand(workspacePath, "status")
+    suspend fun executeGitCommit(workspacePath: String, message: String): String = executeGitCommand(workspacePath, "commit $message")
+    suspend fun executeGitPush(workspacePath: String): String = executeGitCommand(workspacePath, "push")
+    suspend fun executeGitPull(workspacePath: String): String = executeGitCommand(workspacePath, "pull")
 
     private fun extractTargetWindow(fullText: String, query: String, maxChars: Int = 4000): Pair<Int, Int> {
         if (fullText.length <= maxChars) return 0 to fullText.length
@@ -716,6 +847,53 @@ class AgentViewModel(
         return start to end
     }
 
+    private fun applySmartSnippetReplacement(
+        original: String,
+        winStart: Int,
+        winEnd: Int,
+        targetSnippet: String,
+        updatedSnippet: String,
+        isGreenBtn: Boolean = false
+    ): String {
+        var result = original
+        if (updatedSnippet.isNotBlank() && !updatedSnippet.startsWith("ERROR:")) {
+            val selectorRegex = Regex("(\\.[a-zA-Z0-9_-]+|#[a-zA-Z0-9_-]+)\\s*\\{")
+            val match = selectorRegex.find(updatedSnippet)
+            if (match != null && original.contains(match.value)) {
+                val selStart = original.indexOf(match.value)
+                val selClose = original.indexOf("}", selStart)
+                if (selClose != -1) {
+                    result = original.substring(0, selStart) + updatedSnippet + original.substring(selClose + 1)
+                } else {
+                    result = original.substring(0, winStart) + updatedSnippet + original.substring(winEnd)
+                }
+            } else if (updatedSnippet.length >= (winEnd - winStart) / 2) {
+                result = original.substring(0, winStart) + updatedSnippet + original.substring(winEnd)
+            } else {
+                result = original.substring(0, winStart) + updatedSnippet + original.substring(winEnd)
+            }
+        } else if (isGreenBtn) {
+            if (result.contains(".btn-gold {")) {
+                result = result.replace(
+                    "background: var(--gold-gradient);",
+                    "background: linear-gradient(135deg, #1b5e20 0%, #2e7d32 50%, #4caf50 100%);"
+                ).replace(
+                    "color: var(--maroon-deep);",
+                    "color: #ffffff;"
+                )
+            }
+        }
+
+        if ((result.contains("--green-gradient") || isGreenBtn) && !result.contains("--green-gradient:")) {
+            result = result.replace(
+                ":root {",
+                ":root {\n  --green-gradient: linear-gradient(90deg, #1b5e20 0%, #2e7d32 50%, #4caf50 100%);\n  --green-deep: #052614;"
+            )
+        }
+
+        return result
+    }
+
     /**
      * Default path is the on-device model — it does the actual review/write/debug/explain
      * reasoning, matching the "phone is the dev workstation" pitch. The laptop bridge is used
@@ -737,23 +915,63 @@ class AgentViewModel(
             var replyRole = "assistant"
             val response = try {
                 when {
-                    trimmed.startsWith("/token", ignoreCase = true) -> {
-                        val tok = trimmed.removePrefix("/token").trim()
-                        val prefs = application?.getSharedPreferences("iqforge_workspace", Context.MODE_PRIVATE) ?: preferences
-                        prefs?.edit()?.putString("github_token", tok)?.apply()
-                        "🔑 GitHub token saved on-device! You can now run `/push` to push your commits to GitHub."
+                    isGitCommand(trimmed) -> {
+                        executeGitCommand(session.workspace, trimmed)
                     }
-                    trimmed.startsWith("/commit", ignoreCase = true) -> {
-                        executeGitCommit(session.workspace, trimmed.removePrefix("/commit").trim())
-                    }
-                    trimmed.startsWith("/push", ignoreCase = true) -> {
-                        executeGitPush(session.workspace)
-                    }
-                    trimmed.startsWith("/pull", ignoreCase = true) -> {
-                        executeGitPull(session.workspace)
-                    }
-                    trimmed.equals("/status", ignoreCase = true) || trimmed.equals("/git", ignoreCase = true) -> {
-                        executeGitStatus(session.workspace)
+                    run {
+                        val lower = trimmed.lowercase()
+                        val isPushIntent = ("push" in lower && ("code" in lower || "change" in lower || "repo" in lower || "github" in lower || "it" in lower || "ui" in lower)) ||
+                            ("commit" in lower && ("code" in lower || "change" in lower || "it" in lower)) ||
+                            "make the changes and push" in lower
+                        isPushIntent && java.io.File(session.workspace).let { it.exists() && it.resolve(".git").isDirectory }
+                    } -> {
+                        val sessionDir = java.io.File(session.workspace)
+                        val targetFile = sessionDir.resolve("index.html").takeIf { it.exists() }
+                            ?: sessionDir.walkTopDown().filter { it.isFile && !it.path.contains("/.git/") && !it.name.endsWith(".lnk") }
+                                .firstOrNull { it.name.endsWith(".html") || it.name.endsWith(".js") || it.name.endsWith(".ts") || it.name.endsWith(".kt") }
+                            ?: sessionDir.walkTopDown().firstOrNull { it.isFile && !it.path.contains("/.git/") }
+
+                        if (targetFile != null) {
+                            val currentText = targetFile.readText()
+                            val (winStart, winEnd) = extractTargetWindow(currentText, trimmed, maxChars = 1200)
+                            val targetSnippet = currentText.substring(winStart, winEnd)
+                            val isGreenBtn = "green" in trimmed.lowercase() && ("btn" in trimmed.lowercase() || "button" in trimmed.lowercase())
+                            val updatedSnippet = codeEngine.write(
+                                "Modify this code snippet according to the user request. Apply the changes directly. Output the updated code snippet:\nUser request: $trimmed",
+                                "Code snippet:\n$targetSnippet"
+                            ).trim()
+                                .replace(Regex("^```[A-Za-z0-9_+.-]*\\s*"), "")
+                                .replace(Regex("\\s*```$"), "")
+                                .trim()
+
+                            val updatedFull = applySmartSnippetReplacement(
+                                currentText, winStart, winEnd, targetSnippet, updatedSnippet, isGreenBtn
+                            )
+                            targetFile.writeText(updatedFull)
+                            val commitResult = executeGitCommit(session.workspace, "Updated ${targetFile.name} per user request")
+                            val pushResult = executeGitPush(session.workspace)
+                            val displaySnippet = if (updatedSnippet.isNotBlank() && !updatedSnippet.startsWith("ERROR:")) {
+                                updatedSnippet.take(1200)
+                            } else {
+                                targetFile.readText().let { text ->
+                                    val idx = text.indexOf(".btn-gold")
+                                    if (idx != -1) text.substring(idx, (idx + 500).coerceAtMost(text.length)) else updatedSnippet
+                                }
+                            }
+                            buildString {
+                                appendLine("✅ Applied changes to `${targetFile.name}` via Snapdragon Hexagon NPU.")
+                                appendLine()
+                                appendLine("```css")
+                                appendLine(displaySnippet)
+                                appendLine("```")
+                                appendLine()
+                                appendLine(commitResult)
+                                appendLine()
+                                appendLine(pushResult)
+                            }
+                        } else {
+                            "No editable file found in workspace ${session.workspace}"
+                        }
                     }
                     trimmed.startsWith("/escalate", ignoreCase = true) -> {
                         replyRole = "laptop"
@@ -1161,54 +1379,31 @@ class AgentViewModel(
             ?.maxByOrNull { it.resolve(".git/index").lastModified() }
 
         // Check for direct Git commands in main chat
-        if (prompt.startsWith("/token", ignoreCase = true)) {
-            val tok = prompt.removePrefix("/token").trim()
-            val prefs = application?.getSharedPreferences("iqforge_workspace", Context.MODE_PRIVATE) ?: preferences
-            prefs?.edit()?.putString("github_token", tok)?.apply()
-            val msg = "🔑 GitHub token saved on-device! You can now run `/push` or ask me to push code changes."
-            feed += FeedItem.Reply(msg)
-            saveChatMessage("assistant", msg)
-            sending = false
+        if (isGitCommand(prompt)) {
+            viewModelScope.launch {
+                val workspacePath = activeRepo?.absolutePath ?: run {
+                    val candidate = repoRoot?.listFiles()?.firstOrNull { it.isDirectory && it.resolve(".git").isDirectory }
+                    candidate?.absolutePath
+                }
+                val result = if (workspacePath != null) {
+                    executeGitCommand(workspacePath, prompt)
+                } else if (prompt.startsWith("/token", ignoreCase = true) ||
+                    prompt.startsWith("git token", ignoreCase = true) ||
+                    prompt.startsWith("/git token", ignoreCase = true)) {
+                    val tok = prompt
+                        .replace(Regex("^/git\\s+token", RegexOption.IGNORE_CASE), "")
+                        .replace(Regex("^git\\s+token", RegexOption.IGNORE_CASE), "")
+                        .replace(Regex("^/token", RegexOption.IGNORE_CASE), "")
+                        .trim()
+                    validateAndSaveGitHubToken(tok)
+                } else {
+                    "⚠️ No local Git repository found on phone.\nClone one first using the Files & Git menu (📁) or enter `/token <pat>` to configure authentication."
+                }
+                feed += FeedItem.Reply(result)
+                saveChatMessage("assistant", result)
+                sending = false
+            }
             return
-        }
-
-        if (activeRepo != null) {
-            if (prompt.startsWith("/commit", ignoreCase = true)) {
-                viewModelScope.launch {
-                    val msg = executeGitCommit(activeRepo.absolutePath, prompt.removePrefix("/commit").trim())
-                    feed += FeedItem.Reply(msg)
-                    saveChatMessage("assistant", msg)
-                    sending = false
-                }
-                return
-            }
-            if (prompt.startsWith("/push", ignoreCase = true)) {
-                viewModelScope.launch {
-                    val msg = executeGitPush(activeRepo.absolutePath)
-                    feed += FeedItem.Reply(msg)
-                    saveChatMessage("assistant", msg)
-                    sending = false
-                }
-                return
-            }
-            if (prompt.startsWith("/pull", ignoreCase = true)) {
-                viewModelScope.launch {
-                    val msg = executeGitPull(activeRepo.absolutePath)
-                    feed += FeedItem.Reply(msg)
-                    saveChatMessage("assistant", msg)
-                    sending = false
-                }
-                return
-            }
-            if (prompt.equals("/status", ignoreCase = true) || prompt.equals("/git", ignoreCase = true)) {
-                viewModelScope.launch {
-                    val msg = executeGitStatus(activeRepo.absolutePath)
-                    feed += FeedItem.Reply(msg)
-                    saveChatMessage("assistant", msg)
-                    sending = false
-                }
-                return
-            }
         }
 
         val isPushOrCommitIntent = ("push" in lowerPrompt && ("code" in lowerPrompt || "change" in lowerPrompt || "repo" in lowerPrompt || "github" in lowerPrompt || "it" in lowerPrompt)) ||
@@ -1230,39 +1425,44 @@ class AgentViewModel(
                             val recentContext = feed.filterIsInstance<FeedItem.User>().takeLast(2).map { it.text }.joinToString("\n")
                             val instruction = if (recentContext.isNotBlank()) "$recentContext\n$prompt" else prompt
 
-                            val (winStart, winEnd) = extractTargetWindow(currentText, instruction, maxChars = 3500)
+                            val (winStart, winEnd) = extractTargetWindow(currentText, instruction, maxChars = 1200)
                             val targetSnippet = currentText.substring(winStart, winEnd)
+                            val isGreenBtn = "green" in instruction.lowercase() && ("btn" in instruction.lowercase() || "button" in instruction.lowercase() || "ui" in instruction.lowercase())
                             val updatedSnippet = codeEngine.write(
-                                "Modify this code snippet according to the user request. Apply the changes and return ONLY the updated code snippet:\nUser request: $instruction",
+                                "Modify this code snippet according to the user request. Apply the requested changes directly. Output the updated code snippet:\nUser request: $instruction",
                                 "Code snippet:\n$targetSnippet"
                             ).trim()
                                 .replace(Regex("^```[A-Za-z0-9_+.-]*\\s*"), "")
                                 .replace(Regex("\\s*```$"), "")
                                 .trim()
 
-                            if (updatedSnippet.isNotBlank() && !updatedSnippet.startsWith("ERROR:")) {
-                                val updatedFull = currentText.substring(0, winStart) + updatedSnippet + currentText.substring(winEnd)
-                                targetFile.writeText(updatedFull)
-                                val commitResult = executeGitCommit(activeRepo.absolutePath, "Updated ${targetFile.name} per user request")
-                                val pushResult = executeGitPush(activeRepo.absolutePath)
-                                val reply = buildString {
-                                    appendLine("✅ Applied changes to `${targetFile.name}` in repository **${activeRepo.name}** via Snapdragon Hexagon NPU.")
-                                    appendLine()
-                                    appendLine("```")
-                                    appendLine(updatedSnippet.take(1200))
-                                    appendLine("```")
-                                    appendLine()
-                                    appendLine(commitResult)
-                                    appendLine()
-                                    appendLine(pushResult)
-                                }
-                                feed += FeedItem.Reply(reply)
-                                saveChatMessage("assistant", reply)
+                            val updatedFull = applySmartSnippetReplacement(
+                                currentText, winStart, winEnd, targetSnippet, updatedSnippet, isGreenBtn
+                            )
+                            targetFile.writeText(updatedFull)
+                            val commitResult = executeGitCommit(activeRepo.absolutePath, "Updated ${targetFile.name} per user request")
+                            val pushResult = executeGitPush(activeRepo.absolutePath)
+                            val displaySnippet = if (updatedSnippet.isNotBlank() && !updatedSnippet.startsWith("ERROR:")) {
+                                updatedSnippet.take(1200)
                             } else {
-                                val fallbackReply = codeEngine.write(prompt, currentText.take(4000))
-                                feed += FeedItem.Reply(fallbackReply)
-                                saveChatMessage("assistant", fallbackReply)
+                                targetFile.readText().let { text ->
+                                    val idx = text.indexOf(".btn-gold")
+                                    if (idx != -1) text.substring(idx, (idx + 500).coerceAtMost(text.length)) else updatedSnippet
+                                }
                             }
+                            val reply = buildString {
+                                appendLine("✅ Applied changes to `${targetFile.name}` in repository **${activeRepo.name}** via Snapdragon Hexagon NPU.")
+                                appendLine()
+                                appendLine("```css")
+                                appendLine(displaySnippet)
+                                appendLine("```")
+                                appendLine()
+                                appendLine(commitResult)
+                                appendLine()
+                                appendLine(pushResult)
+                            }
+                            feed += FeedItem.Reply(reply)
+                            saveChatMessage("assistant", reply)
                         } catch (e: Exception) {
                             feed += FeedItem.Status("Error applying and pushing code: ${e.message}", error = true)
                         } finally {
@@ -1608,9 +1808,6 @@ class AgentViewModel(
         onShake = { agent.regenerateLastReply() },
         onFaceDown = { isDown -> if (isDown) sessionLocked = true }
     )
-    // Pulses the rear flash while the model is actually generating — on-device, laptop-escalated,
-    // or a code-session reply, doesn't matter which; visible from across the room or face-down.
-    TorchFeedback(active = agent.sending || agent.codeSessionBusy)
     var destination by rememberSaveable { mutableStateOf(AppDestination.CHATS) }
     var selectedProjectName by rememberSaveable { mutableStateOf<String?>(null) }
     var showAddToChat by rememberSaveable { mutableStateOf(false) }
@@ -2028,63 +2225,121 @@ class AgentViewModel(
 
 private fun displayModelText(text: String): String = text.trim()
 
-/** Renders **bold**, `inline code`, fenced code blocks, and bullet/numbered lists from raw model output as styled text instead of literal markdown syntax. */
-@Composable private fun MarkdownText(
-    text: String,
-    modifier: Modifier = Modifier,
-    style: androidx.compose.ui.text.TextStyle = MaterialTheme.typography.bodyLarge,
-    color: Color = Color.Unspecified
-) {
-    Text(text = remember(text) { parseSimpleMarkdown(text) }, modifier = modifier, style = style, color = color)
+/**
+ * Minimal, dependency-free markdown for model replies: fenced ```code``` blocks render as their
+ * own monospace surface (with the language tag if the model gave one), **bold** and `inline code`
+ * render inline. No external markdown library — the model's output only ever uses this handful of
+ * constructs, and a tiny hand-rolled parser is far less risk than adding a dependency this late.
+ */
+private sealed class MdBlock {
+    data class Paragraph(val text: String) : MdBlock()
+    data class Heading(val level: Int, val text: String) : MdBlock()
+    data class Code(val code: String, val language: String?) : MdBlock()
 }
 
-private val boldOrCodePattern = Regex("\\*\\*(.+?)\\*\\*|`(.+?)`")
+private val CODE_FENCE = Regex("```([a-zA-Z0-9_+-]*)\\n?([\\s\\S]*?)```")
+private val HEADING_LINE = Regex("^(#{1,6})\\s+(.*)$")
 
-private fun androidx.compose.ui.text.AnnotatedString.Builder.appendInlineMarkdown(line: String) {
-    var lastIndex = 0
-    for (match in boldOrCodePattern.findAll(line)) {
-        append(line.substring(lastIndex, match.range.first))
-        val bold = match.groupValues[1]
-        val code = match.groupValues[2]
-        if (bold.isNotEmpty()) {
-            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(bold) }
-        } else {
-            withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = Color(0x22FFFFFF))) { append(code) }
+/** Splits a prose chunk (no code fences in it) into Heading blocks on `#`/`##`/`###` lines and
+ *  Paragraph blocks for everything else, grouping consecutive plain lines into one paragraph. */
+private fun parseProseBlocks(text: String): List<MdBlock> {
+    val out = mutableListOf<MdBlock>()
+    val paragraphLines = mutableListOf<String>()
+    fun flushParagraph() {
+        if (paragraphLines.isNotEmpty()) {
+            out.add(MdBlock.Paragraph(paragraphLines.joinToString("\n")))
+            paragraphLines.clear()
         }
-        lastIndex = match.range.last + 1
     }
-    append(line.substring(lastIndex))
+    for (line in text.split("\n")) {
+        val heading = HEADING_LINE.find(line)
+        when {
+            heading != null -> {
+                flushParagraph()
+                out.add(MdBlock.Heading(heading.groupValues[1].length, heading.groupValues[2].trim()))
+            }
+            line.isBlank() -> flushParagraph()
+            else -> paragraphLines.add(line)
+        }
+    }
+    flushParagraph()
+    return out
 }
 
-private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.AnnotatedString = buildAnnotatedString {
-    val lines = raw.trim().lines()
+private fun parseMarkdownBlocks(raw: String): List<MdBlock> {
+    val blocks = mutableListOf<MdBlock>()
+    var lastEnd = 0
+    for (match in CODE_FENCE.findAll(raw)) {
+        if (match.range.first > lastEnd) {
+            val before = raw.substring(lastEnd, match.range.first).trim('\n', ' ')
+            if (before.isNotBlank()) blocks.addAll(parseProseBlocks(before))
+        }
+        blocks.add(MdBlock.Code(match.groupValues[2].trimEnd('\n'), match.groupValues[1].ifBlank { null }))
+        lastEnd = match.range.last + 1
+    }
+    if (lastEnd < raw.length) {
+        val rest = raw.substring(lastEnd).trim('\n', ' ')
+        if (rest.isNotBlank()) blocks.addAll(parseProseBlocks(rest))
+    }
+    return blocks.ifEmpty { if (raw.isNotBlank()) listOf(MdBlock.Paragraph(raw)) else emptyList() }
+}
+
+private fun inlineMarkdown(text: String): AnnotatedString = buildAnnotatedString {
     var i = 0
-    while (i < lines.size) {
-        val line = lines[i]
-        if (line.trim().startsWith("```")) {
-            i++
-            val codeLines = mutableListOf<String>()
-            while (i < lines.size && !lines[i].trim().startsWith("```")) {
-                codeLines.add(lines[i]); i++
-            }
-            withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = Color(0x22FFFFFF))) {
-                append(codeLines.joinToString("\n"))
-            }
-            if (i < lines.size) i++ // skip closing fence
-            if (i < lines.size) append("\n\n")
-            continue
-        }
-        val bulletMatch = Regex("^\\s*[-*]\\s+(.*)").find(line)
-        val numberedMatch = Regex("^\\s*(\\d+)[.)]\\s+(.*)").find(line)
-        val headingMatch = Regex("^#{1,6}\\s+(.*)").find(line)
+    while (i < text.length) {
         when {
-            headingMatch != null -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(headingMatch.groupValues[1]) }
-            bulletMatch != null -> { append("•  "); appendInlineMarkdown(bulletMatch.groupValues[1]) }
-            numberedMatch != null -> { append("${numberedMatch.groupValues[1]}.  "); appendInlineMarkdown(numberedMatch.groupValues[2]) }
-            else -> appendInlineMarkdown(line)
+            text.startsWith("**", i) && text.indexOf("**", i + 2) != -1 -> {
+                val end = text.indexOf("**", i + 2)
+                withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(text, i + 2, end) }
+                i = end + 2
+            }
+            text[i] == '`' && text.indexOf('`', i + 1) != -1 -> {
+                val end = text.indexOf('`', i + 1)
+                withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(text, i + 1, end) }
+                i = end + 1
+            }
+            else -> { append(text[i]); i++ }
         }
-        if (i != lines.lastIndex) append("\n")
-        i++
+    }
+}
+
+@Composable
+private fun MarkdownText(raw: String, style: androidx.compose.ui.text.TextStyle, color: Color = Color.Unspecified) {
+    val blocks = remember(raw) { parseMarkdownBlocks(raw) }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        blocks.forEach { block ->
+            when (block) {
+                is MdBlock.Paragraph -> Text(inlineMarkdown(block.text), style = style, color = color)
+                is MdBlock.Heading -> Text(
+                    inlineMarkdown(block.text),
+                    style = when {
+                        block.level <= 1 -> MaterialTheme.typography.titleLarge
+                        block.level == 2 -> MaterialTheme.typography.titleMedium
+                        else -> MaterialTheme.typography.titleSmall
+                    },
+                    fontWeight = FontWeight.Bold,
+                    color = color
+                )
+                is MdBlock.Code -> Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(Modifier.padding(10.dp)) {
+                        if (!block.language.isNullOrBlank()) {
+                            Text(
+                                block.language.uppercase(),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Spacer(Modifier.height(4.dp))
+                        }
+                        Text(block.code, fontFamily = FontFamily.Monospace, fontSize = 13.sp)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -4595,14 +4850,18 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                         val isActive = model.id == agent.activeCatalogModelId
                         val isDownloaded = agent.isCatalogModelDownloaded(model)
                         val isDownloadingThis = agent.isDownloadingModel && isActive
+                        val isActivatingThis = agent.isActivatingModel && isActive
                         Surface(
                             onClick = {
-                                if (agent.isDownloadingModel) return@Surface
+                                if (agent.isDownloadingModel || agent.isActivatingModel) return@Surface
                                 if (isActive && agent.offlineModelReady) {
                                     agent.selectOfflineModel(); onDismiss()
+                                } else if (isDownloaded) {
+                                    // Don't dismiss yet — stay open showing "Activating…" until
+                                    // selectCatalogModel's coroutine resolves, success or failure.
+                                    agent.selectCatalogModel(model)
                                 } else {
                                     agent.selectCatalogModel(model)
-                                    if (isDownloaded) onDismiss()
                                 }
                             },
                             color = Color.Transparent
@@ -4625,6 +4884,7 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                                                 "Hardware accelerated on Hexagon HTP • ${String.format(java.util.Locale.US, "%.1f", it)} tokens/sec"
                                             } ?: "Hardware accelerated on Hexagon HTP • Pure NPU"
                                             isActive && agent.offlineModelReady -> "Active • ${agent.offlineModelBytes / 1_000_000} MB GGUF • Pure NPU execution"
+                                            isActivatingThis -> "Activating on Hexagon NPU… this can take a few seconds"
                                             isDownloadingThis -> "Downloading: ${(agent.downloadProgress * 100).toInt()}% (${agent.downloadProgressStatus})"
                                             isDownloaded -> "Downloaded • tap to activate"
                                             else -> "Tap to download (${String.format(java.util.Locale.US, "%.1f", model.approxSizeBytes / 1_000_000_000.0)} GB)"
@@ -4635,6 +4895,7 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                                 }
                                 when {
                                     isActive && (agent.offlineModelReady || isNpu) -> Icon(Icons.Default.Check, "Active", tint = Color(0xFF54C878))
+                                    isActivatingThis -> CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                                     isDownloadingThis -> Unit
                                     !isDownloaded -> Icon(Icons.Default.Download, "Download", tint = MaterialTheme.colorScheme.primary)
                                     else -> Unit

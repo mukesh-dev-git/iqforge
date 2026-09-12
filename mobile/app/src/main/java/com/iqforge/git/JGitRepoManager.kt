@@ -3,19 +3,26 @@ package com.iqforge.git
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.eclipse.jgit.api.Git
+import org.eclipse.jgit.api.ResetCommand.ResetType
 import org.eclipse.jgit.api.errors.GitAPIException
+import org.eclipse.jgit.lib.BranchTrackingStatus
 import org.eclipse.jgit.lib.RepositoryBuilder
 import org.eclipse.jgit.transport.CredentialsProvider
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider
+import org.eclipse.jgit.treewalk.filter.PathFilter
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Locale
 
 class JGitRepoManager(private val workspaceRoot: File) : RepoManager {
     @Volatile
     private var credentials: CredentialsProvider? = null
 
     fun updateCredentials(username: String, token: String) {
+        val user = username.trim().ifBlank { "x-access-token" }
         credentials = if (token.isBlank()) null else UsernamePasswordCredentialsProvider(
-            username.ifBlank { "oauth2" }, token
+            user, token.trim()
         )
     }
 
@@ -86,6 +93,10 @@ class JGitRepoManager(private val workspaceRoot: File) : RepoManager {
                 paths.map(::safeGitPath).forEach(add::addFilepattern)
             }
             add.call()
+            try {
+                git.add().setUpdate(true).addFilepattern(".").call()
+            } catch (ignored: Exception) {}
+
             git.commit()
                 .setMessage(message.trim())
                 .setAuthor("iQForge", "iqforge@local")
@@ -111,11 +122,179 @@ class JGitRepoManager(private val workspaceRoot: File) : RepoManager {
         useGit(repo) { git ->
             val command = git.push()
             credentials?.let(command::setCredentialsProvider)
-            val failures = command.call().flatMap { it.remoteUpdates }.filter {
+            val updates = command.call()
+            val failures = updates.flatMap { it.remoteUpdates }.filter {
                 it.status.name !in setOf("OK", "UP_TO_DATE")
             }
             check(failures.isEmpty()) {
-                "Push rejected: ${failures.joinToString { "${it.remoteName} (${it.status})" }}"
+                "Push rejected: ${failures.joinToString { "${it.remoteName} (${it.status} - ${it.message.orEmpty()})" }}"
+            }
+        }
+    }
+
+    suspend fun status(repo: Repo): String = withContext(Dispatchers.IO) {
+        useGit(repo) { git ->
+            val status = git.status().call()
+            val branch = git.repository.branch
+            val tracking = try {
+                BranchTrackingStatus.of(git.repository, branch)
+            } catch (e: Exception) {
+                null
+            }
+            buildString {
+                appendLine("📦 **Repository**: `${repo.name}`")
+                appendLine("🌿 **Branch**: `$branch`")
+                if (tracking != null) {
+                    if (tracking.aheadCount > 0) appendLine("⬆️ Ahead: **${tracking.aheadCount}** commit(s) (run `/push` or `git push` to upload)")
+                    if (tracking.behindCount > 0) appendLine("⬇️ Behind: **${tracking.behindCount}** commit(s) (run `/pull` or `git pull` to update)")
+                }
+                if (status.isClean) {
+                    appendLine("✨ Working tree clean. All changes committed.")
+                } else {
+                    if (status.modified.isNotEmpty()) appendLine("📝 **Modified**:\n" + status.modified.joinToString("\n") { "   • $it" })
+                    if (status.untracked.isNotEmpty()) appendLine("❓ **Untracked**:\n" + status.untracked.joinToString("\n") { "   • $it" })
+                    if (status.added.isNotEmpty()) appendLine("➕ **Staged**:\n" + status.added.joinToString("\n") { "   • $it" })
+                    if (status.removed.isNotEmpty()) appendLine("🗑️ **Deleted**:\n" + status.removed.joinToString("\n") { "   • $it" })
+                    if (status.missing.isNotEmpty()) appendLine("⚠️ **Missing**:\n" + status.missing.joinToString("\n") { "   • $it" })
+                    appendLine("\n💡 Tip: Run `/commit <message>` or `git commit -m \"...\"` to commit.")
+                }
+            }
+        }
+    }
+
+    suspend fun diff(repo: Repo, path: String? = null): String = withContext(Dispatchers.IO) {
+        useGit(repo) { git ->
+            val out = ByteArrayOutputStream()
+            val cmd = git.diff().setOutputStream(out)
+            if (!path.isNullOrBlank()) {
+                cmd.setPathFilter(PathFilter.create(safeGitPath(path)))
+            }
+            cmd.call()
+            val unstaged = out.toString(Charsets.UTF_8.name())
+
+            out.reset()
+            val cachedCmd = git.diff().setCached(true).setOutputStream(out)
+            if (!path.isNullOrBlank()) {
+                cachedCmd.setPathFilter(PathFilter.create(safeGitPath(path)))
+            }
+            cachedCmd.call()
+            val staged = out.toString(Charsets.UTF_8.name())
+
+            buildString {
+                if (unstaged.isBlank() && staged.isBlank()) {
+                    append("✨ No changes detected in ${if (path.isNullOrBlank()) "working tree" else "`$path`"}.")
+                } else {
+                    if (staged.isNotBlank()) {
+                        appendLine("📦 **Staged Changes (Index vs HEAD)**:")
+                        appendLine("```diff")
+                        appendLine(staged.trim())
+                        appendLine("```")
+                    }
+                    if (unstaged.isNotBlank()) {
+                        if (staged.isNotBlank()) appendLine()
+                        appendLine("📝 **Unstaged Changes (Working Tree vs Index)**:")
+                        appendLine("```diff")
+                        appendLine(unstaged.trim())
+                        appendLine("```")
+                    }
+                }
+            }
+        }
+    }
+
+    suspend fun log(repo: Repo, limit: Int = 10): String = withContext(Dispatchers.IO) {
+        useGit(repo) { git ->
+            val commits = try {
+                git.log().setMaxCount(limit.coerceIn(1, 50)).call().toList()
+            } catch (e: Exception) {
+                emptyList()
+            }
+            if (commits.isEmpty()) {
+                return@useGit "📜 No commits yet in repository **${repo.name}**."
+            }
+            val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
+            buildString {
+                appendLine("📜 **Commit History (${commits.size} commits)**:")
+                appendLine()
+                commits.forEach { commit ->
+                    val hash = commit.id.name.take(7)
+                    val author = commit.authorIdent.name
+                    val date = dateFormat.format(commit.authorIdent.`when`)
+                    val title = commit.shortMessage
+                    appendLine("• `$hash` **$title**")
+                    appendLine("  👤 $author | 🕒 $date")
+                }
+            }
+        }
+    }
+
+    suspend fun branches(repo: Repo): String = withContext(Dispatchers.IO) {
+        useGit(repo) { git ->
+            val branchList = git.branchList().call()
+            val current = git.repository.branch
+            if (branchList.isEmpty()) {
+                return@useGit "🌿 No branches found."
+            }
+            buildString {
+                appendLine("🌿 **Branches in ${repo.name}**:")
+                branchList.forEach { ref ->
+                    val name = ref.name.removePrefix("refs/heads/")
+                    if (name == current) {
+                        appendLine("  ★ **$name** *(current)*")
+                    } else {
+                        appendLine("  • $name")
+                    }
+                }
+            }
+        }
+    }
+
+    suspend fun checkout(repo: Repo, branchOrCommit: String, createBranch: Boolean = false): String = withContext(Dispatchers.IO) {
+        useGit(repo) { git ->
+            val cmd = git.checkout().setName(branchOrCommit)
+            if (createBranch) {
+                cmd.setCreateBranch(true)
+            }
+            cmd.call()
+            val cur = git.repository.branch
+            "🌿 Switched to branch **$cur**${if (createBranch) " (newly created)" else ""}."
+        }
+    }
+
+    suspend fun reset(repo: Repo, hard: Boolean = true): String = withContext(Dispatchers.IO) {
+        useGit(repo) { git ->
+            if (hard) {
+                git.reset().setMode(ResetType.HARD).call()
+                git.clean().setCleanDirectories(true).setIgnore(false).call()
+                "🔄 Working tree and index hard-reset to HEAD. All uncommitted changes discarded."
+            } else {
+                git.reset().setMode(ResetType.MIXED).call()
+                "🔄 Changes unstaged from index (working tree preserved)."
+            }
+        }
+    }
+
+    suspend fun discard(repo: Repo, path: String): String = withContext(Dispatchers.IO) {
+        useGit(repo) { git ->
+            git.checkout().addPath(safeGitPath(path)).call()
+            "🔄 Discarded changes in `$path`."
+        }
+    }
+
+    suspend fun remotes(repo: Repo): String = withContext(Dispatchers.IO) {
+        useGit(repo) { git ->
+            val config = git.repository.config
+            val remoteNames = config.getSubsections("remote")
+            if (remoteNames.isEmpty()) {
+                "🔗 No remotes configured."
+            } else {
+                buildString {
+                    appendLine("🔗 **Configured Remotes**:")
+                    remoteNames.forEach { name ->
+                        val url = config.getString("remote", name, "url") ?: "none"
+                        appendLine("  • **$name**: `$url`")
+                    }
+                }
             }
         }
     }
