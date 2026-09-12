@@ -1020,7 +1020,17 @@ class AgentViewModel(
      * fetch fails gracefully and the local model still answers, just without that file's exact
      * contents — it never hard-fails just because the laptop is offline.
      */
-    fun sendCodeSessionMessage(text: String) {
+    /**
+     * @param reviewOnly When true (the Review workspace's "Open Detailed Review" / issue-review
+     * entry points), this message can NEVER write a file or make a commit, no matter what words
+     * it happens to contain. Found live: a review prompt got misrouted into the quick-edit
+     * intent heuristic below (it does plain keyword matching, e.g. "commit"+"change" anywhere in
+     * the text) and it edited and committed an unrelated file in the repo while the user only
+     * asked for a review. Review prompts always include a diff's own patch text, which can
+     * contain almost any word — matching by keyword instead of by call-site was never going to
+     * be reliable, so the call site now says explicitly which behavior it wants.
+     */
+    fun sendCodeSessionMessage(text: String, reviewOnly: Boolean = false) {
         val id = activeCodeSessionId ?: return
         val session = codeSessions.firstOrNull { it.id == id } ?: return
         val trimmed = text.trim()
@@ -1031,6 +1041,7 @@ class AgentViewModel(
             var replyRole = "assistant"
             val response = try {
                 when {
+                    reviewOnly -> codeEngine.explain(trimmed)
                     isGitCommand(trimmed) -> {
                         executeGitCommand(session.workspace, trimmed)
                     }
@@ -3706,12 +3717,12 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
             }
             if (existing != null) {
                 agent.createCodeSession(existing.root.absolutePath, title = "${existing.name} (Review)")
-                agent.sendCodeSessionMessage(prompt)
+                agent.sendCodeSessionMessage(prompt, reviewOnly = true)
                 onOpenCode()
             } else {
                 workspace.cloneRepository("https://github.com/${ref.owner}/${ref.repo}") { repo ->
                     agent.createCodeSession(repo.root.absolutePath, title = "${repo.name} (Review)")
-                    agent.sendCodeSessionMessage(prompt)
+                    agent.sendCodeSessionMessage(prompt, reviewOnly = true)
                     onOpenCode()
                 }
             }
@@ -5567,7 +5578,7 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
     val repoFullName = github.repoRef?.fullName ?: repo.name
     val startReview: (String) -> Unit = { prompt ->
         agent.createCodeSession(repo.root.absolutePath, title = "${repo.name} (Review)")
-        agent.sendCodeSessionMessage(prompt)
+        agent.sendCodeSessionMessage(prompt, reviewOnly = true)
     }
     Column {
         Row(verticalAlignment = Alignment.CenterVertically) {
