@@ -398,6 +398,7 @@ class AgentViewModel(
 
     init {
         refreshOfflineModel()
+        feed = feed.filterNot { it is FeedItem.Status && it.text.startsWith("Cloned ") }
     }
 
     fun refreshOfflineModel() {
@@ -571,10 +572,17 @@ class AgentViewModel(
         refreshRemoteFiles(path)
     }
 
-    fun createCodeSession(workspace: String): CodeSession? {
+    fun createCodeSession(workspace: String, title: String? = null, initialMessage: String? = null): CodeSession? {
         if (workspace.isBlank()) return null
-        val session = codeSessionStore?.create(workspace) ?: return null
-        codeSessions = codeSessionStore.load()
+        val session = if (title != null) {
+            codeSessionStore?.create(workspace, title)
+        } else {
+            codeSessionStore?.create(workspace)
+        } ?: return null
+        if (initialMessage != null) {
+            codeSessionStore?.append(session.id, "assistant", initialMessage)
+        }
+        codeSessions = codeSessionStore?.load().orEmpty()
         activeCodeSessionId = session.id
         activeRemoteWorkspace = workspace
         return session
@@ -588,6 +596,13 @@ class AgentViewModel(
     }
 
     fun closeCodeSession() { activeCodeSessionId = null }
+
+    fun deleteCodeSession(id: String) {
+        codeSessions = codeSessionStore?.delete(id).orEmpty()
+        if (activeCodeSessionId == id) {
+            activeCodeSessionId = null
+        }
+    }
 
     /**
      * Default path is the on-device model — it does the actual review/write/debug/explain
@@ -749,8 +764,22 @@ class AgentViewModel(
                     if (token.isBlank()) {
                         "⚠️ **GitHub Personal Access Token required to push.**\n\nRun `/token <your-token>` or enter it in the Files & Git menu (📁) to authenticate."
                     } else {
-                        mgr.push(repo)
-                        "🚀 **Successfully pushed to GitHub directly from your phone!**\nRemote repository is up to date."
+                        try {
+                            mgr.push(repo)
+                            "🚀 **Successfully pushed to GitHub directly from your phone!**\nRemote repository is up to date."
+                        } catch (e: Exception) {
+                            if (e.message?.contains("REJECTED_NONFASTFORWARD") == true) {
+                                try {
+                                    mgr.pull(repo)
+                                    mgr.push(repo)
+                                    "🔄 **Remote had newer commits — auto-pulled, merged, and pushed!** 🚀\nYour phone changes are now live on GitHub."
+                                } catch (mergeErr: Exception) {
+                                    "⚠️ **Push rejected (remote has newer commits)**: Run `/pull` to merge GitHub changes into your phone, then run `/push`."
+                                }
+                            } else {
+                                throw e
+                            }
+                        }
                     }
                 }
                 "pull" -> {
@@ -777,6 +806,8 @@ class AgentViewModel(
             val msg = e.message ?: e.javaClass.simpleName
             if (verb == "push" && (msg.contains("auth", ignoreCase = true) || msg.contains("401") || msg.contains("credential", ignoreCase = true))) {
                 "❌ **Push failed: Authentication error.**\nCheck your GitHub token with `/token <your-github-token>`.\n\nTip: Make sure your token has the `repo` scope."
+            } else if (verb == "push" && msg.contains("REJECTED_NONFASTFORWARD", ignoreCase = true)) {
+                "⚠️ **Push rejected (remote has newer commits).**\nGitHub is ahead of your phone. Run `/pull` to merge changes from GitHub, then run `/push` again."
             } else {
                 "❌ Git `$verb` failed: $msg"
             }
@@ -1002,7 +1033,7 @@ class AgentViewModel(
                             )
                         }
                     }
-                    looksLikeBigTask(trimmed) -> {
+                    !java.io.File(session.workspace).exists() && looksLikeBigTask(trimmed) -> {
                         replyRole = "laptop"
                         try {
                             bridgeClient.escalateWithOptions(
@@ -1046,8 +1077,10 @@ class AgentViewModel(
                                 runCatching { bridgeClient.workspaceFile(bridgeUrl, session.workspace, it) }.getOrNull()
                             }.orEmpty()
                         }
+                        val isRemoteModelSelected = availableModels.any { it.id == selectedModel }
+                        val useRealModel = isRemoteModelSelected && modelServiceReady && bridgeUrl.isNotBlank()
                         if (fileText.length > MAX_LOCAL_FILE_CHARS) {
-                            if (modelServiceReady && bridgeUrl.isNotBlank() && !bridgeUrl.contains("localhost") && !bridgeUrl.contains("127.0.0.1")) {
+                            if (!isLocal && useRealModel && !bridgeUrl.contains("localhost") && !bridgeUrl.contains("127.0.0.1")) {
                                 replyRole = "laptop"
                                 bridgeClient.escalateWithOptions(
                                     bridgeUrl, task,
@@ -1062,15 +1095,26 @@ class AgentViewModel(
                                 val header = "Repository: ${session.repository}\nWorkspace: ${session.workspace}" +
                                     (mentionedFile?.let { "\nFile: $it (Lines $lineStart-$lineEnd)" } ?: "")
                                 val enrichedContext = "$header\n\n$truncated"
-                                val local = when (task) {
-                                    BridgeTask.REVIEW -> {
-                                        val findings = codeEngine.review(truncated.ifBlank { trimmed })
-                                        if (findings.isEmpty()) "No issues found."
-                                        else findings.joinToString("\n") { "Line ${it.line}: [${it.severity}] ${it.message}" }
+                                val local = if (useRealModel) {
+                                    replyRole = "laptop"
+                                    bridgeClient.escalateWithOptions(
+                                        laptopUrl = bridgeUrl,
+                                        task = task,
+                                        context = enrichedContext,
+                                        instruction = trimmed,
+                                        effort = effort.wireName
+                                    )
+                                } else {
+                                    when (task) {
+                                        BridgeTask.REVIEW -> {
+                                            val findings = codeEngine.review(truncated.ifBlank { trimmed })
+                                            if (findings.isEmpty()) "No issues found."
+                                            else findings.joinToString("\n") { "Line ${it.line}: [${it.severity}] ${it.message}" }
+                                        }
+                                        BridgeTask.DEBUG -> codeEngine.debug(trimmed, enrichedContext)
+                                        BridgeTask.EXPLAIN -> codeEngine.explain("Context:\n$enrichedContext\n\nQuestion:\n$trimmed")
+                                        BridgeTask.WRITE -> codeEngine.write(trimmed, enrichedContext)
                                     }
-                                    BridgeTask.DEBUG -> codeEngine.debug(trimmed, enrichedContext)
-                                    BridgeTask.EXPLAIN -> codeEngine.explain("Context:\n$enrichedContext\n\nQuestion:\n$trimmed")
-                                    BridgeTask.WRITE -> codeEngine.write(trimmed, enrichedContext)
                                 }
                                 buildString {
                                     append(local)
@@ -1083,17 +1127,28 @@ class AgentViewModel(
                             val header = "Repository: ${session.repository}\nWorkspace: ${session.workspace}" +
                                 (mentionedFile?.let { "\nFile: $it" } ?: "")
                             val enrichedContext = if (fileText.isNotBlank()) "$header\n\n$fileText" else header
-                            val local = when (task) {
-                                BridgeTask.REVIEW -> {
-                                    val findings = codeEngine.review(fileText.ifBlank { trimmed })
-                                    if (findings.isEmpty()) "No issues found."
-                                    else findings.joinToString("\n") { "Line ${it.line}: [${it.severity}] ${it.message}" }
-                                }
-                                BridgeTask.DEBUG -> codeEngine.debug(trimmed, enrichedContext)
-                                BridgeTask.EXPLAIN -> codeEngine.explain(
-                                    if (enrichedContext.isNotBlank()) "Context:\n$enrichedContext\n\nQuestion:\n$trimmed" else trimmed
+                            val local = if (useRealModel) {
+                                replyRole = "laptop"
+                                bridgeClient.escalateWithOptions(
+                                    laptopUrl = bridgeUrl,
+                                    task = task,
+                                    context = enrichedContext,
+                                    instruction = trimmed,
+                                    effort = effort.wireName
                                 )
-                                BridgeTask.WRITE -> codeEngine.write(trimmed, enrichedContext)
+                            } else {
+                                when (task) {
+                                    BridgeTask.REVIEW -> {
+                                        val findings = codeEngine.review(fileText.ifBlank { trimmed })
+                                        if (findings.isEmpty()) "No issues found."
+                                        else findings.joinToString("\n") { "Line ${it.line}: [${it.severity}] ${it.message}" }
+                                    }
+                                    BridgeTask.DEBUG -> codeEngine.debug(trimmed, enrichedContext)
+                                    BridgeTask.EXPLAIN -> codeEngine.explain(
+                                        if (enrichedContext.isNotBlank()) "Context:\n$enrichedContext\n\nQuestion:\n$trimmed" else trimmed
+                                    )
+                                    BridgeTask.WRITE -> codeEngine.write(trimmed, enrichedContext)
+                                }
                             }
                             if (fileText.lines().size > 40) {
                                 "$local\n\n(This file is large — reply with \"/escalate\" to ask the laptop for a deeper pass.)"
@@ -1349,8 +1404,7 @@ class AgentViewModel(
         }
     }
     fun showClone(name: String) {
-        if (feed.none { it is FeedItem.Status && it.text == "Cloned $name" })
-            feed += FeedItem.Status("Cloned $name", success = true)
+        // Cloned GitHub repositories belong in Code Sessions, not in regular chat
     }
 
     internal fun inferTask(prompt: String): BridgeTask {
@@ -1865,7 +1919,6 @@ class AgentViewModel(
         agent.refreshServices()
         agent.refreshDispatchWorkspaces()
     }
-    state.repo?.let { agent.showClone(it.name) }
     if (state.selectedFile != null) { EditorScreen(state, workspace, agent); return }
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -2540,6 +2593,47 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
 // Bottom bar & drawers
 // ---------------------------------------------------------------------------
 
+@Composable private fun ModelPill(
+    agent: AgentViewModel,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        onClick = onClick,
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(24.dp),
+        modifier = modifier
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                Icons.Default.AutoAwesome,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(17.dp)
+            )
+            Spacer(Modifier.width(6.dp))
+            val isNpu = agent.isNpuActive
+            val displayModelName = when {
+                agent.selectedModel == null -> "Select model"
+                isNpu || agent.selectedModel?.contains("Snapdragon", ignoreCase = true) == true ->
+                    "${agent.offlineModelName?.substringBefore(" (") ?: "On-device"} NPU"
+                agent.selectedModel?.contains("on-device", ignoreCase = true) == true ->
+                    agent.offlineModelName?.substringBefore(" (") ?: "On-device"
+                else -> agent.selectedModel?.substringBefore(':') ?: "Select model"
+            }
+            Text(
+                displayModelName,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
 @Composable private fun Composer(
     agent: AgentViewModel,
     onAdd: () -> Unit,
@@ -2633,40 +2727,11 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
                         Icon(Icons.Default.Add, "Attach code from camera")
                     }
                     Spacer(Modifier.width(10.dp))
-                    Surface(
+                    ModelPill(
+                        agent = agent,
                         onClick = onModel,
-                        color = MaterialTheme.colorScheme.surfaceVariant,
-                        shape = RoundedCornerShape(24.dp),
                         modifier = Modifier.weight(1f, fill = false)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                Icons.Default.AutoAwesome,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(17.dp)
-                            )
-                            Spacer(Modifier.width(6.dp))
-                            val isNpu = agent.isNpuActive
-                            val displayModelName = when {
-                                agent.selectedModel == null -> "Select model"
-                                isNpu || agent.selectedModel?.contains("Snapdragon", ignoreCase = true) == true ->
-                                    "${agent.offlineModelName?.substringBefore(" (") ?: "On-device"} NPU"
-                                agent.selectedModel?.contains("on-device", ignoreCase = true) == true ->
-                                    agent.offlineModelName?.substringBefore(" (") ?: "On-device"
-                                else -> agent.selectedModel?.substringBefore(':') ?: "Select model"
-                            }
-                            Text(
-                                displayModelName,
-                                fontWeight = FontWeight.Medium,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                    }
+                    )
                     Spacer(Modifier.weight(1f))
                     IconButton(onClick = onVoice) {
                         Icon(
@@ -3545,12 +3610,12 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
                 it.name.equals(ref.repo, ignoreCase = true) || it.name.startsWith("${ref.repo}-", ignoreCase = true)
             }
             if (existing != null) {
-                agent.createCodeSession(existing.root.absolutePath)
+                agent.createCodeSession(existing.root.absolutePath, title = "${existing.name} (Review)")
                 agent.sendCodeSessionMessage(prompt)
                 onOpenCode()
             } else {
                 workspace.cloneRepository("https://github.com/${ref.owner}/${ref.repo}") { repo ->
-                    agent.createCodeSession(repo.root.absolutePath)
+                    agent.createCodeSession(repo.root.absolutePath, title = "${repo.name} (Review)")
                     agent.sendCodeSessionMessage(prompt)
                     onOpenCode()
                 }
@@ -3639,6 +3704,9 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
     var laptopFilesOpen by rememberSaveable { mutableStateOf(false) }
     var githubOpen by rememberSaveable { mutableStateOf(false) }
     var showRepositoryDialog by rememberSaveable { mutableStateOf(false) }
+    var sessionToDeleteId by rememberSaveable { mutableStateOf<String?>(null) }
+    var showModels by rememberSaveable { mutableStateOf(false) }
+    var showEffort by rememberSaveable { mutableStateOf(false) }
     val github: GitHubViewModel = viewModel()
     val laptopRoot = agent.dispatchWorkspaces.firstOrNull().orEmpty()
     val activeRoot = agent.activeRemoteWorkspace.ifBlank {
@@ -3712,15 +3780,34 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
         } else {
             LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 items(agent.codeSessions, key = { "session-${it.id}" }) { session ->
-                    ElevatedCard(Modifier.fillMaxWidth().clickable { agent.openCodeSession(session.id) }) {
+                    ElevatedCard(Modifier.fillMaxWidth()) {
                         Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.Code, null)
-                            Spacer(Modifier.width(12.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text(session.title, maxLines = 1)
-                                Text(
-                                    "${session.repository} · ${session.messages.size} messages",
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                            Row(
+                                modifier = Modifier.weight(1f).clickable { agent.openCodeSession(session.id) },
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Default.Code, null, tint = Color(0xFF54C878))
+                                Spacer(Modifier.width(12.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(session.title, maxLines = 1, style = MaterialTheme.typography.titleMedium)
+                                        Spacer(Modifier.width(6.dp))
+                                        Surface(color = Color(0xFF1E3A24), shape = RoundedCornerShape(6.dp)) {
+                                            Text("NPU", color = Color(0xFF54C878), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp))
+                                        }
+                                    }
+                                    Text(
+                                        "GitHub: ${session.repository} · ${session.messages.size} messages",
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                            IconButton(onClick = { sessionToDeleteId = session.id }) {
+                                Icon(
+                                    Icons.Default.Delete,
+                                    contentDescription = "Delete session",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(20.dp)
                                 )
                             }
                         }
@@ -3728,19 +3815,22 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
                 }
             }
         }
-        Row(Modifier.align(Alignment.End).padding(bottom = 22.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = { showRepositoryDialog = true }) { Text("Repository") }
-            val canCreate = activeRoot.isNotBlank() || state.repo != null
+        Row(
+            Modifier.fillMaxWidth().padding(bottom = 22.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            ModelPill(
+                agent = agent,
+                onClick = { showModels = true },
+                modifier = Modifier.weight(1f, fill = false)
+            )
+            Spacer(Modifier.weight(1f))
             Button(
-                onClick = {
-                    val rootToUse = activeRoot.ifBlank { state.repo?.root?.absolutePath.orEmpty() }
-                    agent.createCodeSession(rootToUse)
-                },
-                enabled = canCreate
+                onClick = { showRepositoryDialog = true }
             ) {
                 Icon(Icons.Default.Add, null)
                 Spacer(Modifier.width(8.dp))
-                Text("New session")
+                Text("New session", maxLines = 1)
             }
         }
     }
@@ -3752,6 +3842,43 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
         onDismiss = { showRepositoryDialog = false },
         onCreated = { showRepositoryDialog = false }
     )
+    if (showModels) {
+        ModelSelectorSheet(
+            agent = agent,
+            onEffort = {
+                showModels = false
+                showEffort = true
+            },
+            onDismiss = { showModels = false }
+        )
+    }
+    if (showEffort) {
+        EffortSheet(agent = agent, onDismiss = { showEffort = false })
+    }
+    val sessionToDelete = agent.codeSessions.firstOrNull { it.id == sessionToDeleteId }
+    if (sessionToDelete != null) {
+        AlertDialog(
+            onDismissRequest = { sessionToDeleteId = null },
+            title = { Text("Delete session?") },
+            text = { Text("Are you sure you want to delete \"${sessionToDelete.title}\"? This action cannot be undone.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        agent.deleteCodeSession(sessionToDelete.id)
+                        sessionToDeleteId = null
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { sessionToDeleteId = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -3764,6 +3891,9 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
     var input by rememberSaveable { mutableStateOf("") }
     var showFilesSheet by rememberSaveable { mutableStateOf(false) }
     var showTokenDialog by rememberSaveable { mutableStateOf(false) }
+    var showDeleteDialog by rememberSaveable { mutableStateOf(false) }
+    var showModels by rememberSaveable { mutableStateOf(false) }
+    var showEffort by rememberSaveable { mutableStateOf(false) }
     var tokenInput by rememberSaveable { mutableStateOf("") }
     val listState = rememberLazyListState()
     val haptics = LocalHapticFeedback.current
@@ -3791,12 +3921,51 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
             }
             Spacer(Modifier.width(4.dp))
             Column(Modifier.weight(1f)) {
-                Text(session?.title ?: "Session", maxLines = 1, style = MaterialTheme.typography.titleMedium)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(session?.title ?: "Session", maxLines = 1, style = MaterialTheme.typography.titleMedium)
+                    Spacer(Modifier.width(8.dp))
+                    val isNpu = agent.isNpuActive
+                    val isOffline = isNpu || agent.selectedModel?.contains("on-device", ignoreCase = true) == true ||
+                        agent.selectedModel?.contains("Snapdragon", ignoreCase = true) == true
+                    Surface(
+                        onClick = { showModels = true },
+                        color = Color(0xFF1E3A24),
+                        shape = RoundedCornerShape(6.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = if (isNpu) "NPU"
+                                else if (isOffline) "ON-DEVICE"
+                                else agent.selectedModel?.substringBefore(':')?.uppercase() ?: "MODEL",
+                                color = Color(0xFF54C878),
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(Modifier.width(2.dp))
+                            Icon(
+                                Icons.Default.ArrowDropDown,
+                                contentDescription = "Switch model",
+                                tint = Color(0xFF54C878),
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                    }
+                }
                 Text(
                     session?.workspace.orEmpty(),
                     maxLines = 1,
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            IconButton(onClick = { showDeleteDialog = true }) {
+                Icon(
+                    Icons.Default.Delete,
+                    contentDescription = "Delete session",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
             IconButton(onClick = { showFilesSheet = true }) {
@@ -3863,34 +4032,46 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
             ) {
                 Column(Modifier.padding(14.dp)) {
                     Surface(
+                        onClick = { showModels = true },
                         modifier = Modifier.fillMaxWidth(),
                         color = MaterialTheme.colorScheme.surfaceVariant,
                         shape = RoundedCornerShape(24.dp)
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 17.dp, vertical = 12.dp),
+                            modifier = Modifier.padding(horizontal = 17.dp, vertical = 10.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
                                 Icons.Default.Code,
                                 contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary,
+                                tint = Color(0xFF54C878),
                                 modifier = Modifier.size(16.dp)
                             )
                             Spacer(Modifier.width(8.dp))
                             Text(
-                                session?.repository ?: "Coding agent",
+                                session?.repository ?: "Code Session",
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                style = MaterialTheme.typography.bodyMedium
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.weight(1f)
                             )
-                            Spacer(Modifier.weight(1f))
+                            Spacer(Modifier.width(8.dp))
+                            val isNpu = agent.isNpuActive
+                            val tps = agent.lastNpuTokensPerSec
+                            val isOffline = isNpu || agent.selectedModel?.contains("on-device", ignoreCase = true) == true ||
+                                agent.selectedModel?.contains("Snapdragon", ignoreCase = true) == true
                             Text(
-                                if (agent.codeSessionBusy) "Working…" else "Ready",
+                                text = if (agent.codeSessionBusy) "Working…"
+                                else if (isNpu) {
+                                    if (tps != null) "${String.format(java.util.Locale.US, "%.1f", tps)} t/s NPU"
+                                    else "Snapdragon NPU active"
+                                } else if (isOffline) "${agent.offlineModelName?.substringBefore(" (") ?: "On-device"} active"
+                                else if (agent.modelServiceReady) "${agent.selectedModel?.substringBefore(':') ?: "Connected"} ready"
+                                else "On-device model",
                                 color = if (agent.codeSessionBusy) MaterialTheme.colorScheme.primary else Color(0xFF54C878),
-                                fontWeight = FontWeight.SemiBold,
-                                style = MaterialTheme.typography.bodyMedium
+                                fontWeight = FontWeight.Bold,
+                                style = MaterialTheme.typography.labelSmall
                             )
                         }
                     }
@@ -3920,6 +4101,11 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
                     )
 
                     Row(verticalAlignment = Alignment.CenterVertically) {
+                        ModelPill(
+                            agent = agent,
+                            onClick = { showModels = true },
+                            modifier = Modifier.weight(1f, fill = false)
+                        )
                         Spacer(Modifier.weight(1f))
                         FilledIconButton(
                             onClick = {
@@ -4045,6 +4231,42 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
             }
         )
     }
+    if (showDeleteDialog && session != null) {
+        AlertDialog(
+            onDismissRequest = { showDeleteDialog = false },
+            title = { Text("Delete session?") },
+            text = { Text("Are you sure you want to delete \"${session.title}\"? This action cannot be undone.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showDeleteDialog = false
+                        agent.deleteCodeSession(session.id)
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+    if (showModels) {
+        ModelSelectorSheet(
+            agent = agent,
+            onEffort = {
+                showModels = false
+                showEffort = true
+            },
+            onDismiss = { showModels = false }
+        )
+    }
+    if (showEffort) {
+        EffortSheet(agent = agent, onDismiss = { showEffort = false })
+    }
 }
 
 @Composable private fun ColumnScope.RemoteLaptopFiles(agent: AgentViewModel, cwd: String) {
@@ -4109,7 +4331,8 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
     onDismiss: () -> Unit,
     onCreated: () -> Unit
 ) {
-    var cloneMode by rememberSaveable { mutableStateOf(true) }
+    val hasExistingRepos = state.repositories.isNotEmpty() || laptopRoot.isNotBlank()
+    var tab by rememberSaveable { mutableStateOf(if (hasExistingRepos) 0 else 1) } // 0 = Existing, 1 = Clone, 2 = Create
     var targetLaptop by rememberSaveable { mutableStateOf(false) }
     var value by rememberSaveable { mutableStateOf("") }
     var token by rememberSaveable { mutableStateOf("") }
@@ -4118,80 +4341,263 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("New coding session") },
+        title = {
+            Text(
+                when (tab) {
+                    0 -> "Select repository"
+                    1 -> "Clone GitHub repository"
+                    else -> "Create new repository"
+                }
+            )
+        },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(cloneMode, { cloneMode = true }, { Text("Clone GitHub") })
-                    FilterChip(!cloneMode, { cloneMode = false }, { Text("Create repository") })
-                }
-                if (laptopRoot.isNotBlank()) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilterChip(!targetLaptop, { targetLaptop = false }, { Text("📱 On phone") })
-                        FilterChip(targetLaptop, { targetLaptop = true }, { Text("💻 On laptop") })
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    if (hasExistingRepos) {
+                        FilterChip(
+                            selected = tab == 0,
+                            onClick = { tab = 0 },
+                            label = { Text("Existing") }
+                        )
                     }
-                }
-                OutlinedTextField(
-                    value, { value = it }, Modifier.fillMaxWidth(),
-                    label = { Text(if (cloneMode) "HTTPS GitHub URL" else "Repository name") },
-                    placeholder = { if (cloneMode) Text("https://github.com/user/repo") else Text("my-project") },
-                    singleLine = true
-                )
-                if (cloneMode && !targetLaptop) {
-                    OutlinedTextField(
-                        token, { token = it }, Modifier.fillMaxWidth(),
-                        label = { Text("GitHub token (optional, for private repos)") },
-                        visualTransformation = PasswordVisualTransformation(),
-                        singleLine = true
+                    FilterChip(
+                        selected = tab == 1,
+                        onClick = { tab = 1 },
+                        label = { Text("Clone") }
+                    )
+                    FilterChip(
+                        selected = tab == 2,
+                        onClick = { tab = 2 },
+                        label = { Text("Create") }
                     )
                 }
-                if (!cloneMode && targetLaptop) Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(publish, { publish = it })
-                    Text("Create private GitHub repo and push")
+
+                when (tab) {
+                    0 -> {
+                        Text(
+                            "Choose a repository for this session:",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (state.repositories.isEmpty() && laptopRoot.isBlank()) {
+                            Text(
+                                "No repositories found on phone.",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.padding(vertical = 12.dp)
+                            )
+                        } else {
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                state.repositories.forEach { repo ->
+                                    ElevatedCard(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable {
+                                                workspace.selectRepository(repo.name)
+                                                agent.createCodeSession(
+                                                    workspace = repo.root.absolutePath,
+                                                    title = repo.name,
+                                                    initialMessage = "Ready to code on repository **`${repo.name}`** with **Snapdragon Hexagon NPU**."
+                                                )
+                                                onCreated()
+                                            },
+                                        shape = RoundedCornerShape(10.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(12.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Icon(
+                                                Icons.Default.Folder,
+                                                contentDescription = null,
+                                                tint = IqfYellow,
+                                                modifier = Modifier.size(24.dp)
+                                            )
+                                            Spacer(Modifier.width(10.dp))
+                                            Column(Modifier.weight(1f)) {
+                                                Text(
+                                                    repo.name,
+                                                    style = MaterialTheme.typography.titleMedium,
+                                                    fontWeight = FontWeight.SemiBold
+                                                )
+                                                Text(
+                                                    "📱 Phone storage",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = Color(0xFF54C878)
+                                                )
+                                            }
+                                            Icon(
+                                                Icons.Default.PlayArrow,
+                                                contentDescription = "Start session",
+                                                tint = Color(0xFF54C878),
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                    }
+                                }
+
+                                if (laptopRoot.isNotBlank()) {
+                                    val laptopName = laptopRoot.replace('\\', '/').trimEnd('/').substringAfterLast('/').ifBlank { "Laptop" }
+                                    ElevatedCard(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable {
+                                                agent.selectRemoteWorkspace(laptopRoot)
+                                                agent.createCodeSession(
+                                                    workspace = laptopRoot,
+                                                    title = "$laptopName (Laptop)",
+                                                    initialMessage = "Connected to laptop workspace **`$laptopRoot`**."
+                                                )
+                                                onCreated()
+                                            },
+                                        shape = RoundedCornerShape(10.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(12.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Icon(
+                                                Icons.Default.Laptop,
+                                                contentDescription = null,
+                                                tint = MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier.size(24.dp)
+                                            )
+                                            Spacer(Modifier.width(10.dp))
+                                            Column(Modifier.weight(1f)) {
+                                                Text(
+                                                    laptopName,
+                                                    style = MaterialTheme.typography.titleMedium,
+                                                    fontWeight = FontWeight.SemiBold
+                                                )
+                                                Text(
+                                                    "💻 Laptop bridge",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                            Icon(
+                                                Icons.Default.PlayArrow,
+                                                contentDescription = "Start session",
+                                                tint = MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    1 -> {
+                        if (laptopRoot.isNotBlank()) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                FilterChip(!targetLaptop, { targetLaptop = false }, { Text("📱 On phone") })
+                                FilterChip(targetLaptop, { targetLaptop = true }, { Text("💻 On laptop") })
+                            }
+                        }
+                        OutlinedTextField(
+                            value, { value = it }, Modifier.fillMaxWidth(),
+                            label = { Text("HTTPS GitHub URL") },
+                            placeholder = { Text("https://github.com/user/repo") },
+                            singleLine = true
+                        )
+                        if (!targetLaptop) {
+                            OutlinedTextField(
+                                token, { token = it }, Modifier.fillMaxWidth(),
+                                label = { Text("GitHub token (optional, for private repos)") },
+                                visualTransformation = PasswordVisualTransformation(),
+                                singleLine = true
+                            )
+                        }
+                        Text(
+                            if (targetLaptop && laptopRoot.isNotBlank()) "Target: Laptop ($laptopRoot)"
+                            else "Target: 📱 On-device (Phone storage • Pure offline NPU)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (targetLaptop) MaterialTheme.colorScheme.onSurfaceVariant else Color(0xFF54C878)
+                        )
+                    }
+                    2 -> {
+                        if (laptopRoot.isNotBlank()) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                FilterChip(!targetLaptop, { targetLaptop = false }, { Text("📱 On phone") })
+                                FilterChip(targetLaptop, { targetLaptop = true }, { Text("💻 On laptop") })
+                            }
+                        }
+                        OutlinedTextField(
+                            value, { value = it }, Modifier.fillMaxWidth(),
+                            label = { Text("Repository name") },
+                            placeholder = { Text("my-project") },
+                            singleLine = true
+                        )
+                        if (targetLaptop) Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(publish, { publish = it })
+                            Text("Create private GitHub repo and push")
+                        }
+                        Text(
+                            if (targetLaptop && laptopRoot.isNotBlank()) "Target: Laptop ($laptopRoot)"
+                            else "Target: 📱 On-device (Phone storage • Pure offline NPU)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (targetLaptop) MaterialTheme.colorScheme.onSurfaceVariant else Color(0xFF54C878)
+                        )
+                    }
                 }
-                Text(
-                    if (targetLaptop && laptopRoot.isNotBlank()) "Target: Laptop ($laptopRoot)"
-                    else "Target: 📱 On-device (Phone storage • Pure offline NPU)",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (targetLaptop) MaterialTheme.colorScheme.onSurfaceVariant else Color(0xFF54C878)
-                )
+
                 state.error?.let {
                     Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
                 }
             }
         },
         confirmButton = {
-            val canConfirm = value.isNotBlank() && !isBusy && (!targetLaptop || laptopRoot.isNotBlank())
-            Button(
-                onClick = {
-                    if (targetLaptop) {
-                        if (cloneMode) agent.cloneRemoteRepository(laptopRoot, value)
-                        else agent.createRemoteRepository(laptopRoot, value, publish)
-                        onCreated()
-                    } else {
-                        if (cloneMode) {
-                            workspace.cloneRepository(value, token = token) { repo ->
-                                agent.createCodeSession(repo.root.absolutePath)
-                                onCreated()
-                            }
+            if (tab == 0) {
+                // In existing tab, tapping a repo card immediately opens the session
+            } else {
+                val canConfirm = value.isNotBlank() && !isBusy && (!targetLaptop || laptopRoot.isNotBlank())
+                Button(
+                    onClick = {
+                        if (targetLaptop) {
+                            if (tab == 1) agent.cloneRemoteRepository(laptopRoot, value)
+                            else agent.createRemoteRepository(laptopRoot, value, publish)
+                            onCreated()
                         } else {
-                            workspace.createRepository(value) { repo ->
-                                agent.createCodeSession(repo.root.absolutePath)
-                                onCreated()
+                            if (tab == 1) {
+                                workspace.cloneRepository(value, token = token) { repo ->
+                                    agent.createCodeSession(
+                                        workspace = repo.root.absolutePath,
+                                        title = "${repo.name} (GitHub)",
+                                        initialMessage = "✅ **Cloned GitHub repository `${repo.name}` on phone**\n\nReady for on-device exploration, code editing, and Git push directly from your phone powered by **Snapdragon Hexagon NPU**."
+                                    )
+                                    onCreated()
+                                }
+                            } else {
+                                workspace.createRepository(value) { repo ->
+                                    agent.createCodeSession(
+                                        workspace = repo.root.absolutePath,
+                                        title = repo.name,
+                                        initialMessage = "✅ **Created repository `${repo.name}` on phone**\n\nReady to build with Snapdragon Hexagon NPU."
+                                    )
+                                    onCreated()
+                                }
                             }
                         }
-                    }
-                },
-                enabled = canConfirm
-            ) {
-                Text(
-                    when {
-                        state.busy -> "Cloning to phone…"
-                        agent.remoteBusy -> "Cloning to laptop…"
-                        cloneMode -> "Clone and open"
-                        else -> "Create and open"
-                    }
-                )
+                    },
+                    enabled = canConfirm
+                ) {
+                    Text(
+                        when {
+                            state.busy -> "Cloning to phone…"
+                            agent.remoteBusy -> "Cloning to laptop…"
+                            tab == 1 -> "Clone and open"
+                            else -> "Create and open"
+                        }
+                    )
+                }
             }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
@@ -4978,7 +5384,7 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
     var tab by rememberSaveable { mutableStateOf(0) } // 0 = PRs, 1 = Issues
     val repoFullName = github.repoRef?.fullName ?: repo.name
     val startReview: (String) -> Unit = { prompt ->
-        agent.createCodeSession(repo.root.absolutePath)
+        agent.createCodeSession(repo.root.absolutePath, title = "${repo.name} (Review)")
         agent.sendCodeSessionMessage(prompt)
     }
     Column {
@@ -5108,8 +5514,12 @@ private fun buildIssueReviewPrompt(repoFullName: String, issue: GitHubIssueDto):
         onDismissRequest = onDismiss,
         title = { Text("#${pr.number} ${pr.title}") },
         text = {
+            val scrollState = rememberScrollState()
             Column(
-                Modifier.verticalScroll(rememberScrollState()).heightIn(max = 420.dp),
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 140.dp, max = 500.dp)
+                    .verticalScroll(scrollState),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
@@ -5121,7 +5531,12 @@ private fun buildIssueReviewPrompt(repoFullName: String, issue: GitHubIssueDto):
                     "+${pr.additions} / -${pr.deletions} · ${pr.changedFiles} files changed",
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                if (!pr.body.isNullOrBlank()) Text(pr.body)
+                HorizontalDivider(Modifier.padding(vertical = 2.dp))
+                if (!pr.body.isNullOrBlank()) {
+                    MarkdownText(pr.body, style = MaterialTheme.typography.bodyMedium)
+                } else {
+                    Text("No description provided.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         },
         confirmButton = {
@@ -5140,15 +5555,24 @@ private fun buildIssueReviewPrompt(repoFullName: String, issue: GitHubIssueDto):
         onDismissRequest = onDismiss,
         title = { Text("#${issue.number} ${issue.title}") },
         text = {
+            val scrollState = rememberScrollState()
             Column(
-                Modifier.verticalScroll(rememberScrollState()).heightIn(max = 420.dp),
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 140.dp, max = 500.dp)
+                    .verticalScroll(scrollState),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text("${issue.user?.login ?: "unknown"} · ${issue.state}", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (issue.labels.isNotEmpty()) Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     issue.labels.forEach { AssistChip(onClick = {}, label = { Text(it.name) }) }
                 }
-                if (!issue.body.isNullOrBlank()) Text(issue.body)
+                HorizontalDivider(Modifier.padding(vertical = 2.dp))
+                if (!issue.body.isNullOrBlank()) {
+                    MarkdownText(issue.body, style = MaterialTheme.typography.bodyMedium)
+                } else {
+                    Text("No description provided.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         },
         confirmButton = {
