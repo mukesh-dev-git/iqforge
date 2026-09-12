@@ -60,6 +60,8 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.CreationExtras
@@ -68,9 +70,11 @@ import androidx.core.view.WindowCompat
 import androidx.core.content.FileProvider
 import androidx.core.content.ContextCompat
 import com.iqforge.engine.CodeEngine
+import com.iqforge.engine.Finding
 import com.iqforge.engine.ModelCatalog
 import com.iqforge.engine.ModelInfo
 import com.iqforge.engine.NativeEngine
+import com.iqforge.engine.Severity
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.iqforge.bridge.BridgeTask
@@ -129,7 +133,7 @@ private val ForgeLightColors = lightColorScheme(primary = Color(0xFFB38600), bac
 private enum class Appearance { SYSTEM, LIGHT, DARK }
 private enum class FontChoice { DEFAULT, SERIF, MONOSPACE }
 private enum class AppDestination { CHATS, DISPATCH, COWORK, PROJECTS, PROJECT_DETAIL, CODE, ARTIFACTS, REVIEW, SETTINGS }
-private enum class SettingsDialog { NONE, USAGE, CAPABILITIES, COLOR, FONT, VOICE, PRIVACY, DEVICE }
+private enum class SettingsDialog { NONE, USAGE, CAPABILITIES, GITHUB, COLOR, FONT, VOICE, PRIVACY, DEVICE }
 
 class MainActivity : ComponentActivity() {
     private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { _, grantResult ->
@@ -433,6 +437,8 @@ class AgentViewModel(
             if (offlineModelReady && selectedModel == null) selectedModel = nativeEngine.displayName
         }
     }
+
+    suspend fun reviewPullRequestPatch(patch: String): List<Finding> = codeEngine.review(patch)
 
     fun selectOfflineModel() {
         if (offlineModelReady) selectedModel = (codeEngine as? NativeEngine)?.displayName
@@ -2035,6 +2041,7 @@ class AgentViewModel(
                     fontChoice = fontChoice,
                     hapticEnabled = hapticEnabled,
                     agent = agent,
+                    workspace = workspace,
                     onDialog = { settingsDialog = it },
                     onConnectors = {
                         showConnectors = true
@@ -2187,6 +2194,9 @@ class AgentViewModel(
             voicePace = voicePace,
             agent = agent,
             workspace = state,
+            githubTokenSaved = workspace.hasSavedToken(),
+            onSaveGitHubToken = { workspace.saveGitHubToken(it) },
+            onClearGitHubToken = { workspace.saveGitHubToken("") },
             onAppearance = onAppearanceChange,
             onFont = onFontChoiceChange,
             onVoiceLanguage = {
@@ -3657,7 +3667,6 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
 ) {
     val github: GitHubViewModel = viewModel()
     var repoInput by rememberSaveable { mutableStateOf("") }
-    var tab by rememberSaveable { mutableStateOf(0) } // 0 = PRs, 1 = Issues
     val startReview: (String) -> Unit = { prompt ->
         val ref = github.repoRef
         if (ref != null) {
@@ -3681,7 +3690,7 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
     Column(Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 10.dp)) {
         Text("Review", style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 14.dp, bottom = 4.dp))
         Text(
-            "Enter a public GitHub repository to review its open pull requests and issues.",
+            "Open a small pull request, review its real patch on device, verify conflicts and checks, then merge the exact commit you reviewed.",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodyMedium,
             modifier = Modifier.padding(bottom = 14.dp)
@@ -3714,10 +3723,12 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
                     Icon(Icons.Default.Refresh, "Refresh")
                 }
             }
-            Row(Modifier.padding(top = 8.dp, bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = tab == 0, onClick = { tab = 0 }, label = { Text("Pull requests (${github.pullRequests.size})") })
-                FilterChip(selected = tab == 1, onClick = { tab = 1 }, label = { Text("Issues (${github.issues.size})") })
-            }
+            Text(
+                "Open pull requests (${github.pullRequests.size})",
+                modifier = Modifier.padding(top = 8.dp, bottom = 8.dp),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
         when {
             github.loadingList -> Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -3727,24 +3738,28 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
             github.repoRef == null -> Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 Text("Enter a GitHub repository above to get started.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            tab == 0 -> PullRequestList(github.pullRequests, onOpen = github::openPullRequest)
-            else -> IssueList(github.issues, onOpen = github::openIssue)
+            else -> PullRequestList(github.pullRequests, onOpen = github::openPullRequest)
         }
         if (github.loadingDetail) StatusCard("Loading…")
         github.detailError?.let { StatusCard(it, error = true) }
     }
     github.selectedPullRequest?.let { pr ->
-        PullRequestDetailDialog(
+        PullRequestReviewWorkspace(
             pr,
+            files = github.selectedPullRequestFiles,
+            readiness = github.reviewReadiness,
+            checks = github.selectedCheckRuns,
+            mergeState = github.mergeState,
+            mergeMessage = github.mergeMessage,
+            mergedCommitSha = github.mergedCommitSha,
+            agent = agent,
             onDismiss = github::clearSelection,
-            onReview = { startReview(buildPullRequestReviewPrompt(github.repoRef!!.fullName, pr)) }
-        )
-    }
-    github.selectedIssue?.let { issue ->
-        IssueDetailDialog(
-            issue,
-            onDismiss = github::clearSelection,
-            onReview = { startReview(buildIssueReviewPrompt(github.repoRef!!.fullName, issue)) }
+            onApproveAndMerge = { hasBlockers ->
+                github.approveAndMerge(pr.number, github.reviewReadiness?.reviewedHeadSha.orEmpty(), hasBlockers)
+            },
+            onOpenDeepReview = {
+                startReview(buildPullRequestReviewPrompt(github.repoRef!!.fullName, pr, github.selectedPullRequestFiles))
+            }
         )
     }
 }
@@ -4715,6 +4730,7 @@ private fun formatProjectDate(timestamp: Long): String = if (timestamp <= 0L) "u
     fontChoice: FontChoice,
     hapticEnabled: Boolean,
     agent: AgentViewModel,
+    workspace: WorkspaceViewModel,
     onDialog: (SettingsDialog) -> Unit,
     onConnectors: () -> Unit,
     onHaptic: (Boolean) -> Unit
@@ -4735,6 +4751,12 @@ private fun formatProjectDate(timestamp: Long): String = if (timestamp <= 0L) "u
         item {
             SettingsGroup {
                 SettingsRow(Icons.Default.Tune, "Capabilities", "${enabledCapabilityCount(agent)} enabled") { onDialog(SettingsDialog.CAPABILITIES) }
+                HorizontalDivider()
+                SettingsRow(
+                    Icons.Default.Key,
+                    "GitHub personal access token",
+                    if (workspace.hasSavedToken()) "Saved on this device" else "Required to approve and merge pull requests"
+                ) { onDialog(SettingsDialog.GITHUB) }
                 HorizontalDivider()
                 SettingsRow(Icons.Default.Link, "Connectors", "$connected connected", onConnectors)
                 HorizontalDivider()
@@ -4824,6 +4846,9 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
     voicePace: Float,
     agent: AgentViewModel,
     workspace: WorkspaceUiState,
+    githubTokenSaved: Boolean,
+    onSaveGitHubToken: (String) -> Unit,
+    onClearGitHubToken: () -> Unit,
     onAppearance: (Appearance) -> Unit,
     onFont: (FontChoice) -> Unit,
     onVoiceLanguage: (String) -> Unit,
@@ -4833,9 +4858,14 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
     onDismiss: () -> Unit
 ) {
     var bridgeUrl by remember(dialog) { mutableStateOf(agent.bridgeUrl) }
+    var githubToken by remember(dialog) { mutableStateOf("") }
+    var githubTokenVisible by remember(dialog) { mutableStateOf(false) }
+    var tokenSaved by remember(dialog, githubTokenSaved) { mutableStateOf(githubTokenSaved) }
+    var tokenMessage by remember(dialog) { mutableStateOf<String?>(null) }
     val title = when (dialog) {
         SettingsDialog.USAGE -> "Usage"
         SettingsDialog.CAPABILITIES -> "Capabilities"
+        SettingsDialog.GITHUB -> "GitHub access"
         SettingsDialog.COLOR -> "Color mode"
         SettingsDialog.FONT -> "Font style"
         SettingsDialog.VOICE -> "Voice"
@@ -4861,6 +4891,59 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                     CapabilityToggle("Web search", agent.webSearchEnabled, agent::updateWebSearch)
                     CapabilityToggle("Memory", agent.memoryEnabled, agent::updateMemory)
                     CapabilityToggle("Live connectors", agent.connectors.any { it.connected }, null)
+                }
+                SettingsDialog.GITHUB -> Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        if (tokenSaved) "A GitHub token is saved on this device." else "Add a GitHub personal access token to approve and merge pull requests.",
+                        color = if (tokenSaved) Color(0xFF63C174) else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    OutlinedTextField(
+                        value = githubToken,
+                        onValueChange = {
+                            githubToken = it
+                            tokenMessage = null
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Personal access token") },
+                        placeholder = { Text("github_pat_… or ghp_…") },
+                        singleLine = true,
+                        visualTransformation = if (githubTokenVisible) androidx.compose.ui.text.input.VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { githubTokenVisible = !githubTokenVisible }) {
+                                Icon(if (githubTokenVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility, if (githubTokenVisible) "Hide token" else "Show token")
+                            }
+                        }
+                    )
+                    Text(
+                        "Use a fine-grained token with Pull requests: Read and write and Contents: Read and write access. The token is stored locally and is never displayed again.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Button(
+                        onClick = {
+                            onSaveGitHubToken(githubToken.trim())
+                            githubToken = ""
+                            githubTokenVisible = false
+                            tokenSaved = true
+                            tokenMessage = "Token saved. You can now return to Review and approve a pull request."
+                        },
+                        enabled = githubToken.trim().length >= 20,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text(if (tokenSaved) "Replace token" else "Save token") }
+                    if (tokenSaved) {
+                        OutlinedButton(
+                            onClick = {
+                                onClearGitHubToken()
+                                githubToken = ""
+                                tokenSaved = false
+                                tokenMessage = "Saved GitHub token removed."
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("Remove saved token") }
+                    }
+                    tokenMessage?.let {
+                        Text(it, color = if (tokenSaved) Color(0xFF63C174) else MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
+                    }
                 }
                 SettingsDialog.COLOR -> Column {
                     Appearance.entries.forEach { choice ->
@@ -5471,10 +5554,20 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
         github.detailError?.let { StatusCard(it, error = true) }
     }
     github.selectedPullRequest?.let { pr ->
-        PullRequestDetailDialog(
+        PullRequestReviewWorkspace(
             pr,
+            files = github.selectedPullRequestFiles,
+            readiness = github.reviewReadiness,
+            checks = github.selectedCheckRuns,
+            mergeState = github.mergeState,
+            mergeMessage = github.mergeMessage,
+            mergedCommitSha = github.mergedCommitSha,
+            agent = agent,
             onDismiss = github::clearSelection,
-            onReview = { startReview(buildPullRequestReviewPrompt(repoFullName, pr)) }
+            onApproveAndMerge = { hasBlockers ->
+                github.approveAndMerge(pr.number, github.reviewReadiness?.reviewedHeadSha.orEmpty(), hasBlockers)
+            },
+            onOpenDeepReview = { startReview(buildPullRequestReviewPrompt(repoFullName, pr, github.selectedPullRequestFiles)) }
         )
     }
     github.selectedIssue?.let { issue ->
@@ -5551,11 +5644,23 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
     }
 }
 
-private fun buildPullRequestReviewPrompt(repoFullName: String, pr: GitHubPullRequestDetailDto): String = buildString {
+private fun buildPullRequestReviewPrompt(
+    repoFullName: String,
+    pr: GitHubPullRequestDetailDto,
+    files: List<com.iqforge.github.GitHubPullRequestFileDto>
+): String = buildString {
     append("Review GitHub pull request #${pr.number} in $repoFullName: \"${pr.title}\"\n")
     append("Branch: ${pr.head.ref} -> ${pr.base.ref} · +${pr.additions} -${pr.deletions} across ${pr.changedFiles} files\n\n")
+    if (pr.head.sha.isNotBlank()) append("Reviewed head commit: ${pr.head.sha}\n\n")
     if (!pr.body.isNullOrBlank()) append("${pr.body}\n\n")
-    append("Explore this repository's code relevant to this branch and give a thorough review: correctness, edge cases, and style. Suggest concrete improvements.")
+    append("Review the actual changed lines below for correctness, security, and edge cases. ")
+    append("For every finding, name the file and added line. Do not invent issues outside this patch.\n\n")
+    files.forEach { file ->
+        append("FILE: ${file.filename} (${file.status}, +${file.additions} -${file.deletions})\n")
+        append(file.patch ?: "[Patch unavailable: binary or too large for GitHub's patch response]")
+        append("\n\n")
+    }
+
 }
 
 private fun buildIssueReviewPrompt(repoFullName: String, issue: GitHubIssueDto): String = buildString {
@@ -5564,45 +5669,285 @@ private fun buildIssueReviewPrompt(repoFullName: String, issue: GitHubIssueDto):
     append("Explore this repository, find the root cause, and propose a concrete fix.")
 }
 
-@Composable private fun PullRequestDetailDialog(pr: GitHubPullRequestDetailDto, onDismiss: () -> Unit, onReview: (() -> Unit)? = null) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("#${pr.number} ${pr.title}") },
-        text = {
-            val scrollState = rememberScrollState()
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 140.dp, max = 500.dp)
-                    .verticalScroll(scrollState),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Text(
-                    "${pr.user?.login ?: "unknown"} · ${pr.state}${if (pr.draft) " · draft" else ""}",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Text("${pr.head.ref} → ${pr.base.ref}", style = MaterialTheme.typography.labelLarge)
-                Text(
-                    "+${pr.additions} / -${pr.deletions} · ${pr.changedFiles} files changed",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                HorizontalDivider(Modifier.padding(vertical = 2.dp))
-                if (!pr.body.isNullOrBlank()) {
-                    MarkdownText(pr.body, style = MaterialTheme.typography.bodyMedium)
-                } else {
-                    Text("No description provided.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+private data class PullRequestFinding(val path: String, val finding: Finding)
+
+@Composable private fun PullRequestReviewWorkspace(
+    pr: GitHubPullRequestDetailDto,
+    files: List<com.iqforge.github.GitHubPullRequestFileDto>,
+    readiness: com.iqforge.github.PullRequestReadiness?,
+    checks: List<com.iqforge.github.GitHubCheckRunDto>,
+    mergeState: com.iqforge.github.MergeState,
+    mergeMessage: String?,
+    mergedCommitSha: String?,
+    agent: AgentViewModel,
+    onDismiss: () -> Unit,
+    onApproveAndMerge: (Boolean) -> Unit,
+    onOpenDeepReview: (() -> Unit)? = null
+) {
+    var selectedStage by rememberSaveable(pr.number, pr.head.sha) { mutableIntStateOf(0) }
+    var reviewBusy by remember(pr.head.sha) { mutableStateOf(true) }
+    var reviewError by remember(pr.head.sha) { mutableStateOf<String?>(null) }
+    var findings by remember(pr.head.sha) { mutableStateOf<List<PullRequestFinding>?>(null) }
+
+    LaunchedEffect(pr.head.sha, files) {
+        reviewBusy = true
+        reviewError = null
+        findings = null
+        try {
+            findings = files.flatMap { file ->
+                val patch = file.patch ?: return@flatMap emptyList()
+                agent.reviewPullRequestPatch(patch).map { PullRequestFinding(file.filename, it) }
+            }
+        } catch (error: Exception) {
+            reviewError = error.message ?: "The on-device review could not complete."
+        } finally {
+            reviewBusy = false
+        }
+    }
+
+    val blockers = findings.orEmpty().count { it.finding.severity == Severity.BUG }
+    val warnings = findings.orEmpty().count { it.finding.severity == Severity.WARNING }
+    val conflictLabel = when (readiness?.hasConflicts) {
+        false -> "No conflicts"
+        true -> "Conflicts detected"
+        null -> "Conflict status pending"
+    }
+    val stages = listOf("Summary", "Findings", "Changes", "Checks")
+
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            Column(Modifier.fillMaxSize()) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = onDismiss) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Close review") }
+                    Column(Modifier.weight(1f)) {
+                        Text("#${pr.number} ${pr.title}", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "${pr.head.ref} → ${pr.base.ref} · ${readiness?.changedLines ?: pr.additions + pr.deletions} lines",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                    AssistChip(onClick = {}, label = { Text(if (blockers > 0) "$blockers blockers" else "Review active") })
+                }
+
+                TabRow(selectedTabIndex = selectedStage) {
+                    stages.forEachIndexed { index, label ->
+                        Tab(selected = selectedStage == index, onClick = { selectedStage = index }, text = { Text(label) })
+                    }
+                }
+
+                if (reviewBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                when (selectedStage) {
+                    0 -> PullRequestSummaryStage(pr, files, readiness, reviewBusy, reviewError, blockers, warnings, conflictLabel, mergeState, mergeMessage, mergedCommitSha)
+                    1 -> PullRequestFindingsStage(reviewBusy, reviewError, findings)
+                    2 -> PullRequestChangesStage(files)
+                    else -> PullRequestChecksStage(pr, readiness, checks, reviewBusy, reviewError, blockers, conflictLabel, mergeState)
+                }
+
+                HorizontalDivider()
+                if (mergeMessage != null) {
+                    Text(
+                        mergeMessage,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                        color = when (mergeState) {
+                            com.iqforge.github.MergeState.MERGED -> Color(0xFF63C174)
+                            com.iqforge.github.MergeState.BLOCKED, com.iqforge.github.MergeState.FAILED -> MaterialTheme.colorScheme.error
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
+                Row(
+                    Modifier.fillMaxWidth().padding(16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedButton(onClick = { selectedStage = 1 }, modifier = Modifier.weight(1f)) { Text("Inspect findings") }
+                    val mergeBusy = mergeState in setOf(
+                        com.iqforge.github.MergeState.REVALIDATING,
+                        com.iqforge.github.MergeState.APPROVING,
+                        com.iqforge.github.MergeState.MERGING
+                    )
+                    val canAttemptMerge = !reviewBusy && reviewError == null && blockers == 0 && readiness?.mergeBlockReason() == null
+                    Button(
+                        onClick = { onApproveAndMerge(blockers > 0) },
+                        enabled = canAttemptMerge && !mergeBusy && mergeState != com.iqforge.github.MergeState.MERGED,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        if (mergeBusy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                        else Text(
+                            when {
+                                mergeState == com.iqforge.github.MergeState.MERGED -> "Merged"
+                                blockers > 0 -> "Merge blocked"
+                                else -> "Approve & merge"
+                            }
+                        )
+                    }
+                }
+                if (onOpenDeepReview != null) {
+                    TextButton(onClick = { onDismiss(); onOpenDeepReview() }, modifier = Modifier.align(Alignment.CenterHorizontally)) {
+                        Text("Open deep review in Code")
+                    }
                 }
             }
-        },
-        confirmButton = {
-            if (onReview != null) Button(onClick = { onDismiss(); onReview() }) {
-                Icon(Icons.Default.Code, null, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(6.dp))
-                Text("Review")
-            } else TextButton(onClick = onDismiss) { Text("Done") }
-        },
-        dismissButton = { if (onReview != null) TextButton(onClick = onDismiss) { Text("Close") } }
-    )
+        }
+    }
+}
+
+@Composable private fun ColumnScope.PullRequestSummaryStage(
+    pr: GitHubPullRequestDetailDto,
+    files: List<com.iqforge.github.GitHubPullRequestFileDto>,
+    readiness: com.iqforge.github.PullRequestReadiness?,
+    reviewBusy: Boolean,
+    reviewError: String?,
+    blockers: Int,
+    warnings: Int,
+    conflictLabel: String,
+    mergeState: com.iqforge.github.MergeState,
+    mergeMessage: String?,
+    mergedCommitSha: String?
+) {
+    LazyColumn(
+        Modifier.weight(1f).fillMaxWidth().padding(20.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        item {
+            Text("Understand the change", style = MaterialTheme.typography.headlineSmall)
+            Text(pr.body?.takeIf { it.isNotBlank() } ?: "No description was provided by the author.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        if (mergeState == com.iqforge.github.MergeState.MERGED) {
+            item {
+                ElevatedCard(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Pull request merged", color = Color(0xFF63C174), style = MaterialTheme.typography.titleMedium)
+                        Text(mergeMessage ?: "GitHub accepted the merge.")
+                        mergedCommitSha?.let { Text("Merge commit ${it.take(12)}", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelMedium) }
+                    }
+                }
+            }
+        }
+        item {
+            ElevatedCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("IQ review", style = MaterialTheme.typography.titleMedium)
+                    when {
+                        reviewBusy -> Text("Reviewing ${files.size} changed file${if (files.size == 1) "" else "s"} on device…")
+                        reviewError != null -> Text(reviewError, color = MaterialTheme.colorScheme.error)
+                        blockers > 0 -> Text("High risk · $blockers blocking finding${if (blockers == 1) "" else "s"}")
+                        warnings > 0 -> Text("Medium risk · $warnings warning${if (warnings == 1) "" else "s"} to inspect")
+                        else -> Text("Low risk · no blocking findings detected")
+                    }
+                    Text("${files.size} files · +${pr.additions} −${pr.deletions} · $conflictLabel")
+                }
+            }
+        }
+        item {
+            Text(
+                "Reviewed commit ${readiness?.reviewedHeadSha?.take(12)?.ifBlank { "unavailable" } ?: "unavailable"}",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable private fun ColumnScope.PullRequestFindingsStage(
+    reviewBusy: Boolean,
+    reviewError: String?,
+    findings: List<PullRequestFinding>?
+) {
+    LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        item { Text("Inspect findings", style = MaterialTheme.typography.headlineSmall) }
+        when {
+            reviewBusy -> item { Text("The on-device reviewer is checking the changed lines…") }
+            reviewError != null -> item { StatusCard(reviewError, error = true) }
+            findings.isNullOrEmpty() -> item { StatusCard("No issues found in the available patch.", success = true) }
+            else -> items(findings) { item ->
+                ElevatedCard(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            "${item.finding.severity} · ${item.path}:${item.finding.line}",
+                            color = if (item.finding.severity == Severity.BUG) MaterialTheme.colorScheme.error else IqfYellow,
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                        Text(item.finding.message)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable private fun ColumnScope.PullRequestChangesStage(files: List<com.iqforge.github.GitHubPullRequestFileDto>) {
+    LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        item { Text("Review changed lines", style = MaterialTheme.typography.headlineSmall) }
+        items(files, key = { it.filename }) { file ->
+            ElevatedCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(file.filename, style = MaterialTheme.typography.titleSmall)
+                    Text("${file.status} · +${file.additions} −${file.deletions}", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(file.patch ?: "Patch unavailable for this file.", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable private fun ColumnScope.PullRequestChecksStage(
+    pr: GitHubPullRequestDetailDto,
+    readiness: com.iqforge.github.PullRequestReadiness?,
+    checks: List<com.iqforge.github.GitHubCheckRunDto>,
+    reviewBusy: Boolean,
+    reviewError: String?,
+    blockers: Int,
+    conflictLabel: String,
+    mergeState: com.iqforge.github.MergeState
+) {
+    LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        item { Text("Verify before merge", style = MaterialTheme.typography.headlineSmall) }
+        item { ReviewCheckRow("Pull request is not a draft", !pr.draft, if (pr.draft) "Draft PRs cannot be merged" else "Ready for review") }
+        item { ReviewCheckRow("No merge conflicts", readiness?.hasConflicts == false, conflictLabel) }
+        item {
+            val checksPassed = readiness?.checksState in setOf(com.iqforge.github.ChecksState.PASSED, com.iqforge.github.ChecksState.NONE)
+            ReviewCheckRow("Automated checks", checksPassed, readiness?.checksState?.name?.lowercase() ?: "pending")
+        }
+        checks.forEach { check ->
+            item {
+                val passed = check.conclusion in setOf("success", "neutral", "skipped")
+                ReviewCheckRow(check.name, passed, check.conclusion ?: check.status)
+            }
+        }
+        item { ReviewCheckRow("Complete patch available", readiness?.patchAvailable == true, if (readiness?.patchAvailable == true) "All changed lines loaded" else "One or more patches unavailable") }
+        item { ReviewCheckRow("No blocking IQ findings", !reviewBusy && reviewError == null && blockers == 0, if (reviewBusy) "Review running" else if (blockers == 0) "No blockers" else "$blockers blockers") }
+        item {
+            val revalidated = mergeState in setOf(
+                com.iqforge.github.MergeState.APPROVING,
+                com.iqforge.github.MergeState.MERGING,
+                com.iqforge.github.MergeState.MERGED
+            )
+            ReviewCheckRow("Reviewed commit unchanged", revalidated, if (revalidated) "Exact reviewed SHA confirmed" else "Rechecked immediately before merge")
+        }
+    }
+}
+
+@Composable private fun ReviewCheckRow(label: String, passed: Boolean, detail: String) {
+    ElevatedCard(Modifier.fillMaxWidth()) {
+        Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                if (passed) Icons.Default.CheckCircle else Icons.Default.ErrorOutline,
+                null,
+                tint = if (passed) Color(0xFF63C174) else MaterialTheme.colorScheme.error
+            )
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(label, style = MaterialTheme.typography.titleSmall)
+                Text(detail, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
+            }
+        }
+    }
 }
 
 @Composable private fun IssueDetailDialog(issue: GitHubIssueDto, onDismiss: () -> Unit, onReview: (() -> Unit)? = null) {
