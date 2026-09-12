@@ -78,6 +78,8 @@ class NativeEngine(private val context: Context) : CodeEngine {
         }
     }
 
+    private var serverProcess: Process? = null
+
     suspend fun checkNpuHealth(): Boolean = withContext(Dispatchers.IO) {
         try {
             val request = Request.Builder()
@@ -95,56 +97,120 @@ class NativeEngine(private val context: Context) : CodeEngine {
         }
     }
 
-    suspend fun initialize(): Boolean = withContext(Dispatchers.IO) {
-        if (checkNpuHealth()) {
-            isReady = true
-            Log.i("NativeEngine", "Initialized with live Snapdragon Hexagon NPU daemon on localhost:8080")
-            return@withContext true
+    suspend fun ensureNpuDaemonRunning(): Boolean = withContext(Dispatchers.IO) {
+        if (checkNpuHealth()) return@withContext true
+
+        val nativeDir = context.applicationInfo.nativeLibraryDir
+        val serverBinary = File(nativeDir, "libllama-server.so").takeIf { it.exists() }
+            ?: File("/data/local/tmp/llama.cpp/bin/llama-server").takeIf { it.exists() }
+
+        if (serverBinary == null) {
+            Log.w("NativeEngine", "Hexagon NPU server binary not found in $nativeDir")
+            return@withContext false
         }
 
-        if (isReady) return@withContext true
-        try {
-            val selected = ModelCatalog.detectAvailable { name ->
-                File(context.filesDir, name).exists() || runCatching { context.assets.open(name).close() }.isSuccess
-            } ?: ModelCatalog.QWEN_1_5B
-            activeModel = selected
+        val modelFile = File(context.filesDir, activeModel.fileName).takeIf { it.exists() && it.length() > 50_000_000L }
+            ?: File("/data/local/tmp/gguf/${activeModel.fileName}").takeIf { it.exists() && it.length() > 50_000_000L }
 
-            val modelFile = File(context.filesDir, selected.fileName)
-            if (!modelFile.exists()) {
-                Log.i("NativeEngine", "Copying ${selected.displayName} from assets...")
-                context.assets.open(selected.fileName).use { input ->
-                    FileOutputStream(modelFile).use { output ->
-                        input.copyTo(output)
+        if (modelFile == null) {
+            Log.w("NativeEngine", "Model ${activeModel.fileName} not yet present on device")
+            return@withContext false
+        }
+
+        try {
+            Log.i("NativeEngine", "Spawning autonomous on-device Hexagon NPU server: ${serverBinary.absolutePath}")
+            val pb = ProcessBuilder(
+                serverBinary.absolutePath,
+                "-m", modelFile.absolutePath,
+                "--host", "127.0.0.1",
+                "--port", "8080",
+                "-ngl", "99",
+                "--device", "HTP0",
+                "-c", "2048"
+            ).apply {
+                val env = environment()
+                env["ADSP_LIBRARY_PATH"] = nativeDir
+                env["LD_LIBRARY_PATH"] = "$nativeDir:/vendor/lib64"
+                redirectErrorStream(true)
+            }
+            serverProcess = pb.start()
+
+            for (attempt in 1..25) {
+                kotlinx.coroutines.delay(400)
+                if (checkNpuHealth()) {
+                    Log.i("NativeEngine", "Hexagon NPU daemon verified active and healthy on attempt $attempt")
+                    isReady = true
+                    return@withContext true
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("NativeEngine", "Failed to launch internal Hexagon NPU daemon", e)
+        }
+        false
+    }
+
+    fun isModelAvailable(): Boolean {
+        val inFiles = File(context.filesDir, activeModel.fileName)
+        val inTmp = File("/data/local/tmp/gguf/${activeModel.fileName}")
+        return (inFiles.exists() && inFiles.length() > 50_000_000L) || inTmp.exists()
+    }
+
+    suspend fun downloadModel(onProgress: (Float, String) -> Unit): Boolean = withContext(Dispatchers.IO) {
+        val targetFile = File(context.filesDir, activeModel.fileName)
+        val tempFile = File(context.filesDir, "${activeModel.fileName}.download")
+        try {
+            val request = Request.Builder().url(activeModel.sourceUrl).build()
+            httpClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return@withContext false
+                val body = response.body ?: return@withContext false
+                val contentLength = body.contentLength()
+                body.byteStream().use { input ->
+                    FileOutputStream(tempFile).use { output ->
+                        val buffer = ByteArray(65536)
+                        var bytesRead: Int
+                        var totalRead = 0L
+                        var lastReport = 0L
+                        while (input.read(buffer).also { bytesRead = it } != -1) {
+                            output.write(buffer, 0, bytesRead)
+                            totalRead += bytesRead
+                            val now = System.currentTimeMillis()
+                            if (now - lastReport > 250) {
+                                val progress = if (contentLength > 0) totalRead.toFloat() / contentLength else 0f
+                                val mbRead = totalRead / (1024 * 1024)
+                                val totalMb = contentLength / (1024 * 1024)
+                                onProgress(progress, "$mbRead MB / $totalMb MB")
+                                lastReport = now
+                            }
+                        }
                     }
                 }
+                if (targetFile.exists()) targetFile.delete()
+                tempFile.renameTo(targetFile)
+                initialize()
             }
-            if (modelFile.length() < 100_000_000L) {
-                Log.e("NativeEngine", "Rejected incomplete GGUF model: ${modelFile.length()} bytes")
-                return@withContext false
-            }
-            modelFile.inputStream().use { input ->
-                val magic = ByteArray(4)
-                if (input.read(magic) != 4 || !magic.contentEquals(byteArrayOf('G'.code.toByte(), 'G'.code.toByte(), 'U'.code.toByte(), 'F'.code.toByte()))) {
-                    Log.e("NativeEngine", "Rejected model without GGUF header")
-                    return@withContext false
-                }
-            }
-            modelPath = modelFile.absolutePath
-            isReady = true
-            Log.i("NativeEngine", "Ready: ${selected.displayName} (${selected.promptStyle})")
-            true
-        } catch (e: FileNotFoundException) {
-            Log.e("NativeEngine", "No catalog model found in assets. Place one of: ${ModelCatalog.ALL.joinToString { it.fileName }}")
-            false
         } catch (e: Exception) {
-            Log.e("NativeEngine", "Failed to initialize model", e)
+            Log.e("NativeEngine", "Model download failed", e)
+            tempFile.delete()
             false
         }
     }
 
-    fun installedModelBytes(): Long = File(context.filesDir, activeModel.fileName).takeIf(File::isFile)?.length() ?: 0L
+    suspend fun initialize(): Boolean = withContext(Dispatchers.IO) {
+        if (checkNpuHealth() || ensureNpuDaemonRunning()) {
+            isReady = true
+            isNpuActive = true
+            Log.i("NativeEngine", "Hexagon NPU hardware accelerator initialized and ready")
+            return@withContext true
+        }
 
-    private external fun nativeGenerate(modelPath: String, prompt: String): String
+        isReady = false
+        isNpuActive = false
+        false
+    }
+
+    fun installedModelBytes(): Long = File(context.filesDir, activeModel.fileName).takeIf(File::isFile)?.length()
+        ?: File("/data/local/tmp/gguf/${activeModel.fileName}").takeIf(File::isFile)?.length()
+        ?: 0L
 
     private fun wrapPrompt(system: String, user: String): String = when (activeModel.promptStyle) {
         PromptStyle.CHATML ->
@@ -182,21 +248,15 @@ class NativeEngine(private val context: Context) : CodeEngine {
     private suspend fun generate(system: String, user: String): String = withContext(Dispatchers.Default) {
         val formattedPrompt = wrapPrompt(system, user)
 
-        if (checkNpuHealth()) {
+        // PURE NPU EXECUTION: Model is integrated to run on Hexagon NPU alone, strictly no CPU fallback
+        if (checkNpuHealth() || ensureNpuDaemonRunning()) {
             val npuResult = generateViaNpu(formattedPrompt)
             if (!npuResult.isNullOrBlank()) {
                 return@withContext npuResult
             }
         }
 
-        if (!isReady && !initialize()) {
-            return@withContext "ERROR: NativeEngine not ready (no model file found — see ModelCatalog.ALL)."
-        }
-        val result = nativeGenerate(modelPath, formattedPrompt)
-        if (result.startsWith("ERROR:")) {
-            return@withContext result
-        }
-        result
+        "ERROR: Qualcomm Snapdragon Hexagon NPU (HTP) hardware acceleration is required. Inference runs exclusively on the NPU; CPU execution is disabled."
     }
 
     override suspend fun write(instruction: String, fileContext: String): String {
