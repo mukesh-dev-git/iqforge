@@ -82,6 +82,47 @@ class GitHubApiClientTest {
         assertEquals(ChecksState.PASSED, readiness.checksState)
         assertEquals(5, readiness.changedLines)
         assertTrue(readiness.isReadyForReview)
+        assertEquals(null, readiness.mergeBlockReason())
+    }
+
+    @Test
+    fun `submits approval then merges only the reviewed SHA`() = runTest {
+        server.enqueue(MockResponse().setBody("""{"id":77,"state":"APPROVED"}"""))
+        server.enqueue(MockResponse().setBody("""{"sha":"merge789","merged":true,"message":"Pull Request successfully merged"}"""))
+        val client = GitHubApiClient(
+            tokenProvider = { "write-token" },
+            baseUrl = server.url("api/v3/").toString()
+        )
+
+        val review = client.submitApproval("acme", "payments", 42)
+        val merge = client.mergePullRequest("acme", "payments", 42, "abc123")
+
+        assertEquals("APPROVED", review.state)
+        assertTrue(merge.merged)
+        assertEquals("merge789", merge.sha)
+
+        val approvalRequest = server.takeRequest()
+        assertEquals("POST", approvalRequest.method)
+        assertEquals("/api/v3/repos/acme/payments/pulls/42/reviews", approvalRequest.path)
+        assertTrue(approvalRequest.body.readUtf8().contains("\"event\":\"APPROVE\""))
+
+        val mergeRequest = server.takeRequest()
+        assertEquals("PUT", mergeRequest.method)
+        assertEquals("/api/v3/repos/acme/payments/pulls/42/merge", mergeRequest.path)
+        val mergeBody = mergeRequest.body.readUtf8()
+        assertTrue(mergeBody.contains("\"sha\":\"abc123\""))
+        assertTrue(mergeBody.contains("\"merge_method\":\"squash\""))
+    }
+
+    @Test
+    fun `readiness explains pending conflict calculation`() {
+        val readiness = PullRequestReadiness.from(
+            pullRequest(mergeable = null),
+            listOf(fileWithPatch()),
+            emptyList()
+        )
+
+        assertEquals("GitHub is still calculating merge conflicts. Refresh and try again.", readiness.mergeBlockReason())
     }
 
     private fun pullRequest(mergeable: Boolean?) = GitHubPullRequestDetailDto(

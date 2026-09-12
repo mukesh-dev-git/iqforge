@@ -7,10 +7,13 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 
 /**
  * Anonymous, read-only client for GitHub's public REST API. Deliberately separate from
@@ -52,13 +55,39 @@ open class GitHubApiClient(
             get("repos/$owner/$repo/commits/$ref/check-runs")
         )
 
+    open suspend fun submitApproval(owner: String, repo: String, number: Int): GitHubReviewDto =
+        json.decodeFromString(
+            GitHubReviewDto.serializer(),
+            request(
+                path = "repos/$owner/$repo/pulls/$number/reviews",
+                method = "POST",
+                body = json.encodeToString(GitHubReviewRequest(event = "APPROVE"))
+            )
+        )
+
+    open suspend fun mergePullRequest(
+        owner: String,
+        repo: String,
+        number: Int,
+        expectedHeadSha: String
+    ): GitHubMergeResponse = json.decodeFromString(
+        GitHubMergeResponse.serializer(),
+        request(
+            path = "repos/$owner/$repo/pulls/$number/merge",
+            method = "PUT",
+            body = json.encodeToString(GitHubMergeRequest(sha = expectedHeadSha, mergeMethod = "squash"))
+        )
+    )
+
     open suspend fun listIssues(owner: String, repo: String): List<GitHubIssueDto> =
         json.decodeFromString(
             ListSerializer(GitHubIssueDto.serializer()),
             get("repos/$owner/$repo/issues?state=open&per_page=30")
         ).filter { it.pullRequest == null }
 
-    private suspend fun get(path: String): String = withContext(Dispatchers.IO) {
+    private suspend fun get(path: String): String = request(path, "GET")
+
+    private suspend fun request(path: String, method: String, body: String? = null): String = withContext(Dispatchers.IO) {
         val requestBuilder = Request.Builder()
             .url("${baseUrl.trimEnd('/')}/$path")
             .header("Accept", "application/vnd.github+json")
@@ -67,9 +96,10 @@ open class GitHubApiClient(
         tokenProvider()?.trim()?.takeIf { it.isNotEmpty() }?.let {
             requestBuilder.header("Authorization", "Bearer $it")
         }
-        val request = requestBuilder.get().build()
+        val requestBody = body?.toRequestBody(JSON_MEDIA_TYPE)
+        val request = requestBuilder.method(method, requestBody).build()
         client.newCall(request).execute().use { response ->
-            val body = response.body?.string().orEmpty()
+            val responseBody = response.body?.string().orEmpty()
             if (response.code == 403) {
                 val remaining = response.header("X-RateLimit-Remaining")
                 throw IOException(
@@ -79,13 +109,21 @@ open class GitHubApiClient(
                 )
             }
             if (response.code == 404) throw IOException("Repository not found or not public.")
-            if (!response.isSuccessful) throw IOException("GitHub API returned HTTP ${response.code}: ${body.take(240)}")
-            body
+            if (!response.isSuccessful) throw IOException(githubError(response.code, responseBody))
+            responseBody
         }
+    }
+
+    private fun githubError(code: Int, body: String): String {
+        val message = runCatching {
+            json.decodeFromString(GitHubErrorResponse.serializer(), body).message
+        }.getOrNull()?.takeIf { it.isNotBlank() } ?: body.take(240)
+        return "GitHub API returned HTTP $code: $message"
     }
 
     private companion object {
         const val BASE_URL = "https://api.github.com"
+        val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     }
 }
 
@@ -164,6 +202,31 @@ data class GitHubCheckRunDto(
     val conclusion: String? = null,
     @SerialName("html_url") val htmlUrl: String? = null
 )
+
+@Serializable
+private data class GitHubReviewRequest(val event: String)
+
+@Serializable
+data class GitHubReviewDto(
+    val id: Long,
+    val state: String = ""
+)
+
+@Serializable
+private data class GitHubMergeRequest(
+    val sha: String,
+    @SerialName("merge_method") val mergeMethod: String
+)
+
+@Serializable
+data class GitHubMergeResponse(
+    val sha: String? = null,
+    val merged: Boolean = false,
+    val message: String = ""
+)
+
+@Serializable
+private data class GitHubErrorResponse(val message: String = "")
 
 @Serializable
 data class GitHubIssueDto(

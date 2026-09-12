@@ -29,6 +29,9 @@ class GitHubViewModel(application: Application) : AndroidViewModel(application) 
     var selectedPullRequestFiles by mutableStateOf<List<GitHubPullRequestFileDto>>(emptyList()); private set
     var selectedCheckRuns by mutableStateOf<List<GitHubCheckRunDto>>(emptyList()); private set
     var reviewReadiness by mutableStateOf<PullRequestReadiness?>(null); private set
+    var mergeState by mutableStateOf(MergeState.IDLE); private set
+    var mergeMessage by mutableStateOf<String?>(null); private set
+    var mergedCommitSha by mutableStateOf<String?>(null); private set
     var selectedIssue by mutableStateOf<GitHubIssueDto?>(null); private set
     var loadingList by mutableStateOf(false); private set
     var loadingDetail by mutableStateOf(false); private set
@@ -92,6 +95,9 @@ class GitHubViewModel(application: Application) : AndroidViewModel(application) 
         selectedPullRequestFiles = emptyList()
         selectedCheckRuns = emptyList()
         reviewReadiness = null
+        mergeState = MergeState.IDLE
+        mergeMessage = null
+        mergedCommitSha = null
         viewModelScope.launch {
             try {
                 val pullRequest = client.getPullRequest(ref.owner, ref.repo, number)
@@ -115,11 +121,71 @@ class GitHubViewModel(application: Application) : AndroidViewModel(application) 
         selectedIssue = issue
     }
 
+    fun approveAndMerge(number: Int, reviewedHeadSha: String, hasBlockingFindings: Boolean) {
+        val ref = repoRef ?: return
+        if (mergeState in setOf(MergeState.REVALIDATING, MergeState.APPROVING, MergeState.MERGING)) return
+        if (preferences.getString("github_token", "").isNullOrBlank()) {
+            mergeState = MergeState.FAILED
+            mergeMessage = "Connect a GitHub token with pull-request and contents write access before merging."
+            return
+        }
+        if (hasBlockingFindings) {
+            mergeState = MergeState.BLOCKED
+            mergeMessage = "Resolve the blocking IQ findings before merging."
+            return
+        }
+
+        mergeState = MergeState.REVALIDATING
+        mergeMessage = "Rechecking the latest commit, conflicts, and automated checks…"
+        viewModelScope.launch {
+            try {
+                val latest = client.getPullRequest(ref.owner, ref.repo, number)
+                if (latest.head.sha != reviewedHeadSha) {
+                    mergeState = MergeState.BLOCKED
+                    mergeMessage = "A new commit was pushed after this review. Review the updated patch before merging."
+                    return@launch
+                }
+                val checks = client.getCheckRuns(ref.owner, ref.repo, latest.head.sha).checkRuns
+                val latestReadiness = PullRequestReadiness.from(latest, selectedPullRequestFiles, checks)
+                selectedPullRequest = latest
+                selectedCheckRuns = checks
+                reviewReadiness = latestReadiness
+                latestReadiness.mergeBlockReason()?.let { reason ->
+                    mergeState = MergeState.BLOCKED
+                    mergeMessage = reason
+                    return@launch
+                }
+
+                mergeState = MergeState.APPROVING
+                mergeMessage = "Submitting your approval…"
+                client.submitApproval(ref.owner, ref.repo, number)
+
+                mergeState = MergeState.MERGING
+                mergeMessage = "Merging the exact commit you reviewed…"
+                val result = client.mergePullRequest(ref.owner, ref.repo, number, reviewedHeadSha)
+                if (result.merged) {
+                    mergeState = MergeState.MERGED
+                    mergedCommitSha = result.sha
+                    mergeMessage = result.message.ifBlank { "Pull request merged successfully." }
+                } else {
+                    mergeState = MergeState.BLOCKED
+                    mergeMessage = result.message.ifBlank { "GitHub declined the merge." }
+                }
+            } catch (error: Exception) {
+                mergeState = MergeState.FAILED
+                mergeMessage = error.message ?: "GitHub could not complete the approval and merge."
+            }
+        }
+    }
+
     fun clearSelection() {
         selectedPullRequest = null
         selectedPullRequestFiles = emptyList()
         selectedCheckRuns = emptyList()
         reviewReadiness = null
+        mergeState = MergeState.IDLE
+        mergeMessage = null
+        mergedCommitSha = null
         selectedIssue = null
         detailError = null
     }
@@ -135,6 +201,17 @@ data class PullRequestReadiness(
 ) {
     val isReadyForReview: Boolean
         get() = !isDraft && hasConflicts == false && checksState != ChecksState.FAILED && patchAvailable
+
+    fun mergeBlockReason(): String? = when {
+        isDraft -> "This pull request is still a draft."
+        hasConflicts == null -> "GitHub is still calculating merge conflicts. Refresh and try again."
+        hasConflicts -> "This pull request conflicts with the target branch."
+        checksState == ChecksState.PENDING -> "Automated checks are still running."
+        checksState == ChecksState.FAILED -> "One or more automated checks failed."
+        !patchAvailable -> "The complete patch was not available for review."
+        reviewedHeadSha.isBlank() -> "The reviewed commit SHA is unavailable."
+        else -> null
+    }
 
     companion object {
         fun from(
@@ -161,5 +238,7 @@ data class PullRequestReadiness(
 }
 
 enum class ChecksState { NONE, PENDING, PASSED, FAILED }
+
+enum class MergeState { IDLE, REVALIDATING, APPROVING, MERGING, MERGED, BLOCKED, FAILED }
 
 private val SUCCESSFUL_CHECK_CONCLUSIONS = setOf("success", "neutral", "skipped")

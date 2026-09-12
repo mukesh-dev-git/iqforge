@@ -3625,8 +3625,14 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
             files = github.selectedPullRequestFiles,
             readiness = github.reviewReadiness,
             checks = github.selectedCheckRuns,
+            mergeState = github.mergeState,
+            mergeMessage = github.mergeMessage,
+            mergedCommitSha = github.mergedCommitSha,
             agent = agent,
             onDismiss = github::clearSelection,
+            onApproveAndMerge = { hasBlockers ->
+                github.approveAndMerge(pr.number, github.reviewReadiness?.reviewedHeadSha.orEmpty(), hasBlockers)
+            },
             onOpenDeepReview = {
                 startReview(buildPullRequestReviewPrompt(github.repoRef!!.fullName, pr, github.selectedPullRequestFiles))
             }
@@ -5027,8 +5033,14 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
             files = github.selectedPullRequestFiles,
             readiness = github.reviewReadiness,
             checks = github.selectedCheckRuns,
+            mergeState = github.mergeState,
+            mergeMessage = github.mergeMessage,
+            mergedCommitSha = github.mergedCommitSha,
             agent = agent,
             onDismiss = github::clearSelection,
+            onApproveAndMerge = { hasBlockers ->
+                github.approveAndMerge(pr.number, github.reviewReadiness?.reviewedHeadSha.orEmpty(), hasBlockers)
+            },
             onOpenDeepReview = { startReview(buildPullRequestReviewPrompt(repoFullName, pr, github.selectedPullRequestFiles)) }
         )
     }
@@ -5138,8 +5150,12 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
     files: List<com.iqforge.github.GitHubPullRequestFileDto>,
     readiness: com.iqforge.github.PullRequestReadiness?,
     checks: List<com.iqforge.github.GitHubCheckRunDto>,
+    mergeState: com.iqforge.github.MergeState,
+    mergeMessage: String?,
+    mergedCommitSha: String?,
     agent: AgentViewModel,
     onDismiss: () -> Unit,
+    onApproveAndMerge: (Boolean) -> Unit,
     onOpenDeepReview: (() -> Unit)? = null
 ) {
     var selectedStage by rememberSaveable(pr.number, pr.head.sha) { mutableIntStateOf(0) }
@@ -5199,21 +5215,50 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
 
                 if (reviewBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
                 when (selectedStage) {
-                    0 -> PullRequestSummaryStage(pr, files, readiness, reviewBusy, reviewError, blockers, warnings, conflictLabel)
+                    0 -> PullRequestSummaryStage(pr, files, readiness, reviewBusy, reviewError, blockers, warnings, conflictLabel, mergeState, mergeMessage, mergedCommitSha)
                     1 -> PullRequestFindingsStage(reviewBusy, reviewError, findings)
                     2 -> PullRequestChangesStage(files)
-                    else -> PullRequestChecksStage(pr, readiness, checks, reviewBusy, reviewError, blockers, conflictLabel)
+                    else -> PullRequestChecksStage(pr, readiness, checks, reviewBusy, reviewError, blockers, conflictLabel, mergeState)
                 }
 
                 HorizontalDivider()
+                if (mergeMessage != null) {
+                    Text(
+                        mergeMessage,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                        color = when (mergeState) {
+                            com.iqforge.github.MergeState.MERGED -> Color(0xFF63C174)
+                            com.iqforge.github.MergeState.BLOCKED, com.iqforge.github.MergeState.FAILED -> MaterialTheme.colorScheme.error
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
                 Row(
                     Modifier.fillMaxWidth().padding(16.dp),
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     OutlinedButton(onClick = { selectedStage = 1 }, modifier = Modifier.weight(1f)) { Text("Inspect findings") }
-                    Button(onClick = {}, enabled = false, modifier = Modifier.weight(1f)) {
-                        Text(if (blockers > 0) "Merge blocked" else "Approve & merge")
+                    val mergeBusy = mergeState in setOf(
+                        com.iqforge.github.MergeState.REVALIDATING,
+                        com.iqforge.github.MergeState.APPROVING,
+                        com.iqforge.github.MergeState.MERGING
+                    )
+                    val canAttemptMerge = !reviewBusy && reviewError == null && blockers == 0 && readiness?.mergeBlockReason() == null
+                    Button(
+                        onClick = { onApproveAndMerge(blockers > 0) },
+                        enabled = canAttemptMerge && !mergeBusy && mergeState != com.iqforge.github.MergeState.MERGED,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        if (mergeBusy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                        else Text(
+                            when {
+                                mergeState == com.iqforge.github.MergeState.MERGED -> "Merged"
+                                blockers > 0 -> "Merge blocked"
+                                else -> "Approve & merge"
+                            }
+                        )
                     }
                 }
                 if (onOpenDeepReview != null) {
@@ -5234,7 +5279,10 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
     reviewError: String?,
     blockers: Int,
     warnings: Int,
-    conflictLabel: String
+    conflictLabel: String,
+    mergeState: com.iqforge.github.MergeState,
+    mergeMessage: String?,
+    mergedCommitSha: String?
 ) {
     LazyColumn(
         Modifier.weight(1f).fillMaxWidth().padding(20.dp),
@@ -5243,6 +5291,17 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
         item {
             Text("Understand the change", style = MaterialTheme.typography.headlineSmall)
             Text(pr.body?.takeIf { it.isNotBlank() } ?: "No description was provided by the author.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        if (mergeState == com.iqforge.github.MergeState.MERGED) {
+            item {
+                ElevatedCard(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Pull request merged", color = Color(0xFF63C174), style = MaterialTheme.typography.titleMedium)
+                        Text(mergeMessage ?: "GitHub accepted the merge.")
+                        mergedCommitSha?.let { Text("Merge commit ${it.take(12)}", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelMedium) }
+                    }
+                }
+            }
         }
         item {
             ElevatedCard(Modifier.fillMaxWidth()) {
@@ -5318,7 +5377,8 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
     reviewBusy: Boolean,
     reviewError: String?,
     blockers: Int,
-    conflictLabel: String
+    conflictLabel: String,
+    mergeState: com.iqforge.github.MergeState
 ) {
     LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { Text("Verify before merge", style = MaterialTheme.typography.headlineSmall) }
@@ -5336,7 +5396,14 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
         }
         item { ReviewCheckRow("Complete patch available", readiness?.patchAvailable == true, if (readiness?.patchAvailable == true) "All changed lines loaded" else "One or more patches unavailable") }
         item { ReviewCheckRow("No blocking IQ findings", !reviewBusy && reviewError == null && blockers == 0, if (reviewBusy) "Review running" else if (blockers == 0) "No blockers" else "$blockers blockers") }
-        item { ReviewCheckRow("Reviewed commit unchanged", false, "Final GitHub revalidation is the next delivery slice") }
+        item {
+            val revalidated = mergeState in setOf(
+                com.iqforge.github.MergeState.APPROVING,
+                com.iqforge.github.MergeState.MERGING,
+                com.iqforge.github.MergeState.MERGED
+            )
+            ReviewCheckRow("Reviewed commit unchanged", revalidated, if (revalidated) "Exact reviewed SHA confirmed" else "Rechecked immediately before merge")
+        }
     }
 }
 
