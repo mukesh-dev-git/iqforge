@@ -438,6 +438,12 @@ class AgentViewModel(
         newChat(privateMode = incognito)
     }
 
+    /** Deletes any saved chat by id, from the Recents list — not just the active one. */
+    fun deleteChat(id: String) {
+        chats = historyStore?.remove(id).orEmpty()
+        if (activeChatId == id) newChat(privateMode = incognito)
+    }
+
     fun clearMemory() {
         preferences?.edit()?.remove("chat_memory")?.apply()
     }
@@ -2164,12 +2170,13 @@ private fun displayModelText(text: String): String = text
                         Modifier.fillMaxWidth().padding(top = 28.dp, bottom = 20.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            "IQF",
-                            color = MaterialTheme.colorScheme.onSurface,
-                            fontFamily = FontFamily.Serif,
-                            fontSize = 30.sp,
-                            modifier = Modifier.weight(1f)
+                        Image(
+                            painter = painterResource(R.drawable.iqoo_q_mark),
+                            contentDescription = "iQForge",
+                            colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(IqfYellow),
+                            modifier = Modifier.weight(1f).size(32.dp),
+                            alignment = Alignment.CenterStart,
+                            contentScale = ContentScale.Fit
                         )
                         IconButton(onIncognito) {
                             Icon(
@@ -2185,7 +2192,6 @@ private fun displayModelText(text: String): String = text
                 // code behind them is untouched, just not linked from here. See
                 // finals-30hr/MVP_PLAN.md.
                 item { NavigationItem("Chats", Icons.Default.Forum) { onDestination(AppDestination.CHATS) } }
-                item { NavigationItem("Clear current chat", Icons.Default.DeleteSweep) { agent.clearCurrentChat(); onDestination(AppDestination.CHATS) } }
                 item { NavigationItem("Code", Icons.Default.Code) { onDestination(AppDestination.CODE) } }
                 item { NavigationItem("Settings", Icons.Default.Settings) { onDestination(AppDestination.SETTINGS) } }
                 item { HorizontalDivider(Modifier.padding(vertical = 12.dp)) }
@@ -2214,8 +2220,18 @@ private fun displayModelText(text: String): String = text
                     }
                 } else {
                     items(agent.chats.take(12), key = { it.id }) { chat ->
-                        TextButton(onClick = { onChat(chat.id) }, modifier = Modifier.fillMaxWidth()) {
-                            Text(chat.title, Modifier.fillMaxWidth(), maxLines = 1, color = MaterialTheme.colorScheme.onSurface)
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            TextButton(onClick = { onChat(chat.id) }, modifier = Modifier.weight(1f)) {
+                                Text(chat.title, Modifier.fillMaxWidth(), maxLines = 1, color = MaterialTheme.colorScheme.onSurface)
+                            }
+                            IconButton(onClick = { agent.deleteChat(chat.id) }) {
+                                Icon(
+                                    Icons.Default.Delete,
+                                    contentDescription = "Delete \"${chat.title}\"",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
                         }
                     }
                 }
