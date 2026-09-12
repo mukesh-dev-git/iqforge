@@ -49,6 +49,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
@@ -631,7 +632,9 @@ class AgentViewModel(
             connectorStatus = try {
                 val health = bridgeClient.health(bridgeUrl)
                 modelServiceReady = health.modelReachable
-                selectedModel = health.model
+                if (selectedModel?.contains("on-device", ignoreCase = true) != true) {
+                    selectedModel = health.model
+                }
                 if (health.modelReachable) {
                     "Connected - ${health.backend}${health.model?.let { " / $it" }.orEmpty()}"
                 } else {
@@ -660,7 +663,9 @@ class AgentViewModel(
                 val discoveredConnectors = bridgeClient.connectors(bridgeUrl)
                 availableModels = discoveredModels
                 connectors = discoveredConnectors
-                selectedModel = discoveredModels.firstOrNull { it.selected }?.id ?: health.model
+                if (selectedModel?.contains("on-device", ignoreCase = true) != true) {
+                    selectedModel = discoveredModels.firstOrNull { it.selected }?.id ?: health.model
+                }
                 modelServiceReady = discoveredModels.any { it.id == selectedModel }
                 val connectedCount = discoveredConnectors.count { it.connected }
                 connectorStatus = "$connectedCount live connector(s)"
@@ -731,7 +736,8 @@ class AgentViewModel(
                         feed += FeedItem.Status("Web search unavailable; continuing on-device. ${error.message.orEmpty()}", error = true)
                     }
                 }
-                val useRealModel = modelServiceReady &&
+                val isOfflineSelected = selectedModel?.contains("on-device", ignoreCase = true) == true
+                val useRealModel = !isOfflineSelected && modelServiceReady &&
                     (toolAccessMode == ToolAccessMode.AUTO || toolAccessMode == ToolAccessMode.AUTOMATIC)
                 val response = if (useRealModel) {
                     bridgeClient.escalateWithOptions(
@@ -1343,7 +1349,7 @@ class AgentViewModel(
             is FeedItem.User           -> UserBubble(item.text)
             is FeedItem.Status         -> StatusCard(item.text, item.success, item.error)
             is FeedItem.Tool           -> ToolCard(item.text)
-            is FeedItem.Reply          -> Text(displayModelText(item.text), style = MaterialTheme.typography.bodyLarge)
+            is FeedItem.Reply          -> OnDeviceReplyCard(item.text)
             is FeedItem.Diff           -> DiffCard(item)
             is FeedItem.EscalatePrompt -> EscalatePromptCard(item) { agent.escalate(item.prompt, item.context, item.task) }
             is FeedItem.LaptopReply    -> LaptopReplyCard(item.text)
@@ -1509,6 +1515,34 @@ private fun displayModelText(text: String): String = text
  * Successful laptop bridge response.
  * Styled with a laptop icon + primary tint to visually distinguish from the offline reply above.
  */
+@Composable private fun OnDeviceReplyCard(text: String) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(10.dp),
+        modifier = Modifier.fillMaxWidth(),
+        tonalElevation = 2.dp
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.PhoneAndroid,
+                    contentDescription = null,
+                    tint = Color(0xFF54C878),
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    "On-Device (Qwen 1.5B)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color(0xFF54C878)
+                )
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(displayModelText(text), style = MaterialTheme.typography.bodyLarge)
+        }
+    }
+}
+
 @Composable private fun LaptopReplyCard(text: String) {
     Surface(
         color = MaterialTheme.colorScheme.surface,
@@ -1618,15 +1652,16 @@ private fun displayModelText(text: String): String = text
                         modifier = Modifier.padding(horizontal = 17.dp, vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        val isOffline = agent.selectedModel?.contains("on-device", ignoreCase = true) == true
                         Text(
-                            if (agent.modelServiceReady) "Connected coding model" else "Private offline fallback",
+                            if (isOffline) "On-device model (offline)" else if (agent.modelServiceReady) "Connected coding model" else "Private offline fallback",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodyMedium
                         )
                         Spacer(Modifier.weight(1f))
                         Text(
-                            if (agent.modelServiceReady) "Real model ready" else "Offline fallback",
-                            color = MaterialTheme.colorScheme.primary,
+                            if (isOffline) "Qwen 1.5B active" else if (agent.modelServiceReady) "Real model ready" else "Offline fallback",
+                            color = if (isOffline) Color(0xFF54C878) else MaterialTheme.colorScheme.primary,
                             fontWeight = FontWeight.SemiBold,
                             style = MaterialTheme.typography.bodyMedium
                         )
@@ -1675,10 +1710,11 @@ private fun displayModelText(text: String): String = text
                     Surface(
                         onClick = onModel,
                         color = MaterialTheme.colorScheme.surfaceVariant,
-                        shape = RoundedCornerShape(24.dp)
+                        shape = RoundedCornerShape(24.dp),
+                        modifier = Modifier.weight(1f, fill = false)
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 11.dp),
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
@@ -1687,11 +1723,17 @@ private fun displayModelText(text: String): String = text
                                 tint = MaterialTheme.colorScheme.primary,
                                 modifier = Modifier.size(17.dp)
                             )
-                            Spacer(Modifier.width(8.dp))
+                            Spacer(Modifier.width(6.dp))
+                            val displayModelName = when {
+                                agent.selectedModel == null -> "Select model"
+                                agent.selectedModel?.contains("on-device", ignoreCase = true) == true -> "Qwen 1.5B"
+                                else -> agent.selectedModel?.substringBefore(':') ?: "Select model"
+                            }
                             Text(
-                                agent.selectedModel?.substringBefore(':') ?: "Select model",
+                                displayModelName,
                                 fontWeight = FontWeight.Medium,
-                                maxLines = 1
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
                     }
@@ -1707,15 +1749,17 @@ private fun displayModelText(text: String): String = text
                     Spacer(Modifier.width(4.dp))
                     FilledIconButton(
                         onClick = {
-                            if (agent.composer.isBlank()) onVoice()
-                            else if (!agent.sending) {
+                            if (!agent.sending && agent.composer.isNotBlank()) {
                                 if (hapticEnabled) haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                                 send()
                             }
                         },
+                        enabled = agent.composer.isNotBlank() && !agent.sending,
                         colors = IconButtonDefaults.filledIconButtonColors(
-                            containerColor = if (agent.composer.isNotBlank()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
-                            contentColor = if (agent.composer.isNotBlank()) Color.White else MaterialTheme.colorScheme.surface
+                            containerColor = MaterialTheme.colorScheme.primary,
+                            contentColor = Color.White,
+                            disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                            disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
                         )
                     ) {
                         if (agent.sending) {
@@ -1726,8 +1770,8 @@ private fun displayModelText(text: String): String = text
                             )
                         } else {
                             Icon(
-                                if (agent.composer.isBlank()) Icons.Default.GraphicEq else Icons.AutoMirrored.Filled.Send,
-                                contentDescription = if (agent.composer.isBlank()) "Voice conversation" else "Send"
+                                Icons.AutoMirrored.Filled.Send,
+                                contentDescription = "Send"
                             )
                         }
                     }
@@ -3274,7 +3318,7 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                 Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
                     Column {
                         agent.availableModels.forEachIndexed { index, model ->
-                            Surface(onClick = { agent.selectModel(model) }, color = Color.Transparent) {
+                            Surface(onClick = { agent.selectModel(model); onDismiss() }, color = Color.Transparent) {
                                 Row(
                                     Modifier.fillMaxWidth().padding(18.dp),
                                     verticalAlignment = Alignment.CenterVertically
@@ -3301,7 +3345,7 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
             }
             if (agent.offlineModelReady) {
                 Spacer(Modifier.height(12.dp))
-                Surface(onClick = agent::selectOfflineModel, color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
+                Surface(onClick = { agent.selectOfflineModel(); onDismiss() }, color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
                     Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.PhoneAndroid, null, tint = Color(0xFF54C878))
                         Spacer(Modifier.width(14.dp))
