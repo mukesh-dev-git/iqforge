@@ -48,6 +48,12 @@ android {
             version = "3.22.1"
         }
     }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
 }
 
 dependencies {

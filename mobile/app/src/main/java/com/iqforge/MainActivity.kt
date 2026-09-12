@@ -322,6 +322,9 @@ class AgentViewModel(
     var modelServiceReady by mutableStateOf(false); private set
     var offlineModelReady by mutableStateOf(false); private set
     var offlineModelBytes by mutableStateOf(0L); private set
+    var isDownloadingModel by mutableStateOf(false); private set
+    var downloadProgress by mutableFloatStateOf(0f); private set
+    var downloadProgressStatus by mutableStateOf(""); private set
     var connectors by mutableStateOf<List<BridgeConnector>>(emptyList()); private set
     var chats by mutableStateOf<List<SavedChat>>(historyStore?.load().orEmpty()); private set
     var activeChatId by mutableStateOf<String?>(null); private set
@@ -379,6 +382,27 @@ class AgentViewModel(
 
     fun selectOfflineModel() {
         if (offlineModelReady) selectedModel = (codeEngine as? NativeEngine)?.displayName
+    }
+
+    fun startModelDownload() {
+        val nativeEngine = codeEngine as? NativeEngine ?: return
+        if (isDownloadingModel) return
+        isDownloadingModel = true
+        downloadProgress = 0f
+        downloadProgressStatus = "Starting download..."
+        viewModelScope.launch {
+            val ok = nativeEngine.downloadModel { progress, status ->
+                downloadProgress = progress
+                downloadProgressStatus = status
+            }
+            isDownloadingModel = false
+            if (ok) {
+                refreshOfflineModel()
+                feed += FeedItem.Status("Snapdragon Hexagon NPU model downloaded and active!", success = true)
+            } else {
+                feed += FeedItem.Status("Model download failed. Please verify connection and retry.", error = true)
+            }
+        }
     }
 
     fun updateComposer(value: String) { composer = value }
@@ -3364,17 +3388,47 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                 }
             }
             val isNpu = agent.isNpuActive
-            if (agent.offlineModelReady || isNpu) {
-                Spacer(Modifier.height(12.dp))
-                Surface(onClick = { agent.selectOfflineModel(); onDismiss() }, color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
-                    Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.PhoneAndroid, null, tint = Color(0xFF54C878))
-                        Spacer(Modifier.width(14.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(if (isNpu) "Qwen 1.5B (Snapdragon NPU)" else "Qwen2.5 Coder 1.5B", style = MaterialTheme.typography.titleMedium)
-                            Text(if (isNpu) "Hardware accelerated on Hexagon HTP • 23+ tokens/sec" else "On-device • ${agent.offlineModelBytes / 1_000_000} MB GGUF • works without internet", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                        if (agent.selectedModel?.contains("on-device") == true || agent.selectedModel?.contains("Snapdragon") == true) Icon(Icons.Default.Check, "Selected", tint = Color(0xFF54C878))
+            val hasModel = (agent.codeEngine as? NativeEngine)?.isModelAvailable() == true
+            Spacer(Modifier.height(12.dp))
+            Surface(
+                onClick = {
+                    if (agent.offlineModelReady || isNpu) {
+                        agent.selectOfflineModel()
+                        onDismiss()
+                    } else if (!hasModel) {
+                        agent.startModelDownload()
+                    } else {
+                        agent.refreshOfflineModel()
+                        onDismiss()
+                    }
+                },
+                color = MaterialTheme.colorScheme.surface,
+                shape = RoundedCornerShape(22.dp)
+            ) {
+                Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Default.PhoneAndroid,
+                        null,
+                        tint = if (isNpu || agent.offlineModelReady) Color(0xFF54C878) else MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(Modifier.width(14.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Qwen 1.5B (Snapdragon Hexagon NPU)", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            when {
+                                isNpu || agent.offlineModelReady -> "Hardware accelerated on Hexagon HTP • Pure NPU execution (23+ t/s)"
+                                agent.isDownloadingModel -> "Downloading model: ${(agent.downloadProgress * 100).toInt()}% (${agent.downloadProgressStatus})"
+                                !hasModel -> "Tap to download weights (1.1 GB) for Snapdragon NPU"
+                                else -> "Tap to initialize Snapdragon Hexagon NPU"
+                            },
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    if (agent.selectedModel?.contains("on-device") == true || agent.selectedModel?.contains("Snapdragon") == true) {
+                        Icon(Icons.Default.Check, "Selected", tint = Color(0xFF54C878))
+                    } else if (!hasModel && !agent.isDownloadingModel) {
+                        Icon(Icons.Default.Download, "Download", tint = MaterialTheme.colorScheme.primary)
                     }
                 }
             }
