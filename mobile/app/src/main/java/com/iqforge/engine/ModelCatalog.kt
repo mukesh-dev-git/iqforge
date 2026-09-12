@@ -47,8 +47,8 @@ object ModelCatalog {
         // Verify the exact filename on the repo's Files tab before downloading — quantizers
         // vary casing/naming (e.g. "Phi-4-mini-instruct-Q4_K_M.gguf"). Rename after download
         // to match `fileName` above exactly, since NativeEngine looks it up by that name.
-        sourceUrl = "https://huggingface.co/unsloth/Phi-4-mini-instruct-GGUF",
-        approxSizeBytes = 2_490_000_000L,
+        sourceUrl = "https://huggingface.co/unsloth/Phi-4-mini-instruct-GGUF/resolve/main/Phi-4-mini-instruct-Q4_K_M.gguf",
+        approxSizeBytes = 2_491_874_272L,
         promptStyle = PromptStyle.PHI,
     )
 
