@@ -24,7 +24,9 @@ open class GitHubApiClient(
         .readTimeout(15, TimeUnit.SECONDS)
         .callTimeout(20, TimeUnit.SECONDS)
         .build(),
-    private val json: Json = Json { ignoreUnknownKeys = true }
+    private val json: Json = Json { ignoreUnknownKeys = true },
+    private val tokenProvider: () -> String? = { null },
+    private val baseUrl: String = BASE_URL
 ) {
     open suspend fun listPullRequests(owner: String, repo: String): List<GitHubPullRequestSummaryDto> =
         json.decodeFromString(
@@ -38,6 +40,18 @@ open class GitHubApiClient(
             get("repos/$owner/$repo/pulls/$number")
         )
 
+    open suspend fun getPullRequestFiles(owner: String, repo: String, number: Int): List<GitHubPullRequestFileDto> =
+        json.decodeFromString(
+            ListSerializer(GitHubPullRequestFileDto.serializer()),
+            get("repos/$owner/$repo/pulls/$number/files?per_page=100")
+        )
+
+    open suspend fun getCheckRuns(owner: String, repo: String, ref: String): GitHubCheckRunsResponse =
+        json.decodeFromString(
+            GitHubCheckRunsResponse.serializer(),
+            get("repos/$owner/$repo/commits/$ref/check-runs")
+        )
+
     open suspend fun listIssues(owner: String, repo: String): List<GitHubIssueDto> =
         json.decodeFromString(
             ListSerializer(GitHubIssueDto.serializer()),
@@ -45,13 +59,15 @@ open class GitHubApiClient(
         ).filter { it.pullRequest == null }
 
     private suspend fun get(path: String): String = withContext(Dispatchers.IO) {
-        val request = Request.Builder()
-            .url("$BASE_URL/$path")
+        val requestBuilder = Request.Builder()
+            .url("${baseUrl.trimEnd('/')}/$path")
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .header("User-Agent", "iQForge-Android")
-            .get()
-            .build()
+        tokenProvider()?.trim()?.takeIf { it.isNotEmpty() }?.let {
+            requestBuilder.header("Authorization", "Bearer $it")
+        }
+        val request = requestBuilder.get().build()
         client.newCall(request).execute().use { response ->
             val body = response.body?.string().orEmpty()
             if (response.code == 403) {
@@ -86,7 +102,10 @@ data class GitHubLabelDto(
 )
 
 @Serializable
-data class GitHubBranchRefDto(val ref: String)
+data class GitHubBranchRefDto(
+    val ref: String,
+    val sha: String = ""
+)
 
 @Serializable
 data class GitHubPullRequestSummaryDto(
@@ -115,8 +134,35 @@ data class GitHubPullRequestDetailDto(
     val additions: Int = 0,
     val deletions: Int = 0,
     @SerialName("changed_files") val changedFiles: Int = 0,
+    val mergeable: Boolean? = null,
+    @SerialName("mergeable_state") val mergeableState: String = "unknown",
     val base: GitHubBranchRefDto,
     val head: GitHubBranchRefDto
+)
+
+@Serializable
+data class GitHubPullRequestFileDto(
+    val filename: String,
+    val status: String,
+    val additions: Int = 0,
+    val deletions: Int = 0,
+    val changes: Int = 0,
+    val patch: String? = null
+)
+
+@Serializable
+data class GitHubCheckRunsResponse(
+    @SerialName("total_count") val totalCount: Int = 0,
+    @SerialName("check_runs") val checkRuns: List<GitHubCheckRunDto> = emptyList()
+)
+
+@Serializable
+data class GitHubCheckRunDto(
+    val id: Long,
+    val name: String,
+    val status: String,
+    val conclusion: String? = null,
+    @SerialName("html_url") val htmlUrl: String? = null
 )
 
 @Serializable

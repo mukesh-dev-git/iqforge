@@ -3616,8 +3616,12 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
     github.selectedPullRequest?.let { pr ->
         PullRequestDetailDialog(
             pr,
+            files = github.selectedPullRequestFiles,
+            readiness = github.reviewReadiness,
             onDismiss = github::clearSelection,
-            onReview = { startReview(buildPullRequestReviewPrompt(github.repoRef!!.fullName, pr)) }
+            onReview = {
+                startReview(buildPullRequestReviewPrompt(github.repoRef!!.fullName, pr, github.selectedPullRequestFiles))
+            }
         )
     }
     github.selectedIssue?.let { issue ->
@@ -5012,8 +5016,10 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
     github.selectedPullRequest?.let { pr ->
         PullRequestDetailDialog(
             pr,
+            files = github.selectedPullRequestFiles,
+            readiness = github.reviewReadiness,
             onDismiss = github::clearSelection,
-            onReview = { startReview(buildPullRequestReviewPrompt(repoFullName, pr)) }
+            onReview = { startReview(buildPullRequestReviewPrompt(repoFullName, pr, github.selectedPullRequestFiles)) }
         )
     }
     github.selectedIssue?.let { issue ->
@@ -5090,11 +5096,22 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
     }
 }
 
-private fun buildPullRequestReviewPrompt(repoFullName: String, pr: GitHubPullRequestDetailDto): String = buildString {
+private fun buildPullRequestReviewPrompt(
+    repoFullName: String,
+    pr: GitHubPullRequestDetailDto,
+    files: List<com.iqforge.github.GitHubPullRequestFileDto>
+): String = buildString {
     append("Review GitHub pull request #${pr.number} in $repoFullName: \"${pr.title}\"\n")
     append("Branch: ${pr.head.ref} -> ${pr.base.ref} · +${pr.additions} -${pr.deletions} across ${pr.changedFiles} files\n\n")
+    if (pr.head.sha.isNotBlank()) append("Reviewed head commit: ${pr.head.sha}\n\n")
     if (!pr.body.isNullOrBlank()) append("${pr.body}\n\n")
-    append("Explore this repository's code relevant to this branch and give a thorough review: correctness, edge cases, and style. Suggest concrete improvements.")
+    append("Review the actual changed lines below for correctness, security, and edge cases. ")
+    append("For every finding, name the file and added line. Do not invent issues outside this patch.\n\n")
+    files.forEach { file ->
+        append("FILE: ${file.filename} (${file.status}, +${file.additions} -${file.deletions})\n")
+        append(file.patch ?: "[Patch unavailable: binary or too large for GitHub's patch response]")
+        append("\n\n")
+    }
 }
 
 private fun buildIssueReviewPrompt(repoFullName: String, issue: GitHubIssueDto): String = buildString {
@@ -5103,7 +5120,13 @@ private fun buildIssueReviewPrompt(repoFullName: String, issue: GitHubIssueDto):
     append("Explore this repository, find the root cause, and propose a concrete fix.")
 }
 
-@Composable private fun PullRequestDetailDialog(pr: GitHubPullRequestDetailDto, onDismiss: () -> Unit, onReview: (() -> Unit)? = null) {
+@Composable private fun PullRequestDetailDialog(
+    pr: GitHubPullRequestDetailDto,
+    files: List<com.iqforge.github.GitHubPullRequestFileDto> = emptyList(),
+    readiness: com.iqforge.github.PullRequestReadiness? = null,
+    onDismiss: () -> Unit,
+    onReview: (() -> Unit)? = null
+) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("#${pr.number} ${pr.title}") },
@@ -5121,11 +5144,33 @@ private fun buildIssueReviewPrompt(repoFullName: String, issue: GitHubIssueDto):
                     "+${pr.additions} / -${pr.deletions} · ${pr.changedFiles} files changed",
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                readiness?.let {
+                    val conflictLabel = when (it.hasConflicts) {
+                        false -> "No conflicts"
+                        true -> "Conflicts detected"
+                        null -> "Conflict check pending"
+                    }
+                    Text(
+                        "$conflictLabel · Checks ${it.checksState.name.lowercase()} · ${it.changedLines} lines loaded",
+                        color = if (it.hasConflicts == true) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
+                if (files.any { it.patch.isNullOrBlank() }) {
+                    Text(
+                        "Some file patches are unavailable; iQForge will block a complete patch review.",
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
                 if (!pr.body.isNullOrBlank()) Text(pr.body)
             }
         },
         confirmButton = {
-            if (onReview != null) Button(onClick = { onDismiss(); onReview() }) {
+            if (onReview != null) Button(
+                onClick = { onDismiss(); onReview() },
+                enabled = readiness?.patchAvailable == true
+            ) {
                 Icon(Icons.Default.Code, null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
                 Text("Review")
