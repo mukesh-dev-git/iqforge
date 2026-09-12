@@ -529,35 +529,106 @@ class AgentViewModel(
 
     fun closeCodeSession() { activeCodeSessionId = null }
 
+    /**
+     * Default path is the on-device model — it does the actual review/write/debug/explain
+     * reasoning, matching the "phone is the dev workstation" pitch. The laptop bridge is used
+     * only for two narrow things: (1) reading the raw text of a file the user names, since the
+     * cloned repo currently lives on the laptop's disk, not the phone's, and (2) genuinely
+     * bigger tasks — an explicit "/" shell/dispatch command, a build/test run, or an explicit
+     * "/escalate" ask for a deeper laptop-model pass. If the bridge is unreachable, file-text
+     * fetch fails gracefully and the local model still answers, just without that file's exact
+     * contents — it never hard-fails just because the laptop is offline.
+     */
     fun sendCodeSessionMessage(text: String) {
         val id = activeCodeSessionId ?: return
         val session = codeSessions.firstOrNull { it.id == id } ?: return
-        if (text.isBlank() || codeSessionBusy) return
-        codeSessions = codeSessionStore?.append(id, "user", text.trim()).orEmpty()
+        val trimmed = text.trim()
+        if (trimmed.isBlank() || codeSessionBusy) return
+        codeSessions = codeSessionStore?.append(id, "user", trimmed).orEmpty()
         codeSessionBusy = true
         viewModelScope.launch {
+            var replyRole = "assistant"
             val response = try {
-                val explicit = text.trim().removePrefix("/")
-                val plan = bridgeClient.planDispatch(bridgeUrl, explicit, session.workspace)
-                if (plan.executable && plan.command != null) {
-                    val result = bridgeClient.execute(bridgeUrl, plan.command, session.workspace)
-                    buildString {
-                        append(plan.summary).append("\n\n$ ").append(plan.command).append('\n')
-                        append((result.stdout + result.stderr).trim())
-                        append("\n\nExit ").append(result.exitCode)
+                when {
+                    trimmed.startsWith("/escalate", ignoreCase = true) -> {
+                        replyRole = "laptop"
+                        val instruction = trimmed.drop("/escalate".length).trim()
+                            .ifBlank { session.messages.lastOrNull { it.role == "user" }?.text ?: trimmed }
+                        bridgeClient.escalateWithOptions(
+                            bridgeUrl, BridgeTask.WRITE,
+                            "Repository: ${session.repository}\nWorkspace: ${session.workspace}",
+                            instruction, effort.wireName
+                        )
                     }
-                } else {
-                    bridgeClient.escalateWithOptions(
-                        bridgeUrl, BridgeTask.WRITE,
-                        "Repository: ${session.repository}\nWorkspace: ${session.workspace}",
-                        text.trim(), effort.wireName
-                    )
+                    trimmed.startsWith("/") -> {
+                        replyRole = "laptop"
+                        val explicit = trimmed.removePrefix("/")
+                        val plan = bridgeClient.planDispatch(bridgeUrl, explicit, session.workspace)
+                        if (plan.executable && plan.command != null) {
+                            val result = bridgeClient.execute(bridgeUrl, plan.command, session.workspace)
+                            buildString {
+                                append(plan.summary).append("\n\n$ ").append(plan.command).append('\n')
+                                append((result.stdout + result.stderr).trim())
+                                append("\n\nExit ").append(result.exitCode)
+                            }
+                        } else {
+                            bridgeClient.escalateWithOptions(
+                                bridgeUrl, BridgeTask.WRITE,
+                                "Repository: ${session.repository}\nWorkspace: ${session.workspace}",
+                                explicit, effort.wireName
+                            )
+                        }
+                    }
+                    looksLikeBigTask(trimmed) -> {
+                        replyRole = "laptop"
+                        bridgeClient.escalateWithOptions(
+                            bridgeUrl, BridgeTask.WRITE,
+                            "Repository: ${session.repository}\nWorkspace: ${session.workspace}",
+                            trimmed, effort.wireName
+                        )
+                    }
+                    else -> {
+                        val task = inferTask(trimmed)
+                        val knownFiles = remoteFiles.ifEmpty {
+                            runCatching { bridgeClient.workspaceFiles(bridgeUrl, session.workspace) }.getOrNull().orEmpty()
+                        }
+                        val mentionedFile = knownFiles.firstOrNull { trimmed.contains(it, ignoreCase = true) }
+                        val fileText = mentionedFile?.let {
+                            runCatching { bridgeClient.workspaceFile(bridgeUrl, session.workspace, it) }.getOrNull()
+                        }.orEmpty()
+                        val header = "Repository: ${session.repository}\nWorkspace: ${session.workspace}" +
+                            (mentionedFile?.let { "\nFile: $it" } ?: "")
+                        val enrichedContext = if (fileText.isNotBlank()) "$header\n\n$fileText" else header
+                        val local = when (task) {
+                            BridgeTask.REVIEW -> {
+                                val findings = codeEngine.review(fileText.ifBlank { trimmed })
+                                if (findings.isEmpty()) "No issues found."
+                                else findings.joinToString("\n") { "Line ${it.line}: [${it.severity}] ${it.message}" }
+                            }
+                            BridgeTask.DEBUG -> codeEngine.debug(trimmed, enrichedContext)
+                            BridgeTask.EXPLAIN -> codeEngine.explain(
+                                if (enrichedContext.isNotBlank()) "Context:\n$enrichedContext\n\nQuestion:\n$trimmed" else trimmed
+                            )
+                            BridgeTask.WRITE -> codeEngine.write(trimmed, enrichedContext)
+                        }
+                        if (fileText.lines().size > 40) {
+                            "$local\n\n(This file is large — reply with \"/escalate\" to ask the laptop for a deeper pass.)"
+                        } else local
+                    }
                 }
             } catch (error: Exception) { "ERROR: ${error.message ?: "Code agent failed"}" }
-            codeSessions = codeSessionStore?.append(id, "assistant", response).orEmpty()
+            codeSessions = codeSessionStore?.append(id, replyRole, response).orEmpty()
             codeSessionBusy = false
             refreshRemoteFiles(session.workspace)
         }
+    }
+
+    private fun looksLikeBigTask(text: String): Boolean {
+        val lower = text.lowercase()
+        return listOf(
+            "run test", "run tests", "pytest", "npm test", "npm run", "npm install",
+            "gradle", "gradlew", "pip install", "build the project", "run the app", "compile"
+        ).any { it in lower }
     }
 
     fun cloneRemoteRepository(root: String, url: String) {
@@ -2899,8 +2970,11 @@ private fun displayModelText(text: String): String = text.trim()
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 items(session.messages) { message ->
-                    if (message.role == "user") UserBubble(message.text)
-                    else LaptopReplyCard(message.text)
+                    when (message.role) {
+                        "user" -> UserBubble(message.text)
+                        "laptop" -> LaptopReplyCard(message.text)
+                        else -> OnDeviceReplyCard(message.text, agent)
+                    }
                 }
                 if (agent.codeSessionBusy) item { ThinkingIndicator() }
                 item { Spacer(Modifier.height(4.dp)) }
