@@ -274,43 +274,46 @@ class NativeEngine(private val context: Context) : CodeEngine {
         val modelsDir = getModelsDir()
         val targetFile = File(modelsDir, targetModel.fileName)
         val tempFile = File(modelsDir, "${targetModel.fileName}.download")
+        val existingBytes = if (tempFile.exists()) tempFile.length() else 0L
         try {
-            if (tempFile.exists()) tempFile.delete()
-            val request = Request.Builder()
+            val requestBuilder = Request.Builder()
                 .url(targetModel.sourceUrl)
                 .header("User-Agent", "Mozilla/5.0 (Android; Mobile)")
-                .build()
+            if (existingBytes > 0) {
+                requestBuilder.header("Range", "bytes=$existingBytes-")
+            }
+            val request = requestBuilder.build()
             downloadHttpClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     Log.e("NativeEngine", "Model download failed: HTTP ${response.code} ${response.message}")
                     return@withContext false
                 }
                 val body = response.body ?: return@withContext false
-                val contentLength = body.contentLength()
-                Log.i("NativeEngine", "Starting download: ${targetModel.fileName}, length = $contentLength")
+                val isResume = response.code == 206
+                val totalExpected = if (isResume) existingBytes + body.contentLength() else body.contentLength()
+                Log.i("NativeEngine", "Downloading ${targetModel.fileName}, resume=$isResume, total=$totalExpected, existing=$existingBytes")
                 body.byteStream().use { input ->
-                    FileOutputStream(tempFile).use { output ->
+                    FileOutputStream(tempFile, isResume).use { output ->
                         val buffer = ByteArray(128 * 1024)
                         var bytesRead: Int
-                        var totalRead = 0L
+                        var totalRead = if (isResume) existingBytes else 0L
                         var lastReport = 0L
                         while (input.read(buffer).also { bytesRead = it } != -1) {
                             output.write(buffer, 0, bytesRead)
                             totalRead += bytesRead
                             val now = System.currentTimeMillis()
                             if (now - lastReport > 200) {
-                                val progress = if (contentLength > 0) totalRead.toFloat() / contentLength else 0f
+                                val progress = if (totalExpected > 0) totalRead.toFloat() / totalExpected else 0f
                                 val mbRead = totalRead / (1024 * 1024)
-                                val totalMb = contentLength / (1024 * 1024)
+                                val totalMb = totalExpected / (1024 * 1024)
                                 onProgress(progress, "$mbRead MB / $totalMb MB")
                                 lastReport = now
                             }
                         }
                     }
                 }
-                if (contentLength > 0 && tempFile.length() < contentLength * 0.95) {
-                    Log.e("NativeEngine", "Downloaded file incomplete (${tempFile.length()} / $contentLength)")
-                    tempFile.delete()
+                if (totalExpected > 0 && tempFile.length() < totalExpected * 0.95) {
+                    Log.e("NativeEngine", "Downloaded file incomplete (${tempFile.length()} / $totalExpected)")
                     return@withContext false
                 }
                 if (targetFile.exists()) targetFile.delete()
@@ -319,8 +322,7 @@ class NativeEngine(private val context: Context) : CodeEngine {
                 switchActiveModel(targetModel)
             }
         } catch (e: Exception) {
-            Log.e("NativeEngine", "Model download failed", e)
-            tempFile.delete()
+            Log.e("NativeEngine", "Model download interrupted: ${e.message}")
             false
         }
     }

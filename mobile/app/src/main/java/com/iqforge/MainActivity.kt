@@ -2703,31 +2703,43 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
                     color = MaterialTheme.colorScheme.surfaceVariant,
                     shape = RoundedCornerShape(24.dp)
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 17.dp, vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        val isNpu = agent.isNpuActive
-                        val isOffline = isNpu || agent.selectedModel?.contains("on-device", ignoreCase = true) == true ||
-                            agent.selectedModel?.contains("Snapdragon", ignoreCase = true) == true
-                        Text(
-                            if (isNpu) "Snapdragon NPU active (HTP v81)"
-                            else if (isOffline) "On-device model (offline)"
-                            else if (agent.modelServiceReady) "Connected coding model"
-                            else "Private offline fallback",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                        Spacer(Modifier.weight(1f))
-                        Text(
-                            if (isNpu) (agent.lastNpuTokensPerSec?.let { "${String.format(java.util.Locale.US, "%.1f", it)} t/s NPU" } ?: "NPU active")
-                            else if (isOffline) "${agent.offlineModelName?.substringBefore(" (") ?: "On-device"} active"
-                            else if (agent.modelServiceReady) "Real model ready"
-                            else "Offline fallback",
-                            color = if (isOffline) Color(0xFF54C878) else MaterialTheme.colorScheme.primary,
-                            fontWeight = FontWeight.SemiBold,
-                            style = MaterialTheme.typography.bodyMedium
-                        )
+                    Column {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 17.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            val isNpu = agent.isNpuActive
+                            val isOffline = isNpu || agent.selectedModel?.contains("on-device", ignoreCase = true) == true ||
+                                agent.selectedModel?.contains("Snapdragon", ignoreCase = true) == true
+                            Text(
+                                if (agent.isDownloadingModel) "Downloading ${agent.catalogModels.find { it.id == agent.downloadingModelId }?.displayName?.substringBefore(" (") ?: "Model"}…"
+                                else if (isNpu) "Snapdragon NPU active (HTP v81)"
+                                else if (isOffline) "On-device model (offline)"
+                                else if (agent.modelServiceReady) "Connected coding model"
+                                else "Private offline fallback",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Spacer(Modifier.weight(1f))
+                            Text(
+                                if (agent.isDownloadingModel) "${(agent.downloadProgress * 100).toInt()}% (${agent.downloadProgressStatus})"
+                                else if (isNpu) (agent.lastNpuTokensPerSec?.let { "${String.format(java.util.Locale.US, "%.1f", it)} t/s NPU" } ?: "NPU active")
+                                else if (isOffline) "${agent.offlineModelName?.substringBefore(" (") ?: "On-device"} active"
+                                else if (agent.modelServiceReady) "Real model ready"
+                                else "Offline fallback",
+                                color = if (agent.isDownloadingModel) MaterialTheme.colorScheme.primary else if (isOffline) Color(0xFF54C878) else MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.SemiBold,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                        if (agent.isDownloadingModel) {
+                            LinearProgressIndicator(
+                                progress = { agent.downloadProgress },
+                                modifier = Modifier.fillMaxWidth().height(3.dp),
+                                color = MaterialTheme.colorScheme.primary,
+                                trackColor = MaterialTheme.colorScheme.surfaceVariant
+                            )
+                        }
                     }
                 }
 
