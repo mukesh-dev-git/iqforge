@@ -30,6 +30,10 @@ android {
     buildFeatures {
         compose = true
     }
+
+    androidResources {
+        noCompress += "gguf"
+    }
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.14"
     }
