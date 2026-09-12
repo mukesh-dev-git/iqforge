@@ -82,24 +82,29 @@ class NativeEngine(private val context: Context) : CodeEngine {
     private var serverProcess: Process? = null
 
     suspend fun checkNpuHealth(): Boolean = withContext(Dispatchers.IO) {
-        try {
-            val request = Request.Builder()
-                .url("http://127.0.0.1:8080/health")
-                .get()
-                .build()
-            httpClient.newCall(request).execute().use { response ->
-                isNpuActive = response.isSuccessful
-                if (isNpuActive) isReady = true
-                isNpuActive
-            }
-        } catch (e: Exception) {
-            isNpuActive = false
-            false
-        }
+        val alive = NpuDaemonManager.isServerAlive()
+        isNpuActive = alive
+        if (alive) isReady = true
+        alive
     }
 
     suspend fun ensureNpuDaemonRunning(): Boolean = withContext(Dispatchers.IO) {
         if (checkNpuHealth()) return@withContext true
+
+        val targetModelPath = when {
+            File("/data/local/tmp/gguf/${activeModel.fileName}").exists() ->
+                "/data/local/tmp/gguf/${activeModel.fileName}"
+            File(context.filesDir, activeModel.fileName).exists() ->
+                File(context.filesDir, activeModel.fileName).absolutePath
+            else -> "/data/local/tmp/gguf/${activeModel.fileName}"
+        }
+
+        // Standalone on-device NPU wakeup via Shizuku shell (zero PC / ADB required)
+        if (NpuDaemonManager.ensureNpuAwake(targetModelPath)) {
+            isNpuActive = true
+            isReady = true
+            return@withContext true
+        }
 
         // Retry quick health checks in case daemon was just launched or processing
         for (attempt in 1..4) {
@@ -125,26 +130,42 @@ class NativeEngine(private val context: Context) : CodeEngine {
     }
 
     /**
-     * Switches which catalog model subsequent initialize()/downloadModel() calls target. Resets
-     * readiness so the NPU daemon (bound to whatever GGUF it was launched with) gets relaunched
-     * against the newly selected model rather than silently continuing to serve the old one.
+     * Switches which catalog model subsequent initialize()/downloadModel() calls target.
      */
     fun selectCatalogModel(model: ModelInfo) {
         if (activeModel.id == model.id) return
-        // A daemon already running is bound to the OLD model's weights — ensureNpuDaemonRunning()
-        // would otherwise see it as healthy and skip relaunching, silently keeping the old model.
-        serverProcess?.destroy()
-        serverProcess = null
         activeModel = model
         isReady = false
         isNpuActive = false
     }
 
-    suspend fun downloadModel(onProgress: (Float, String) -> Unit): Boolean = withContext(Dispatchers.IO) {
-        val targetFile = File(context.filesDir, activeModel.fileName)
-        val tempFile = File(context.filesDir, "${activeModel.fileName}.download")
+    /**
+     * Cleanly switches the active model: kills the current NPU daemon instance,
+     * updates activeModel, and spawns the daemon with the new weights.
+     */
+    suspend fun switchActiveModel(model: ModelInfo): Boolean = withContext(Dispatchers.IO) {
+        if (!isCatalogModelAvailable(model)) return@withContext false
+        if (activeModel.id == model.id && isReady && isNpuActive) return@withContext true
+
+        activeModel = model
+        isReady = false
+        isNpuActive = false
+
+        // Terminate existing daemon so it relaunches bound to the new model's weights
+        NpuDaemonManager.stopServer()
+        kotlinx.coroutines.delay(400)
+
+        ensureNpuDaemonRunning()
+    }
+
+    suspend fun downloadModel(
+        targetModel: ModelInfo = activeModel,
+        onProgress: (Float, String) -> Unit
+    ): Boolean = withContext(Dispatchers.IO) {
+        val targetFile = File(context.filesDir, targetModel.fileName)
+        val tempFile = File(context.filesDir, "${targetModel.fileName}.download")
         try {
-            val request = Request.Builder().url(activeModel.sourceUrl).build()
+            val request = Request.Builder().url(targetModel.sourceUrl).build()
             httpClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) return@withContext false
                 val body = response.body ?: return@withContext false
@@ -171,7 +192,7 @@ class NativeEngine(private val context: Context) : CodeEngine {
                 }
                 if (targetFile.exists()) targetFile.delete()
                 tempFile.renameTo(targetFile)
-                initialize()
+                switchActiveModel(targetModel)
             }
         } catch (e: Exception) {
             Log.e("NativeEngine", "Model download failed", e)

@@ -6,6 +6,8 @@ import android.content.Context
 import android.content.Intent
 import android.app.Application
 import android.Manifest
+import rikka.shizuku.Shizuku
+import com.iqforge.engine.NpuDaemonManager
 import android.net.Uri
 import android.provider.Settings
 import android.speech.RecognizerIntent
@@ -130,7 +132,21 @@ private enum class AppDestination { CHATS, DISPATCH, COWORK, PROJECTS, PROJECT_D
 private enum class SettingsDialog { NONE, USAGE, CAPABILITIES, COLOR, FONT, VOICE, PRIVACY, DEVICE }
 
 class MainActivity : ComponentActivity() {
-    override fun onCreate(savedInstanceState: Bundle?) = super.onCreate(savedInstanceState).also {
+    private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { _, grantResult ->
+        if (grantResult == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            android.util.Log.i("MainActivity", "Shizuku permission granted! Snapdragon Hexagon NPU ready.")
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        try {
+            Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
+            if (NpuDaemonManager.isShizukuAvailable() && !NpuDaemonManager.hasShizukuPermission()) {
+                NpuDaemonManager.requestShizukuPermission()
+            }
+        } catch (_: Throwable) {}
+
         setContent {
             ForgeTheme { appearance, updateAppearance, fontChoice, updateFontChoice ->
                 var showSplash by remember { mutableStateOf(true) }
@@ -143,6 +159,13 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try {
+            Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener)
+        } catch (_: Throwable) {}
     }
 }
 
@@ -422,56 +445,70 @@ class AgentViewModel(
         (codeEngine as? NativeEngine)?.isCatalogModelAvailable(model) == true
 
     var isActivatingModel by mutableStateOf(false); private set
+    var downloadingModelId by mutableStateOf<String?>(null); private set
+    private var downloadJob: kotlinx.coroutines.Job? = null
+
+    fun cancelModelDownload() {
+        downloadJob?.cancel()
+        downloadJob = null
+        isDownloadingModel = false
+        downloadingModelId = null
+        downloadProgress = 0f
+        downloadProgressStatus = ""
+    }
 
     /**
-     * Switch which on-device model is active. Downloaded already -> activate it (and relaunch
-     * the NPU daemon against it), tracked via isActivatingModel so the sheet can show progress
-     * instead of silently doing nothing while ensureNpuDaemonRunning() spawns the daemon (can
-     * take several seconds) — and surface a real error if it fails, rather than leaving the row
-     * stuck on "tap to activate" with no explanation. Not downloaded -> fetch it first;
-     * startModelDownload() already activates whatever NativeEngine.activeModel is once the
-     * download finishes.
+     * Switch which on-device model is active. If downloaded, switches to it immediately
+     * and restarts the Hexagon NPU daemon with its weights. If not downloaded, begins
+     * downloading it while keeping the currently active model usable.
      */
     fun selectCatalogModel(model: ModelInfo) {
         val nativeEngine = codeEngine as? NativeEngine ?: return
-        if (isDownloadingModel || isActivatingModel) return
-        nativeEngine.selectCatalogModel(model)
-        if (nativeEngine.isModelAvailable()) {
+        if (isActivatingModel) return
+
+        if (nativeEngine.isCatalogModelAvailable(model)) {
+            // Cancel any background download of other models so user immediately switches
+            if (isDownloadingModel) {
+                cancelModelDownload()
+            }
             isActivatingModel = true
             viewModelScope.launch {
-                val ready = nativeEngine.initialize()
+                val ready = nativeEngine.switchActiveModel(model)
                 offlineModelReady = ready
                 offlineModelBytes = nativeEngine.installedModelBytes()
                 offlineModelName = if (ready) nativeEngine.displayName else null
-                if (ready && selectedModel == null) selectedModel = nativeEngine.displayName
+                if (ready) selectedModel = nativeEngine.displayName
                 isActivatingModel = false
                 if (!ready) {
                     feed += FeedItem.Status(
-                        "Couldn't start ${model.displayName} on the Hexagon NPU — the daemon didn't come up in time. Try again, or check the phone isn't thermal-throttled.",
+                        "Couldn't start ${model.displayName} on the Hexagon NPU — the daemon didn't come up in time.",
                         error = true
                     )
                 }
             }
         } else {
-            startModelDownload()
+            if (isDownloadingModel) return
+            startModelDownload(model)
         }
     }
 
-    fun startModelDownload() {
+    fun startModelDownload(targetModel: ModelInfo = (codeEngine as? NativeEngine)?.activeModelInfo ?: ModelCatalog.QWEN_1_5B) {
         val nativeEngine = codeEngine as? NativeEngine ?: return
         if (isDownloadingModel) return
         isDownloadingModel = true
+        downloadingModelId = targetModel.id
         downloadProgress = 0f
         downloadProgressStatus = "Starting download..."
-        viewModelScope.launch {
-            val ok = nativeEngine.downloadModel { progress, status ->
+        downloadJob = viewModelScope.launch {
+            val ok = nativeEngine.downloadModel(targetModel) { progress, status ->
                 downloadProgress = progress
                 downloadProgressStatus = status
             }
             isDownloadingModel = false
+            downloadingModelId = null
             if (ok) {
                 refreshOfflineModel()
-                feed += FeedItem.Status("Snapdragon Hexagon NPU model downloaded and active!", success = true)
+                feed += FeedItem.Status("${targetModel.displayName} downloaded and active on Snapdragon Hexagon NPU!", success = true)
             } else {
                 feed += FeedItem.Status("Model download failed. Please verify connection and retry.", error = true)
             }
@@ -5195,19 +5232,15 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
             Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
                 Column {
                     agent.catalogModels.forEachIndexed { index, model ->
-                        val isActive = model.id == agent.activeCatalogModelId
+                        val isActive = model.id == agent.activeCatalogModelId && agent.offlineModelReady
                         val isDownloaded = agent.isCatalogModelDownloaded(model)
-                        val isDownloadingThis = agent.isDownloadingModel && isActive
-                        val isActivatingThis = agent.isActivatingModel && isActive
+                        val isDownloadingThis = agent.isDownloadingModel && model.id == agent.downloadingModelId
+                        val isActivatingThis = agent.isActivatingModel && model.id == agent.activeCatalogModelId
                         Surface(
                             onClick = {
-                                if (agent.isDownloadingModel || agent.isActivatingModel) return@Surface
+                                if (agent.isActivatingModel) return@Surface
                                 if (isActive && agent.offlineModelReady) {
                                     agent.selectOfflineModel(); onDismiss()
-                                } else if (isDownloaded) {
-                                    // Don't dismiss yet — stay open showing "Activating…" until
-                                    // selectCatalogModel's coroutine resolves, success or failure.
-                                    agent.selectCatalogModel(model)
                                 } else {
                                     agent.selectCatalogModel(model)
                                 }
@@ -5228,12 +5261,12 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                                     )
                                     Text(
                                         when {
+                                            isActivatingThis -> "Activating on Hexagon NPU… this can take a few seconds"
+                                            isDownloadingThis -> "Downloading: ${(agent.downloadProgress * 100).toInt()}% (${agent.downloadProgressStatus})"
                                             isActive && isNpu -> agent.lastNpuTokensPerSec?.let {
                                                 "Hardware accelerated on Hexagon HTP • ${String.format(java.util.Locale.US, "%.1f", it)} tokens/sec"
                                             } ?: "Hardware accelerated on Hexagon HTP • Pure NPU"
                                             isActive && agent.offlineModelReady -> "Active • ${agent.offlineModelBytes / 1_000_000} MB GGUF • Pure NPU execution"
-                                            isActivatingThis -> "Activating on Hexagon NPU… this can take a few seconds"
-                                            isDownloadingThis -> "Downloading: ${(agent.downloadProgress * 100).toInt()}% (${agent.downloadProgressStatus})"
                                             isDownloaded -> "Downloaded • tap to activate"
                                             else -> "Tap to download (${String.format(java.util.Locale.US, "%.1f", model.approxSizeBytes / 1_000_000_000.0)} GB)"
                                         },
@@ -5242,9 +5275,13 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                                     )
                                 }
                                 when {
-                                    isActive && (agent.offlineModelReady || isNpu) -> Icon(Icons.Default.Check, "Active", tint = Color(0xFF54C878))
                                     isActivatingThis -> CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                                    isDownloadingThis -> Unit
+                                    isDownloadingThis -> {
+                                        TextButton(onClick = { agent.cancelModelDownload() }) {
+                                            Text("Cancel", color = MaterialTheme.colorScheme.error)
+                                        }
+                                    }
+                                    isActive && (agent.offlineModelReady || isNpu) -> Icon(Icons.Default.Check, "Active", tint = Color(0xFF54C878))
                                     !isDownloaded -> Icon(Icons.Default.Download, "Download", tint = MaterialTheme.colorScheme.primary)
                                     else -> Unit
                                 }
