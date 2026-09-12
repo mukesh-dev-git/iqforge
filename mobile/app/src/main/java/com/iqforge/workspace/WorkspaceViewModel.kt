@@ -86,8 +86,13 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
         token: String = "",
         onComplete: ((Repo) -> Unit)? = null
     ) = runOperation("Cloning repository…") {
-        if (token.isNotBlank()) repoManager.updateCredentials(username, token)
-        else applyCredentials()
+        if (token.isNotBlank()) {
+            preferences.edit()
+                .putString("github_token", token.trim())
+                .putString("github_username", username.trim())
+                .apply()
+            repoManager.updateCredentials(username.trim(), token.trim())
+        } else applyCredentials()
         val name = RepositoryPaths.repositoryName(url)
         val destination = RepositoryPaths.uniqueCloneDirectory(workspaceRoot, name)
         val repo = repoManager.clone(url.trim(), destination)
@@ -97,7 +102,6 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
                 repo = repo,
                 repositories = (mutableState.value.repositories.filterNot { it.root == repo.root } + repo)
                     .sortedBy { it.name.lowercase() },
-                githubToken = "",
                 entries = files.visibleEntries(repo.root, emptySet()),
                 artifacts = files.artifactFiles(repo.root),
                 projectMetadata = metadata,
@@ -271,10 +275,11 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun commit() {
+    fun commit(customMessage: String = "") {
         val repo = mutableState.value.repo ?: return
+        val msg = customMessage.trim().ifBlank { mutableState.value.commitMessage }.ifBlank { "Update from IQForge mobile agent" }
         runOperation("Creating commit…") {
-            repoManager.commit(repo, mutableState.value.commitMessage, emptyList())
+            repoManager.commit(repo, msg, emptyList())
             withContext(Dispatchers.Main) {
                 mutableState.value = mutableState.value.copy(
                     commitMessage = "",
@@ -285,24 +290,42 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun push() {
+    fun push(token: String = "") {
         val repo = mutableState.value.repo ?: return
         runOperation("Pushing to remote…") {
-            applyCredentials()
+            if (token.isNotBlank()) {
+                preferences.edit().putString("github_token", token.trim()).apply()
+                repoManager.updateCredentials("", token.trim())
+            } else {
+                applyCredentials()
+            }
             repoManager.push(repo)
             withContext(Dispatchers.Main) {
                 mutableState.value = mutableState.value.copy(
-                    githubToken = "",
-                    message = "Push completed",
+                    message = "Push completed to GitHub",
                     error = null
                 )
             }
         }
     }
 
+    fun hasSavedToken(): Boolean = preferences.getString("github_token", "").isNullOrBlank().not()
+
+    fun saveGitHubToken(token: String, username: String = "") {
+        preferences.edit()
+            .putString("github_token", token.trim())
+            .putString("github_username", username.trim())
+            .apply()
+        applyCredentials()
+    }
+
     private fun applyCredentials() {
         val snapshot = mutableState.value
-        repoManager.updateCredentials(snapshot.githubUsername, snapshot.githubToken)
+        val username = snapshot.githubUsername.ifBlank { preferences.getString("github_username", "").orEmpty() }
+        val token = snapshot.githubToken.ifBlank { preferences.getString("github_token", "").orEmpty() }
+        if (token.isNotBlank()) {
+            repoManager.updateCredentials(username, token)
+        }
     }
 
     private suspend fun refreshFiles(repo: Repo) = withContext(Dispatchers.Main) {

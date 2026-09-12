@@ -62,6 +62,8 @@ import androidx.core.view.WindowCompat
 import androidx.core.content.FileProvider
 import androidx.core.content.ContextCompat
 import com.iqforge.engine.CodeEngine
+import com.iqforge.engine.ModelCatalog
+import com.iqforge.engine.ModelInfo
 import com.iqforge.engine.NativeEngine
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -98,6 +100,10 @@ import java.util.Locale
 import com.iqforge.sensors.SensorFeedback
 import com.iqforge.sensors.HapticCue
 import com.iqforge.sensors.buzz
+import com.iqforge.sensors.TorchFeedback
+import com.iqforge.git.JGitRepoManager
+import com.iqforge.git.Repo
+import org.eclipse.jgit.api.Git
 
 private val IqfYellow = Color(0xFFFFC400)
 private val ForgeDarkColors = darkColorScheme(
@@ -300,7 +306,8 @@ class AgentViewModel(
     internal val codeEngine: CodeEngine,
     internal var bridgeClient: LaptopBridgeClient = LaptopBridgeClient(),
     private val preferences: android.content.SharedPreferences? = null,
-    private val attachmentService: ChatAttachmentService = ChatAttachmentService()
+    private val attachmentService: ChatAttachmentService = ChatAttachmentService(),
+    private val application: Application? = null
 ) : ViewModel() {
     val isNpuActive: Boolean get() = (codeEngine as? NativeEngine)?.isNpuActive == true
     val lastNpuTokensPerSec: Double? get() = (codeEngine as? NativeEngine)?.lastNpuTokensPerSec
@@ -377,7 +384,8 @@ class AgentViewModel(
                 }
                 return AgentViewModel(
                     codeEngine = NativeEngine(application),
-                    preferences = preferences
+                    preferences = preferences,
+                    application = application as? Application
                 ) as T
             }
         }
@@ -399,6 +407,24 @@ class AgentViewModel(
 
     fun selectOfflineModel() {
         if (offlineModelReady) selectedModel = (codeEngine as? NativeEngine)?.displayName
+    }
+
+    /** On-device catalog models (Qwen 1.5B / 3B / Phi-4-mini) — the picker's model list. */
+    val catalogModels: List<ModelInfo> get() = ModelCatalog.ALL
+    val activeCatalogModelId: String? get() = (codeEngine as? NativeEngine)?.activeModelInfo?.id
+    fun isCatalogModelDownloaded(model: ModelInfo): Boolean =
+        (codeEngine as? NativeEngine)?.isCatalogModelAvailable(model) == true
+
+    /**
+     * Switch which on-device model is active. Downloaded already -> activate it (and relaunch
+     * the NPU daemon against it). Not downloaded -> fetch it first; startModelDownload() already
+     * activates whatever NativeEngine.activeModel is once the download finishes.
+     */
+    fun selectCatalogModel(model: ModelInfo) {
+        val nativeEngine = codeEngine as? NativeEngine ?: return
+        if (isDownloadingModel) return
+        nativeEngine.selectCatalogModel(model)
+        if (nativeEngine.isModelAvailable()) refreshOfflineModel() else startModelDownload()
     }
 
     fun startModelDownload() {
@@ -544,6 +570,159 @@ class AgentViewModel(
      * fetch fails gracefully and the local model still answers, just without that file's exact
      * contents — it never hard-fails just because the laptop is offline.
      */
+    fun executeGitStatus(workspacePath: String): String {
+        val sessionDir = File(workspacePath)
+        if (!sessionDir.exists() || !sessionDir.resolve(".git").isDirectory) {
+            return "Not a Git repository: $workspacePath"
+        }
+        return try {
+            Git.open(sessionDir).use { git ->
+                val status = git.status().call()
+                buildString {
+                    appendLine("📦 Repository: ${sessionDir.name}")
+                    appendLine("🌿 Branch: ${git.repository.branch}")
+                    if (status.isClean) {
+                        appendLine("✨ Working tree clean. All changes committed.")
+                    } else {
+                        if (status.modified.isNotEmpty()) appendLine("📝 Modified:\n" + status.modified.joinToString("\n") { "   • $it" })
+                        if (status.untracked.isNotEmpty()) appendLine("❓ Untracked:\n" + status.untracked.joinToString("\n") { "   • $it" })
+                        if (status.added.isNotEmpty()) appendLine("➕ Staged:\n" + status.added.joinToString("\n") { "   • $it" })
+                        if (status.removed.isNotEmpty()) appendLine("🗑️ Deleted:\n" + status.removed.joinToString("\n") { "   • $it" })
+                        appendLine("\nTip: Type `/commit <message>` to commit your changes.")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            "Git status check failed: ${e.message}"
+        }
+    }
+
+    suspend fun executeGitCommit(workspacePath: String, message: String): String {
+        val sessionDir = File(workspacePath)
+        if (!sessionDir.exists() || !sessionDir.resolve(".git").isDirectory) {
+            return "Not a Git repository: $workspacePath"
+        }
+        val commitMsg = message.trim().ifBlank { "Update code from IQForge on-device agent" }
+        return try {
+            val repo = Repo(sessionDir, sessionDir.name)
+            val mgr = JGitRepoManager(sessionDir.parentFile)
+            mgr.commit(repo, commitMsg, emptyList())
+            "✅ Successfully committed on phone!\nMessage: \"$commitMsg\"\n\nReady to push! Run `/push` to push to GitHub."
+        } catch (e: Exception) {
+            "❌ Commit failed: ${e.message}"
+        }
+    }
+
+    suspend fun executeGitPush(workspacePath: String): String {
+        val sessionDir = File(workspacePath)
+        if (!sessionDir.exists() || !sessionDir.resolve(".git").isDirectory) {
+            return "Not a Git repository: $workspacePath"
+        }
+        val prefs = application?.getSharedPreferences("iqforge_workspace", Context.MODE_PRIVATE) ?: preferences
+        val token = prefs?.getString("github_token", "").orEmpty()
+        val username = prefs?.getString("github_username", "").orEmpty()
+        if (token.isBlank()) {
+            return "⚠️ GitHub Personal Access Token is required to push.\nRun `/token <your-github-token>` or enter it in the Files & Git menu (📁) to authenticate."
+        }
+        return try {
+            val repo = Repo(sessionDir, sessionDir.name)
+            val mgr = JGitRepoManager(sessionDir.parentFile)
+            mgr.updateCredentials(username, token)
+            mgr.push(repo)
+            "🚀 Successfully pushed changes to GitHub directly from your phone!"
+        } catch (e: Exception) {
+            "❌ Push failed: ${e.message}\n\nTip: Ensure your GitHub token has the 'repo' scope."
+        }
+    }
+
+    suspend fun executeGitPull(workspacePath: String): String {
+        val sessionDir = File(workspacePath)
+        if (!sessionDir.exists() || !sessionDir.resolve(".git").isDirectory) {
+            return "Not a Git repository: $workspacePath"
+        }
+        val prefs = application?.getSharedPreferences("iqforge_workspace", Context.MODE_PRIVATE) ?: preferences
+        val token = prefs?.getString("github_token", "").orEmpty()
+        val username = prefs?.getString("github_username", "").orEmpty()
+        return try {
+            val repo = Repo(sessionDir, sessionDir.name)
+            val mgr = JGitRepoManager(sessionDir.parentFile)
+            if (token.isNotBlank()) mgr.updateCredentials(username, token)
+            mgr.pull(repo)
+            "⬇️ Successfully pulled latest changes from GitHub!"
+        } catch (e: Exception) {
+            "❌ Pull failed: ${e.message}"
+        }
+    }
+
+    private fun extractTargetWindow(fullText: String, query: String, maxChars: Int = 4000): Pair<Int, Int> {
+        if (fullText.length <= maxChars) return 0 to fullText.length
+        val stopwords = setOf(
+            "the", "a", "an", "and", "or", "to", "in", "for", "on", "with", "at", "by", "from",
+            "of", "is", "it", "i", "you", "me", "we", "he", "she", "this", "that", "want",
+            "please", "can", "could", "would", "should", "change", "edit", "make", "update", "push"
+        )
+        val tokens = query.lowercase().split(Regex("[^a-zA-Z0-9_.-]+"))
+            .filter { it.length >= 2 && it !in stopwords }
+
+        val searchTerms = mutableSetOf<String>()
+        for (t in tokens) {
+            searchTerms.add(t)
+            if (t == "button" || t == "buttons") searchTerms.add("btn")
+            if (t == "color" || t == "colours") { searchTerms.add("color:"); searchTerms.add("background") }
+            if (t == "nav" || t == "navbar") searchTerms.add("header")
+        }
+
+        var bestIndex = -1
+        var maxHits = 0
+
+        val lower = fullText.lowercase()
+        for (term in searchTerms) {
+            var idx = lower.indexOf(term)
+            var count = 0
+            while (idx != -1 && count < 30) {
+                count++
+                val windowStart = (idx - 500).coerceAtLeast(0)
+                val windowEnd = (idx + 500).coerceAtMost(lower.length)
+                val sub = lower.substring(windowStart, windowEnd)
+                var hits = 0
+                for (st in searchTerms) {
+                    if (sub.contains(st)) hits++
+                }
+                if (hits > maxHits) {
+                    maxHits = hits
+                    bestIndex = idx
+                }
+                idx = lower.indexOf(term, idx + term.length + 1)
+            }
+        }
+
+        val targetCenter = if (bestIndex != -1) bestIndex else 0
+        val half = maxChars / 2
+        var start = (targetCenter - half).coerceAtLeast(0)
+        var end = (targetCenter + half).coerceAtMost(fullText.length)
+
+        val prevNl = fullText.lastIndexOf('\n', start)
+        if (prevNl in 0 until start && (start - prevNl) < 200) {
+            start = prevNl + 1
+        }
+        val nextNl = fullText.indexOf('\n', end)
+        if (nextNl in end until fullText.length && (nextNl - end) < 200) {
+            end = nextNl
+        }
+
+        return start to end
+    }
+
+    /**
+     * Default path is the on-device model — it does the actual review/write/debug/explain
+     * reasoning, matching the "phone is the dev workstation" pitch. The laptop bridge is used
+     * only for two narrow things: (1) reading the raw text of a file the user names, since the
+     * cloned repo currently lives on the laptop's disk, not the phone's, and (2) genuinely
+     * bigger tasks — an explicit "/" shell/dispatch command, a build/test run, or an explicit
+     * "/escalate" ask for a deeper laptop-model pass. If the bridge is unreachable, file-text
+     * fetch fails gracefully and the local model still answers, just without that file's exact
+     * contents — it never hard-fails just because the laptop is offline.
+     */
     fun sendCodeSessionMessage(text: String) {
         val id = activeCodeSessionId ?: return
         val session = codeSessions.firstOrNull { it.id == id } ?: return
@@ -555,6 +734,24 @@ class AgentViewModel(
             var replyRole = "assistant"
             val response = try {
                 when {
+                    trimmed.startsWith("/token", ignoreCase = true) -> {
+                        val tok = trimmed.removePrefix("/token").trim()
+                        val prefs = application?.getSharedPreferences("iqforge_workspace", Context.MODE_PRIVATE) ?: preferences
+                        prefs?.edit()?.putString("github_token", tok)?.apply()
+                        "🔑 GitHub token saved on-device! You can now run `/push` to push your commits to GitHub."
+                    }
+                    trimmed.startsWith("/commit", ignoreCase = true) -> {
+                        executeGitCommit(session.workspace, trimmed.removePrefix("/commit").trim())
+                    }
+                    trimmed.startsWith("/push", ignoreCase = true) -> {
+                        executeGitPush(session.workspace)
+                    }
+                    trimmed.startsWith("/pull", ignoreCase = true) -> {
+                        executeGitPull(session.workspace)
+                    }
+                    trimmed.equals("/status", ignoreCase = true) || trimmed.equals("/git", ignoreCase = true) -> {
+                        executeGitStatus(session.workspace)
+                    }
                     trimmed.startsWith("/escalate", ignoreCase = true) -> {
                         replyRole = "laptop"
                         val instruction = trimmed.drop("/escalate".length).trim()
@@ -613,6 +810,14 @@ class AgentViewModel(
                             }
                         }
                         val mentionedFile = knownFiles.firstOrNull { trimmed.contains(it, ignoreCase = true) }
+                            ?: if (isLocal) {
+                                knownFiles.firstOrNull {
+                                    it.equals("index.html", true) || it.endsWith("/index.html", true) ||
+                                    it.equals("main.js", true) || it.equals("App.tsx", true) ||
+                                    it.equals("App.jsx", true) || it.endsWith("MainActivity.kt", true)
+                                } ?: knownFiles.firstOrNull { !it.endsWith(".lnk") && !it.endsWith(".md") && !it.startsWith(".") }
+                                  ?: knownFiles.firstOrNull()
+                            } else null
                         val fileText = if (isLocal && mentionedFile != null) {
                             runCatching { java.io.File(sessionDir, mentionedFile).readText() }.getOrDefault("")
                         } else {
@@ -629,9 +834,12 @@ class AgentViewModel(
                                     trimmed, effort.wireName
                                 )
                             } else {
-                                val truncated = fileText.take(MAX_LOCAL_FILE_CHARS)
+                                val (winStart, winEnd) = extractTargetWindow(fileText, trimmed, maxChars = 4000)
+                                val truncated = fileText.substring(winStart, winEnd)
+                                val lineStart = fileText.substring(0, winStart).count { it == '\n' } + 1
+                                val lineEnd = lineStart + truncated.count { it == '\n' }
                                 val header = "Repository: ${session.repository}\nWorkspace: ${session.workspace}" +
-                                    (mentionedFile?.let { "\nFile: $it (truncated)" } ?: "")
+                                    (mentionedFile?.let { "\nFile: $it (Lines $lineStart-$lineEnd)" } ?: "")
                                 val enrichedContext = "$header\n\n$truncated"
                                 val local = when (task) {
                                     BridgeTask.REVIEW -> {
@@ -643,7 +851,12 @@ class AgentViewModel(
                                     BridgeTask.EXPLAIN -> codeEngine.explain("Context:\n$enrichedContext\n\nQuestion:\n$trimmed")
                                     BridgeTask.WRITE -> codeEngine.write(trimmed, enrichedContext)
                                 }
-                                "$local\n\n(Note: File was truncated to prevent context overflow on-device.)"
+                                buildString {
+                                    append(local)
+                                    if (mentionedFile != null) {
+                                        append("\n\n💡 *Tip: To save this change to `$mentionedFile`, open **Files & Git (📁)** at top right -> tap `$mentionedFile` -> **Edit with IQF**. Once saved, run `/commit <msg>` and `/push` to push directly to GitHub!*")
+                                    }
+                                }
                             }
                         } else {
                             val header = "Repository: ${session.repository}\nWorkspace: ${session.workspace}" +
@@ -938,6 +1151,132 @@ class AgentViewModel(
         attachmentMessage = null
         feed += FeedItem.User(prompt)
         saveChatMessage("user", prompt)
+
+        val lowerPrompt = prompt.lowercase()
+        val repoRoot = application?.filesDir?.resolve("repositories")
+        val activeRepo = repoRoot?.listFiles()?.filter { it.isDirectory && it.resolve(".git").isDirectory }
+            ?.maxByOrNull { it.resolve(".git/index").lastModified() }
+
+        // Check for direct Git commands in main chat
+        if (prompt.startsWith("/token", ignoreCase = true)) {
+            val tok = prompt.removePrefix("/token").trim()
+            val prefs = application?.getSharedPreferences("iqforge_workspace", Context.MODE_PRIVATE) ?: preferences
+            prefs?.edit()?.putString("github_token", tok)?.apply()
+            val msg = "🔑 GitHub token saved on-device! You can now run `/push` or ask me to push code changes."
+            feed += FeedItem.Reply(msg)
+            saveChatMessage("assistant", msg)
+            sending = false
+            return
+        }
+
+        if (activeRepo != null) {
+            if (prompt.startsWith("/commit", ignoreCase = true)) {
+                viewModelScope.launch {
+                    val msg = executeGitCommit(activeRepo.absolutePath, prompt.removePrefix("/commit").trim())
+                    feed += FeedItem.Reply(msg)
+                    saveChatMessage("assistant", msg)
+                    sending = false
+                }
+                return
+            }
+            if (prompt.startsWith("/push", ignoreCase = true)) {
+                viewModelScope.launch {
+                    val msg = executeGitPush(activeRepo.absolutePath)
+                    feed += FeedItem.Reply(msg)
+                    saveChatMessage("assistant", msg)
+                    sending = false
+                }
+                return
+            }
+            if (prompt.startsWith("/pull", ignoreCase = true)) {
+                viewModelScope.launch {
+                    val msg = executeGitPull(activeRepo.absolutePath)
+                    feed += FeedItem.Reply(msg)
+                    saveChatMessage("assistant", msg)
+                    sending = false
+                }
+                return
+            }
+            if (prompt.equals("/status", ignoreCase = true) || prompt.equals("/git", ignoreCase = true)) {
+                viewModelScope.launch {
+                    val msg = executeGitStatus(activeRepo.absolutePath)
+                    feed += FeedItem.Reply(msg)
+                    saveChatMessage("assistant", msg)
+                    sending = false
+                }
+                return
+            }
+        }
+
+        val isPushOrCommitIntent = ("push" in lowerPrompt && ("code" in lowerPrompt || "change" in lowerPrompt || "repo" in lowerPrompt || "github" in lowerPrompt || "it" in lowerPrompt)) ||
+            ("commit" in lowerPrompt && ("code" in lowerPrompt || "change" in lowerPrompt || "it" in lowerPrompt)) ||
+            "make the changes and push" in lowerPrompt
+
+        if (isPushOrCommitIntent) {
+            if (activeRepo != null) {
+                val targetFile = activeRepo.resolve("index.html").takeIf { it.exists() }
+                    ?: activeRepo.walkTopDown().filter { it.isFile && !it.path.contains("/.git/") && !it.name.endsWith(".lnk") }
+                        .firstOrNull { it.name.endsWith(".html") || it.name.endsWith(".js") || it.name.endsWith(".ts") || it.name.endsWith(".kt") }
+                    ?: activeRepo.walkTopDown().firstOrNull { it.isFile && !it.path.contains("/.git/") }
+
+                if (targetFile != null) {
+                    viewModelScope.launch {
+                        try {
+                            feed += FeedItem.Status("Modifying ${targetFile.name} on Qualcomm Snapdragon Hexagon NPU…")
+                            val currentText = targetFile.readText()
+                            val recentContext = feed.filterIsInstance<FeedItem.User>().takeLast(2).map { it.text }.joinToString("\n")
+                            val instruction = if (recentContext.isNotBlank()) "$recentContext\n$prompt" else prompt
+
+                            val (winStart, winEnd) = extractTargetWindow(currentText, instruction, maxChars = 3500)
+                            val targetSnippet = currentText.substring(winStart, winEnd)
+                            val updatedSnippet = codeEngine.write(
+                                "Modify this code snippet according to the user request. Apply the changes and return ONLY the updated code snippet:\nUser request: $instruction",
+                                "Code snippet:\n$targetSnippet"
+                            ).trim()
+                                .replace(Regex("^```[A-Za-z0-9_+.-]*\\s*"), "")
+                                .replace(Regex("\\s*```$"), "")
+                                .trim()
+
+                            if (updatedSnippet.isNotBlank() && !updatedSnippet.startsWith("ERROR:")) {
+                                val updatedFull = currentText.substring(0, winStart) + updatedSnippet + currentText.substring(winEnd)
+                                targetFile.writeText(updatedFull)
+                                val commitResult = executeGitCommit(activeRepo.absolutePath, "Updated ${targetFile.name} per user request")
+                                val pushResult = executeGitPush(activeRepo.absolutePath)
+                                val reply = buildString {
+                                    appendLine("✅ Applied changes to `${targetFile.name}` in repository **${activeRepo.name}** via Snapdragon Hexagon NPU.")
+                                    appendLine()
+                                    appendLine("```")
+                                    appendLine(updatedSnippet.take(1200))
+                                    appendLine("```")
+                                    appendLine()
+                                    appendLine(commitResult)
+                                    appendLine()
+                                    appendLine(pushResult)
+                                }
+                                feed += FeedItem.Reply(reply)
+                                saveChatMessage("assistant", reply)
+                            } else {
+                                val fallbackReply = codeEngine.write(prompt, currentText.take(4000))
+                                feed += FeedItem.Reply(fallbackReply)
+                                saveChatMessage("assistant", fallbackReply)
+                            }
+                        } catch (e: Exception) {
+                            feed += FeedItem.Status("Error applying and pushing code: ${e.message}", error = true)
+                        } finally {
+                            sending = false
+                        }
+                    }
+                    return
+                }
+            } else {
+                val msg = "⚠️ No local repository is currently open on your phone. Please go to the **Code** section -> **Repository** -> **Clone GitHub** to clone your repository to the phone first, and I will be able to edit and push your code directly!"
+                feed += FeedItem.Reply(msg)
+                saveChatMessage("assistant", msg)
+                sending = false
+                return
+            }
+        }
+
         viewModelScope.launch {
             try {
                 val task = inferTask(prompt)
@@ -1090,24 +1429,44 @@ class AgentViewModel(
         fileEditError = null
         viewModelScope.launch {
             try {
-                val generated = if (modelServiceReady) {
-                    bridgeClient.escalateWithOptions(
+                val cleaned = if (modelServiceReady && selectedModel != null && selectedModel != "offline") {
+                    val generated = bridgeClient.escalateWithOptions(
                         bridgeUrl,
                         BridgeTask.WRITE,
                         "File: $path\n\n$currentText",
                         "Apply this change and return the complete updated file only: ${instruction.trim()}",
                         effort.wireName
                     )
+                    generated.trim()
+                        .replace(Regex("^```[A-Za-z0-9_+.-]*\\s*"), "")
+                        .replace(Regex("\\s*```$"), "")
+                        .trim()
                 } else {
-                    codeEngine.write(
-                        "Apply this change and return the complete updated file only: ${instruction.trim()}",
-                        "File: $path\n\n$currentText"
-                    )
+                    if (currentText.length > MAX_LOCAL_FILE_CHARS) {
+                        val (winStart, winEnd) = extractTargetWindow(currentText, instruction, maxChars = 3500)
+                        val targetSnippet = currentText.substring(winStart, winEnd)
+                        val updatedSnippet = codeEngine.write(
+                            "Modify this code snippet according to the instruction. Return ONLY the updated replacement code snippet without explanation or markdown fences:\nInstruction: ${instruction.trim()}",
+                            "Code snippet:\n$targetSnippet"
+                        ).trim()
+                            .replace(Regex("^```[A-Za-z0-9_+.-]*\\s*"), "")
+                            .replace(Regex("\\s*```$"), "")
+                            .trim()
+                        require(updatedSnippet.isNotBlank() && !updatedSnippet.startsWith("ERROR:")) {
+                            updatedSnippet.ifBlank { "Model returned an empty edit" }
+                        }
+                        currentText.substring(0, winStart) + updatedSnippet + currentText.substring(winEnd)
+                    } else {
+                        val generated = codeEngine.write(
+                            "Apply this change and return the complete updated file only: ${instruction.trim()}",
+                            "File: $path\n\n$currentText"
+                        )
+                        generated.trim()
+                            .replace(Regex("^```[A-Za-z0-9_+.-]*\\s*"), "")
+                            .replace(Regex("\\s*```$"), "")
+                            .trim()
+                    }
                 }
-                val cleaned = generated.trim()
-                    .replace(Regex("^```[A-Za-z0-9_+.-]*\\s*"), "")
-                    .replace(Regex("\\s*```$"), "")
-                    .trim()
                 require(cleaned.isNotBlank() && !cleaned.startsWith("ERROR:")) {
                     cleaned.ifBlank { "Model returned an empty edit" }
                 }
@@ -1246,6 +1605,9 @@ class AgentViewModel(
         onShake = { agent.regenerateLastReply() },
         onFaceDown = { isDown -> if (isDown) sessionLocked = true }
     )
+    // Pulses the rear flash while the model is actually generating — on-device, laptop-escalated,
+    // or a code-session reply, doesn't matter which; visible from across the room or face-down.
+    TorchFeedback(active = agent.sending || agent.codeSessionBusy)
     var destination by rememberSaveable { mutableStateOf(AppDestination.CHATS) }
     var selectedProjectName by rememberSaveable { mutableStateOf<String?>(null) }
     var showAddToChat by rememberSaveable { mutableStateOf(false) }
@@ -2982,7 +3344,7 @@ private fun displayModelText(text: String): String = text.trim()
         state.repo?.root?.absolutePath.orEmpty().ifBlank { laptopRoot }
     }
     if (agent.activeCodeSessionId != null) {
-        CodeSessionChat(agent)
+        CodeSessionChat(agent, workspace, state)
         return
     }
     Column(Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 10.dp)) {
@@ -3091,14 +3453,32 @@ private fun displayModelText(text: String): String = text.trim()
     )
 }
 
-@Composable private fun CodeSessionChat(agent: AgentViewModel) {
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun CodeSessionChat(
+    agent: AgentViewModel,
+    workspace: WorkspaceViewModel,
+    state: WorkspaceUiState
+) {
     val session = agent.codeSessions.firstOrNull { it.id == agent.activeCodeSessionId }
     var input by rememberSaveable { mutableStateOf("") }
+    var showFilesSheet by rememberSaveable { mutableStateOf(false) }
+    var showTokenDialog by rememberSaveable { mutableStateOf(false) }
+    var tokenInput by rememberSaveable { mutableStateOf("") }
     val listState = rememberLazyListState()
     val haptics = LocalHapticFeedback.current
     LaunchedEffect(session?.messages?.size, agent.codeSessionBusy) {
         val count = (session?.messages?.size ?: 0) + if (agent.codeSessionBusy) 1 else 0
         if (count > 0) listState.animateScrollToItem(count - 1)
+    }
+    LaunchedEffect(session?.workspace) {
+        val ws = session?.workspace.orEmpty()
+        if (ws.isNotBlank() && state.repo?.root?.absolutePath != ws) {
+            val match = state.repositories.firstOrNull { it.root.absolutePath == ws }
+                ?: state.repositories.firstOrNull { it.name == session?.repository }
+            if (match != null) {
+                workspace.selectRepository(match.name)
+            }
+        }
     }
     Column(Modifier.fillMaxSize()) {
         Row(
@@ -3117,6 +3497,9 @@ private fun displayModelText(text: String): String = text.trim()
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            }
+            IconButton(onClick = { showFilesSheet = true }) {
+                Icon(Icons.Default.FolderOpen, "Files & Git")
             }
         }
         if (session == null || session.messages.isEmpty()) {
@@ -3268,6 +3651,98 @@ private fun displayModelText(text: String): String = text.trim()
                 }
             }
         }
+    }
+    if (showFilesSheet) {
+        ModalBottomSheet(onDismissRequest = { showFilesSheet = false }) {
+            Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Folder, null, tint = IqfYellow)
+                    Spacer(Modifier.width(8.dp))
+                    Text(session?.repository ?: "Repository", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                    IconButton(onClick = workspace::pull, enabled = !state.busy) {
+                        Icon(Icons.Default.Refresh, "Pull from GitHub")
+                    }
+                }
+                Text(session?.workspace.orEmpty(), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    state.commitMessage, workspace::updateCommitMessage,
+                    Modifier.fillMaxWidth(),
+                    label = { Text("Commit message") },
+                    singleLine = true
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = { workspace.commit() },
+                        enabled = !state.busy,
+                        modifier = Modifier.weight(1f)
+                    ) { Text("Commit") }
+                    Button(
+                        onClick = {
+                            if (workspace.hasSavedToken() || state.githubToken.isNotBlank()) {
+                                workspace.push()
+                            } else {
+                                showTokenDialog = true
+                            }
+                        },
+                        enabled = !state.busy,
+                        modifier = Modifier.weight(1f)
+                    ) { Text("Push to GitHub") }
+                }
+                if (state.busy) {
+                    Spacer(Modifier.height(8.dp))
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                    Text(state.operation, style = MaterialTheme.typography.labelSmall)
+                }
+                state.message?.let {
+                    Text(it, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 4.dp))
+                }
+                state.error?.let {
+                    Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 4.dp))
+                }
+                HorizontalDivider(Modifier.padding(vertical = 12.dp))
+                Text("Files (tap to open editor & Edit with IQF)", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.height(6.dp))
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 280.dp)) {
+                    items(state.entries, key = { it.relativePath }) { entry ->
+                        FileRow(entry, workspace)
+                    }
+                }
+                Spacer(Modifier.height(24.dp))
+            }
+        }
+    }
+    if (showTokenDialog) {
+        AlertDialog(
+            onDismissRequest = { showTokenDialog = false },
+            title = { Text("GitHub Authentication") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Enter a GitHub Personal Access Token (classic token with 'repo' scope or fine-grained PAT with Contents write access) to push from your phone:")
+                    OutlinedTextField(
+                        tokenInput, { tokenInput = it },
+                        Modifier.fillMaxWidth(),
+                        label = { Text("Personal Access Token") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        workspace.saveGitHubToken(tokenInput)
+                        workspace.push(tokenInput)
+                        showTokenDialog = false
+                    },
+                    enabled = tokenInput.isNotBlank()
+                ) { Text("Save & Push") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showTokenDialog = false }) { Text("Cancel") }
+            }
+        )
     }
 }
 
@@ -4003,52 +4478,66 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                 }
             }
             val isNpu = agent.isNpuActive
-            val hasModel = (agent.codeEngine as? NativeEngine)?.isModelAvailable() == true
             Spacer(Modifier.height(12.dp))
-            Surface(
-                onClick = {
-                    if (agent.offlineModelReady || isNpu) {
-                        agent.selectOfflineModel()
-                        onDismiss()
-                    } else if (!hasModel) {
-                        agent.startModelDownload()
-                    } else {
-                        agent.refreshOfflineModel()
-                        onDismiss()
-                    }
-                },
-                color = MaterialTheme.colorScheme.surface,
-                shape = RoundedCornerShape(22.dp)
-            ) {
-                Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        Icons.Default.PhoneAndroid,
-                        null,
-                        tint = if (isNpu || agent.offlineModelReady) Color(0xFF54C878) else MaterialTheme.colorScheme.primary
-                    )
-                    Spacer(Modifier.width(14.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text(
-                            if (isNpu) "${agent.offlineModelName?.substringBefore(" (") ?: "Qwen 1.5B"} (Snapdragon NPU)"
-                            else agent.offlineModelName ?: "Qwen 1.5B (Snapdragon NPU)",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                        Text(
-                            when {
-                                isNpu -> agent.lastNpuTokensPerSec?.let { "Hardware accelerated on Hexagon HTP • ${String.format(java.util.Locale.US, "%.1f", it)} tokens/sec" } ?: "Hardware accelerated on Hexagon HTP • Pure NPU (23+ t/s)"
-                                agent.offlineModelReady -> "On-device • ${agent.offlineModelBytes / 1_000_000} MB GGUF • Pure NPU execution"
-                                agent.isDownloadingModel -> "Downloading model: ${(agent.downloadProgress * 100).toInt()}% (${agent.downloadProgressStatus})"
-                                !hasModel -> "Tap to download weights (1.1 GB) for Snapdragon NPU"
-                                else -> "Tap to initialize Snapdragon Hexagon NPU"
+            Text(
+                "On-device (Hexagon NPU)",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 8.dp)
+            )
+            Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
+                Column {
+                    agent.catalogModels.forEachIndexed { index, model ->
+                        val isActive = model.id == agent.activeCatalogModelId
+                        val isDownloaded = agent.isCatalogModelDownloaded(model)
+                        val isDownloadingThis = agent.isDownloadingModel && isActive
+                        Surface(
+                            onClick = {
+                                if (agent.isDownloadingModel) return@Surface
+                                if (isActive && agent.offlineModelReady) {
+                                    agent.selectOfflineModel(); onDismiss()
+                                } else {
+                                    agent.selectCatalogModel(model)
+                                    if (isDownloaded) onDismiss()
+                                }
                             },
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                    if (agent.selectedModel?.contains("on-device") == true || agent.selectedModel?.contains("Snapdragon") == true) {
-                        Icon(Icons.Default.Check, "Selected", tint = Color(0xFF54C878))
-                    } else if (!hasModel && !agent.isDownloadingModel) {
-                        Icon(Icons.Default.Download, "Download", tint = MaterialTheme.colorScheme.primary)
+                            color = Color.Transparent
+                        ) {
+                            Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    Icons.Default.PhoneAndroid,
+                                    null,
+                                    tint = if (isActive && (isNpu || agent.offlineModelReady)) Color(0xFF54C878) else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Spacer(Modifier.width(14.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        if (isActive && isNpu) "${model.displayName.substringBefore(" (")} (Snapdragon NPU)" else model.displayName,
+                                        style = MaterialTheme.typography.titleMedium
+                                    )
+                                    Text(
+                                        when {
+                                            isActive && isNpu -> agent.lastNpuTokensPerSec?.let {
+                                                "Hardware accelerated on Hexagon HTP • ${String.format(java.util.Locale.US, "%.1f", it)} tokens/sec"
+                                            } ?: "Hardware accelerated on Hexagon HTP • Pure NPU"
+                                            isActive && agent.offlineModelReady -> "Active • ${agent.offlineModelBytes / 1_000_000} MB GGUF • Pure NPU execution"
+                                            isDownloadingThis -> "Downloading: ${(agent.downloadProgress * 100).toInt()}% (${agent.downloadProgressStatus})"
+                                            isDownloaded -> "Downloaded • tap to activate"
+                                            else -> "Tap to download (${String.format(java.util.Locale.US, "%.1f", model.approxSizeBytes / 1_000_000_000.0)} GB)"
+                                        },
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+                                when {
+                                    isActive && (agent.offlineModelReady || isNpu) -> Icon(Icons.Default.Check, "Active", tint = Color(0xFF54C878))
+                                    isDownloadingThis -> Unit
+                                    !isDownloaded -> Icon(Icons.Default.Download, "Download", tint = MaterialTheme.colorScheme.primary)
+                                    else -> Unit
+                                }
+                            }
+                        }
+                        if (index != agent.catalogModels.lastIndex) HorizontalDivider()
                     }
                 }
             }
