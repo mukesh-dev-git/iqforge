@@ -38,8 +38,16 @@ iqforge/
 
 ## Status
 
-Android scaffolding is complete and `assembleDebug` succeeds. The current app is a minimal
-Compose shell; the core clone/edit/review/escalate/commit/push loop is not implemented yet.
-`bridge/` contains the ported `/review` server, but contract-compatible `/escalate` and
-toolchain execution via `/exec` are not built yet. `salvaged/` holds the camera, sensor,
-and native llama.cpp integration files waiting to be moved into `mobile/`.
+Core loop is real: clone/edit (JGit + file workspace), review/write/debug/explain (on-device
+CPU inference via `llama.cpp` JNI, auto-selects from `ModelCatalog`), escalate + toolchain
+exec + model discovery + connector probing (`bridge/server.py`, 5 endpoints). Chat history,
+camera/voice attachments, sensor feedback (haptics, tilt-scroll) are wired into the app.
+`salvaged/` has been removed — everything in it was superseded or moved in; see git history
+if you need the originals.
+
+**Open:** the on-device model file itself isn't bundled yet (`mobile/app/src/main/assets/`
+only has `MODEL_INFO.md`) — CPU inference has nothing to load until that lands. Hexagon NPU
+backend is CPU-only by design for now; real NPU support needs teammate B's Docker toolchain
+build (see `finals-30hr/NPU_SETUP_INSTRUCTIONS.md`) plus a separate jniLibs integration step
+(see the comment in `mobile/app/src/main/cpp/CMakeLists.txt`) — it does not fall out for free
+once the Docker build succeeds.

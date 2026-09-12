@@ -49,6 +49,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
@@ -89,6 +90,9 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import com.iqforge.sensors.SensorFeedback
+import com.iqforge.sensors.HapticCue
+import com.iqforge.sensors.buzz
 
 private val IqfYellow = Color(0xFFFFC400)
 private val ForgeDarkColors = darkColorScheme(
@@ -323,6 +327,11 @@ class AgentViewModel(
     var modelServiceReady by mutableStateOf(false); private set
     var offlineModelReady by mutableStateOf(false); private set
     var offlineModelBytes by mutableStateOf(0L); private set
+    /** The real on-device model's display name (e.g. "Qwen2.5 Coder 1.5B (on-device, fast)"
+     *  or "Phi-4-mini 3.8B (on-device, alternative)") — whichever ModelCatalog entry
+     *  NativeEngine actually detected and loaded. Independent of [selectedModel], which can
+     *  point at a different (laptop/Ollama) model while this still reflects what's on-device. */
+    var offlineModelName by mutableStateOf<String?>(null); private set
     var connectors by mutableStateOf<List<BridgeConnector>>(emptyList()); private set
     var chats by mutableStateOf<List<SavedChat>>(historyStore?.load().orEmpty()); private set
     var activeChatId by mutableStateOf<String?>(null); private set
@@ -377,6 +386,7 @@ class AgentViewModel(
         viewModelScope.launch {
             offlineModelReady = nativeEngine.initialize()
             offlineModelBytes = nativeEngine.installedModelBytes()
+            offlineModelName = if (offlineModelReady) nativeEngine.displayName else null
             if (offlineModelReady && selectedModel == null) selectedModel = nativeEngine.displayName
         }
     }
@@ -426,6 +436,12 @@ class AgentViewModel(
     fun clearCurrentChat() {
         activeChatId?.let { chats = historyStore?.remove(it).orEmpty() }
         newChat(privateMode = incognito)
+    }
+
+    /** Deletes any saved chat by id, from the Recents list — not just the active one. */
+    fun deleteChat(id: String) {
+        chats = historyStore?.remove(id).orEmpty()
+        if (activeChatId == id) newChat(privateMode = incognito)
     }
 
     fun clearMemory() {
@@ -687,7 +703,9 @@ class AgentViewModel(
             connectorStatus = try {
                 val health = bridgeClient.health(bridgeUrl)
                 modelServiceReady = health.modelReachable
-                selectedModel = health.model
+                if (selectedModel?.contains("on-device", ignoreCase = true) != true) {
+                    selectedModel = health.model
+                }
                 if (health.modelReachable) {
                     "Connected - ${health.backend}${health.model?.let { " / $it" }.orEmpty()}"
                 } else {
@@ -716,7 +734,9 @@ class AgentViewModel(
                 val discoveredConnectors = bridgeClient.connectors(bridgeUrl)
                 availableModels = discoveredModels
                 connectors = discoveredConnectors
-                selectedModel = discoveredModels.firstOrNull { it.selected }?.id ?: health.model
+                if (selectedModel?.contains("on-device", ignoreCase = true) != true) {
+                    selectedModel = discoveredModels.firstOrNull { it.selected }?.id ?: health.model
+                }
                 modelServiceReady = discoveredModels.any { it.id == selectedModel }
                 val connectedCount = discoveredConnectors.count { it.connected }
                 connectorStatus = "$connectedCount live connector(s)"
@@ -787,7 +807,8 @@ class AgentViewModel(
                         feed += FeedItem.Status("Web search unavailable; continuing on-device. ${error.message.orEmpty()}", error = true)
                     }
                 }
-                val useRealModel = modelServiceReady &&
+                val isOfflineSelected = selectedModel?.contains("on-device", ignoreCase = true) == true
+                val useRealModel = !isOfflineSelected && modelServiceReady &&
                     (toolAccessMode == ToolAccessMode.AUTO || toolAccessMode == ToolAccessMode.AUTOMATIC)
                 val response = if (useRealModel) {
                     bridgeClient.escalateWithOptions(
@@ -811,7 +832,13 @@ class AgentViewModel(
                 }
                 saveChatMessage("assistant", response)
                 if (memoryEnabled && !incognito) remember("User: $prompt\nIQF: ${response.take(1_500)}")
-                if (!useRealModel && bridgeUrl.isNotBlank() && toolAccessMode != ToolAccessMode.OFF) {
+                // Only offer escalation when there's an actual reason to — a diff/context past
+                // the ~40-line point where a 1.5B on-device model's review quality reliably
+                // holds up (see finals-30hr/BUILD_PLAN.md). Showing this after every reply,
+                // regardless of whether the on-device answer was already sufficient, trained
+                // the UI to look laptop-dependent by default — it isn't.
+                val contextIsLarge = enrichedContext.lines().size > 40
+                if (!useRealModel && bridgeUrl.isNotBlank() && toolAccessMode != ToolAccessMode.OFF && contextIsLarge) {
                     feed += FeedItem.EscalatePrompt(prompt = prompt, context = enrichedContext, task = task)
                 }
             } catch (error: Exception) {
@@ -820,6 +847,14 @@ class AgentViewModel(
                 sending = false
             }
         }
+    }
+
+    /** Shake to regenerate — re-issues the last user prompt through the same [send] path. */
+    fun regenerateLastReply() {
+        if (sending) return
+        val lastPrompt = feed.filterIsInstance<FeedItem.User>().lastOrNull()?.text ?: return
+        composer = lastPrompt
+        send()
     }
 
     /**
@@ -1041,6 +1076,20 @@ class AgentViewModel(
     var voiceName by rememberSaveable { mutableStateOf(settingsPreferences.getString("tts_voice", "").orEmpty()) }
     var voicePace by rememberSaveable { mutableStateOf(settingsPreferences.getFloat("voice_pace", 1f)) }
     var navigationOpen by remember { mutableStateOf(false) }
+    // Face-down locks the session (shoulder-surf protection) and stays locked — flipping
+    // back face-up does NOT auto-unlock, an explicit tap does. Whatever was visible while
+    // it was face-down may already have been seen; auto-unlocking on flip-back defeats
+    // the point.
+    var sessionLocked by remember { mutableStateOf(false) }
+    // Tilt right opens the sidebar, tilt left closes it — app-wide, not just on the chat
+    // screen. Replaces the old tilt-to-scroll gesture (removed from Feed). Shake regenerates
+    // the last on-device reply. Face-down locks the session (see above).
+    SensorFeedback(
+        onTiltRight = { navigationOpen = true },
+        onTiltLeft = { navigationOpen = false },
+        onShake = { agent.regenerateLastReply() },
+        onFaceDown = { isDown -> if (isDown) sessionLocked = true }
+    )
     var destination by rememberSaveable { mutableStateOf(AppDestination.CHATS) }
     var selectedProjectName by rememberSaveable { mutableStateOf<String?>(null) }
     var showAddToChat by rememberSaveable { mutableStateOf(false) }
@@ -1336,6 +1385,29 @@ class AgentViewModel(
             onDismiss = { settingsDialog = SettingsDialog.NONE }
         )
     }
+    if (sessionLocked) {
+        Surface(
+            modifier = Modifier.fillMaxSize().clickable { sessionLocked = false },
+            color = MaterialTheme.colorScheme.background
+        ) {
+            Column(
+                modifier = Modifier.fillMaxSize(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Icon(
+                    Icons.Default.Lock,
+                    contentDescription = null,
+                    modifier = Modifier.size(48.dp),
+                    tint = MaterialTheme.colorScheme.onBackground
+                )
+                Spacer(Modifier.height(16.dp))
+                Text("Session locked", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onBackground)
+                Spacer(Modifier.height(8.dp))
+                Text("Tap to unlock", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
 }
 
 @Composable private fun MinimalAgentHeader(
@@ -1379,9 +1451,18 @@ class AgentViewModel(
 @Composable private fun Feed(modifier: Modifier, agent: AgentViewModel, workspace: WorkspaceUiState) {
     val listState = rememberLazyListState()
     val feedSize = agent.feed.size
+    val context = LocalContext.current
     LaunchedEffect(feedSize, agent.sending) {
         val visibleItems = feedSize + if (agent.sending) 1 else 0
         if (visibleItems > 0) listState.animateScrollToItem(visibleItems - 1)
+    }
+    // Feel a reply land, not just see it — and an escalation failure buzzes differently
+    // from a normal one. Fires once per new item, only once the model has actually replied.
+    LaunchedEffect(feedSize) {
+        if (feedSize > 0 && !agent.sending) {
+            val cue = if (agent.feed.lastOrNull() is FeedItem.EscalateError) HapticCue.ERROR else HapticCue.REPLY
+            context.buzz(cue)
+        }
     }
 
     if (agent.feed.isEmpty()) {
@@ -1399,7 +1480,7 @@ class AgentViewModel(
             is FeedItem.User           -> UserBubble(item.text)
             is FeedItem.Status         -> StatusCard(item.text, item.success, item.error)
             is FeedItem.Tool           -> ToolCard(item.text)
-            is FeedItem.Reply          -> Text(displayModelText(item.text), style = MaterialTheme.typography.bodyLarge)
+            is FeedItem.Reply          -> OnDeviceReplyCard(item.text)
             is FeedItem.Diff           -> DiffCard(item)
             is FeedItem.EscalatePrompt -> EscalatePromptCard(item) { agent.escalate(item.prompt, item.context, item.task) }
             is FeedItem.LaptopReply    -> LaptopReplyCard(item.text)
@@ -1455,15 +1536,14 @@ private fun displayModelText(text: String): String = text
                 lineHeight = 32.sp,
                 textAlign = androidx.compose.ui.text.style.TextAlign.Center
             )
-            if (incognito) {
-                Spacer(Modifier.height(14.dp))
-                Text(
-                    "This chat is not saved to history or memory.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodyMedium,
-                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
-                )
-            }
+            Spacer(Modifier.height(14.dp))
+            Text(
+                if (incognito) "This chat is not saved to history or memory."
+                else "Running on your iQOO's NPU — no cloud, no laptop needed.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+            )
             if (repositoryName != null) {
                 Spacer(Modifier.height(12.dp))
                 Text(
@@ -1565,6 +1645,34 @@ private fun displayModelText(text: String): String = text
  * Successful laptop bridge response.
  * Styled with a laptop icon + primary tint to visually distinguish from the offline reply above.
  */
+@Composable private fun OnDeviceReplyCard(text: String) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(10.dp),
+        modifier = Modifier.fillMaxWidth(),
+        tonalElevation = 2.dp
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.PhoneAndroid,
+                    contentDescription = null,
+                    tint = Color(0xFF54C878),
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    "On-Device (Qwen 1.5B)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color(0xFF54C878)
+                )
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(displayModelText(text), style = MaterialTheme.typography.bodyLarge)
+        }
+    }
+}
+
 @Composable private fun LaptopReplyCard(text: String) {
     Surface(
         color = MaterialTheme.colorScheme.surface,
@@ -1674,15 +1782,16 @@ private fun displayModelText(text: String): String = text
                         modifier = Modifier.padding(horizontal = 17.dp, vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        val isOffline = agent.selectedModel?.contains("on-device", ignoreCase = true) == true
                         Text(
-                            if (agent.modelServiceReady) "Connected coding model" else "Private offline fallback",
+                            if (isOffline) "On-device model (offline)" else if (agent.modelServiceReady) "Connected coding model" else "Private offline fallback",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodyMedium
                         )
                         Spacer(Modifier.weight(1f))
                         Text(
-                            if (agent.modelServiceReady) "Real model ready" else "Offline fallback",
-                            color = MaterialTheme.colorScheme.primary,
+                            if (isOffline) "${agent.offlineModelName?.substringBefore(" (") ?: "On-device"} active" else if (agent.modelServiceReady) "Real model ready" else "Offline fallback",
+                            color = if (isOffline) Color(0xFF54C878) else MaterialTheme.colorScheme.primary,
                             fontWeight = FontWeight.SemiBold,
                             style = MaterialTheme.typography.bodyMedium
                         )
@@ -1731,10 +1840,11 @@ private fun displayModelText(text: String): String = text
                     Surface(
                         onClick = onModel,
                         color = MaterialTheme.colorScheme.surfaceVariant,
-                        shape = RoundedCornerShape(24.dp)
+                        shape = RoundedCornerShape(24.dp),
+                        modifier = Modifier.weight(1f, fill = false)
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 11.dp),
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
@@ -1743,11 +1853,18 @@ private fun displayModelText(text: String): String = text
                                 tint = MaterialTheme.colorScheme.primary,
                                 modifier = Modifier.size(17.dp)
                             )
-                            Spacer(Modifier.width(8.dp))
+                            Spacer(Modifier.width(6.dp))
+                            val displayModelName = when {
+                                agent.selectedModel == null -> "Select model"
+                                agent.selectedModel?.contains("on-device", ignoreCase = true) == true ->
+                                    agent.offlineModelName?.substringBefore(" (") ?: "On-device"
+                                else -> agent.selectedModel?.substringBefore(':') ?: "Select model"
+                            }
                             Text(
-                                agent.selectedModel?.substringBefore(':') ?: "Select model",
+                                displayModelName,
                                 fontWeight = FontWeight.Medium,
-                                maxLines = 1
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
                     }
@@ -1763,15 +1880,17 @@ private fun displayModelText(text: String): String = text
                     Spacer(Modifier.width(4.dp))
                     FilledIconButton(
                         onClick = {
-                            if (agent.composer.isBlank()) onVoice()
-                            else if (!agent.sending) {
+                            if (!agent.sending && agent.composer.isNotBlank()) {
                                 if (hapticEnabled) haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                                 send()
                             }
                         },
+                        enabled = agent.composer.isNotBlank() && !agent.sending,
                         colors = IconButtonDefaults.filledIconButtonColors(
-                            containerColor = if (agent.composer.isNotBlank()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
-                            contentColor = if (agent.composer.isNotBlank()) Color.White else MaterialTheme.colorScheme.surface
+                            containerColor = MaterialTheme.colorScheme.primary,
+                            contentColor = Color.White,
+                            disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                            disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
                         )
                     ) {
                         if (agent.sending) {
@@ -1782,8 +1901,8 @@ private fun displayModelText(text: String): String = text
                             )
                         } else {
                             Icon(
-                                if (agent.composer.isBlank()) Icons.Default.GraphicEq else Icons.AutoMirrored.Filled.Send,
-                                contentDescription = if (agent.composer.isBlank()) "Voice conversation" else "Send"
+                                Icons.AutoMirrored.Filled.Send,
+                                contentDescription = "Send"
                             )
                         }
                     }
@@ -2094,12 +2213,13 @@ private fun displayModelText(text: String): String = text
                         Modifier.fillMaxWidth().padding(top = 28.dp, bottom = 20.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            "IQF",
-                            color = MaterialTheme.colorScheme.onSurface,
-                            fontFamily = FontFamily.Serif,
-                            fontSize = 30.sp,
-                            modifier = Modifier.weight(1f)
+                        Image(
+                            painter = painterResource(R.drawable.iqoo_q_mark),
+                            contentDescription = "iQForge",
+                            colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(IqfYellow),
+                            modifier = Modifier.weight(1f).size(32.dp),
+                            alignment = Alignment.CenterStart,
+                            contentScale = ContentScale.Fit
                         )
                         IconButton(onIncognito) {
                             Icon(
@@ -2110,13 +2230,12 @@ private fun displayModelText(text: String): String = text
                         }
                     }
                 }
+                // MVP nav: Chats / Code / Settings only. Dispatch, Cowork, Projects, and
+                // Artifacts are folded into Code (Dispatch) or hidden for the demo — the
+                // code behind them is untouched, just not linked from here. See
+                // finals-30hr/MVP_PLAN.md.
                 item { NavigationItem("Chats", Icons.Default.Forum) { onDestination(AppDestination.CHATS) } }
-                item { NavigationItem("Clear current chat", Icons.Default.DeleteSweep) { agent.clearCurrentChat(); onDestination(AppDestination.CHATS) } }
-                item { NavigationItem("Dispatch", Icons.Default.Terminal) { onDestination(AppDestination.DISPATCH) } }
-                item { NavigationItem("Cowork", Icons.Default.TaskAlt) { onDestination(AppDestination.COWORK) } }
-                item { NavigationItem("Projects", Icons.Default.Inventory2) { onDestination(AppDestination.PROJECTS) } }
                 item { NavigationItem("Code", Icons.Default.Code) { onDestination(AppDestination.CODE) } }
-                item { NavigationItem("Artifacts", Icons.Default.Category) { onDestination(AppDestination.ARTIFACTS) } }
                 item { NavigationItem("Settings", Icons.Default.Settings) { onDestination(AppDestination.SETTINGS) } }
                 item { HorizontalDivider(Modifier.padding(vertical = 12.dp)) }
                 if (state.pinnedRepositoryNames.isNotEmpty()) {
@@ -2144,8 +2263,18 @@ private fun displayModelText(text: String): String = text
                     }
                 } else {
                     items(agent.chats.take(12), key = { it.id }) { chat ->
-                        TextButton(onClick = { onChat(chat.id) }, modifier = Modifier.fillMaxWidth()) {
-                            Text(chat.title, Modifier.fillMaxWidth(), maxLines = 1, color = MaterialTheme.colorScheme.onSurface)
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            TextButton(onClick = { onChat(chat.id) }, modifier = Modifier.weight(1f)) {
+                                Text(chat.title, Modifier.fillMaxWidth(), maxLines = 1, color = MaterialTheme.colorScheme.onSurface)
+                            }
+                            IconButton(onClick = { agent.deleteChat(chat.id) }) {
+                                Icon(
+                                    Icons.Default.Delete,
+                                    contentDescription = "Delete \"${chat.title}\"",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
                         }
                     }
                 }
@@ -3415,7 +3544,7 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                 Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
                     Column {
                         agent.availableModels.forEachIndexed { index, model ->
-                            Surface(onClick = { agent.selectModel(model) }, color = Color.Transparent) {
+                            Surface(onClick = { agent.selectModel(model); onDismiss() }, color = Color.Transparent) {
                                 Row(
                                     Modifier.fillMaxWidth().padding(18.dp),
                                     verticalAlignment = Alignment.CenterVertically
@@ -3442,12 +3571,12 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
             }
             if (agent.offlineModelReady) {
                 Spacer(Modifier.height(12.dp))
-                Surface(onClick = agent::selectOfflineModel, color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
+                Surface(onClick = { agent.selectOfflineModel(); onDismiss() }, color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
                     Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.PhoneAndroid, null, tint = Color(0xFF54C878))
                         Spacer(Modifier.width(14.dp))
                         Column(Modifier.weight(1f)) {
-                            Text("Qwen2.5 Coder 1.5B", style = MaterialTheme.typography.titleMedium)
+                            Text(agent.offlineModelName ?: "On-device model", style = MaterialTheme.typography.titleMedium)
                             Text("On-device • ${agent.offlineModelBytes / 1_000_000} MB GGUF • works without internet", color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         if (agent.selectedModel?.contains("on-device") == true) Icon(Icons.Default.Check, "Selected", tint = Color(0xFF54C878))

@@ -60,9 +60,8 @@ single diff via the GitHub REST API.
 { "result": "..." }
 ```
 
-**Run a toolchain command** — `POST http://<laptop-ip>:8000/exec` *(not built yet — this is
-the core addition `bridge/` needs; `/escalate` already exists as `/review` in `server.py`,
-rename or alias it)*
+**Run a toolchain command** — `POST http://<laptop-ip>:8000/exec` *(built — path-restricted to
+`ALLOWED_EXEC_ROOTS`, with a timeout)*
 
 ```json
 { "command": "npm test", "cwd": "/path/on/laptop/to/the/cloned/repo" }
