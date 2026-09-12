@@ -15,8 +15,7 @@ class SensorManager(context: Context) : SensorEventListener {
     private val proximity: Sensor? = sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY)
 
     var onShakeCallback: (() -> Unit)? = null
-    var onTiltRightCallback: (() -> Unit)? = null
-    var onTiltLeftCallback: (() -> Unit)? = null
+    var onTiltScrollCallback: ((Float) -> Unit)? = null
     var onFaceDownCallback: ((Boolean) -> Unit)? = null
 
     // Shake detection vars
@@ -26,11 +25,11 @@ class SensorManager(context: Context) : SensorEventListener {
     private var lastZ: Float = 0f
     private val SHAKE_THRESHOLD = 800
 
-    // Tilt left/right: a discrete gesture (open/close the sidebar), not a continuous signal —
-    // debounced so one physical tilt fires once instead of on every sensor frame while held.
-    private var lastTiltFire: Long = 0
-    private val TILT_THRESHOLD = 1.8f
-    private val TILT_COOLDOWN_MS = 800L
+    // Tilt-to-scroll: a continuous signal, not a discrete gesture — every sample beyond the
+    // deadzone reports a scroll delta for as long as the phone stays tilted, so scroll speed
+    // tracks how far it's tilted. Replaces the earlier tilt-left/right sidebar toggle.
+    private val TILT_DEADZONE = 0.4f
+    private val TILT_SCROLL_SPEED = 28f
 
     fun startListening() {
         accelerometer?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL) }
@@ -68,19 +67,13 @@ class SensorManager(context: Context) : SensorEventListener {
                 }
             }
             Sensor.TYPE_GYROSCOPE -> {
-                // Y-axis rotation = rolling the phone left/right while held upright.
-                // Sign convention (positive = right) is untested on real hardware — flip the
-                // comparison below if right/left come out swapped once you try it.
-                val roll = event.values[1]
-                val now = System.currentTimeMillis()
-                if (now - lastTiltFire > TILT_COOLDOWN_MS) {
-                    if (roll > TILT_THRESHOLD) {
-                        lastTiltFire = now
-                        onTiltRightCallback?.invoke()
-                    } else if (roll < -TILT_THRESHOLD) {
-                        lastTiltFire = now
-                        onTiltLeftCallback?.invoke()
-                    }
+                // Y-axis rotation = tilting the top of the phone forward/back while held
+                // upright — forward scrolls down, back scrolls up, same sense as tipping a
+                // physical page toward or away from you. Sign convention is untested on real
+                // hardware — flip the sign below if forward/back come out swapped once you try it.
+                val pitch = event.values[1]
+                if (abs(pitch) > TILT_DEADZONE) {
+                    onTiltScrollCallback?.invoke(pitch * TILT_SCROLL_SPEED)
                 }
             }
             Sensor.TYPE_PROXIMITY -> {

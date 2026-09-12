@@ -25,7 +25,9 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -1944,12 +1946,13 @@ class AgentViewModel(
     // it was face-down may already have been seen; auto-unlocking on flip-back defeats
     // the point.
     var sessionLocked by remember { mutableStateOf(false) }
-    // Tilt right opens the sidebar, tilt left closes it — app-wide, not just on the chat
-    // screen. Replaces the old tilt-to-scroll gesture (removed from Feed). Shake regenerates
-    // the last on-device reply. Face-down locks the session (see above).
+    // Tilting the phone forward/back scrolls the chat feed — back to the original tilt-to-scroll
+    // gesture (the sidebar-toggle it was temporarily switched to is gone). Shake regenerates the
+    // last on-device reply. Face-down locks the session (see above).
+    val feedListState = rememberLazyListState()
+    val sensorScope = rememberCoroutineScope()
     SensorFeedback(
-        onTiltRight = { navigationOpen = true },
-        onTiltLeft = { navigationOpen = false },
+        onTiltScroll = { delta -> sensorScope.launch { feedListState.scrollBy(delta) } },
         onShake = { agent.regenerateLastReply() },
         onFaceDown = { isDown -> if (isDown) sessionLocked = true }
     )
@@ -2038,7 +2041,7 @@ class AgentViewModel(
     ) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
             when (destination) {
-                AppDestination.CHATS -> Feed(Modifier.fillMaxSize(), agent, state)
+                AppDestination.CHATS -> Feed(Modifier.fillMaxSize(), agent, state, feedListState)
                 AppDestination.DISPATCH -> DispatchPage(agent)
                 AppDestination.COWORK -> CoworkPage(agent, state) { showCreateTask = true }
                 AppDestination.PROJECTS -> ProjectsPage(
@@ -2320,8 +2323,7 @@ class AgentViewModel(
 // Feed & card composables
 // ---------------------------------------------------------------------------
 
-@Composable private fun Feed(modifier: Modifier, agent: AgentViewModel, workspace: WorkspaceUiState) {
-    val listState = rememberLazyListState()
+@Composable private fun Feed(modifier: Modifier, agent: AgentViewModel, workspace: WorkspaceUiState, listState: LazyListState = rememberLazyListState()) {
     val feedSize = agent.feed.size
     val context = LocalContext.current
     LaunchedEffect(feedSize, agent.sending) {
@@ -5733,6 +5735,16 @@ private fun buildIssueReviewPrompt(repoFullName: String, issue: GitHubIssueDto):
 
 private data class PullRequestFinding(val path: String, val finding: Finding)
 
+private val DiffAddColor = Color(0xFF63C174)
+private val DiffDelColor = Color(0xFFE8622E)
+
+/** "+adds -dels" as one inline styled span — additions green, deletions red, same convention as GitHub's own diff stats. Embed with AnnotatedString.Builder.append(). */
+private fun diffStat(additions: Int, deletions: Int): AnnotatedString = buildAnnotatedString {
+    withStyle(SpanStyle(color = DiffAddColor, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold)) { append("+$additions") }
+    append(" ")
+    withStyle(SpanStyle(color = DiffDelColor, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold)) { append("-$deletions") }
+}
+
 @Composable private fun PullRequestReviewWorkspace(
     pr: GitHubPullRequestDetailDto,
     files: List<com.iqforge.github.GitHubPullRequestFileDto>,
@@ -5932,7 +5944,11 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
                         warnings > 0 -> Text("Medium risk · $warnings warning${if (warnings == 1) "" else "s"} to inspect")
                         else -> Text("Low risk · no blocking findings detected")
                     }
-                    Text("${files.size} files changed. ${pr.additions} lines added and ${pr.deletions} removed. $conflictLabel.")
+                    Text(buildAnnotatedString {
+                        append("${files.size} file${if (files.size == 1) "" else "s"} changed, ")
+                        append(diffStat(pr.additions, pr.deletions))
+                        append(". $conflictLabel.")
+                    })
                 }
             }
         }
@@ -5973,6 +5989,24 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
     }
 }
 
+/** Colors each line of a unified diff patch the way GitHub's own diff view does — added lines
+ *  green, removed lines red, hunk headers (@@ ... @@) in the accent color, everything else
+ *  (context lines, the file-header lines patch responses don't usually include) left neutral. */
+private fun highlightPatch(patch: String): AnnotatedString = buildAnnotatedString {
+    val lines = patch.lines()
+    lines.forEachIndexed { index, line ->
+        val color = when {
+            line.startsWith("+++") || line.startsWith("---") -> null
+            line.startsWith("@@") -> IqfYellow
+            line.startsWith("+") -> DiffAddColor
+            line.startsWith("-") -> DiffDelColor
+            else -> null
+        }
+        if (color != null) withStyle(SpanStyle(color = color)) { append(line) } else append(line)
+        if (index != lines.lastIndex) append("\n")
+    }
+}
+
 @Composable private fun ColumnScope.PullRequestChangesStage(files: List<com.iqforge.github.GitHubPullRequestFileDto>) {
     LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { Text("CHANGED FILES", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)) }
@@ -5980,8 +6014,15 @@ private data class PullRequestFinding(val path: String, val finding: Finding)
             ElevatedCard(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(file.filename, style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold))
-                    Text("${file.status.replaceFirstChar { it.uppercase() }} file. ${file.additions} additions and ${file.deletions} deletions.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(file.patch ?: "Patch unavailable for this file.", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                    Text(buildAnnotatedString {
+                        append("${file.status.replaceFirstChar { it.uppercase() }} file, ")
+                        append(diffStat(file.additions, file.deletions))
+                    }, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        file.patch?.let(::highlightPatch) ?: AnnotatedString("Patch unavailable for this file."),
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp
+                    )
                 }
             }
         }

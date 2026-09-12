@@ -40,8 +40,7 @@ fun Context.buzz(cue: HapticCue) {
 fun SensorFeedback(
     onShake: () -> Unit = {},
     onFaceDown: (Boolean) -> Unit = {},
-    onTiltRight: () -> Unit = {},
-    onTiltLeft: () -> Unit = {},
+    onTiltScroll: (Float) -> Unit = {},
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -50,8 +49,7 @@ fun SensorFeedback(
         val manager = SensorManager(context).apply {
             onShakeCallback = onShake
             onFaceDownCallback = onFaceDown
-            onTiltRightCallback = onTiltRight
-            onTiltLeftCallback = onTiltLeft
+            onTiltScrollCallback = onTiltScroll
         }
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
