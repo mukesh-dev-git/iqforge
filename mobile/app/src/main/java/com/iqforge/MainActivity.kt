@@ -1578,7 +1578,14 @@ class AgentViewModel(
 
 private fun displayModelText(text: String): String = text.trim()
 
-@Composable private fun EmptyAgentState(modifier: Modifier, repositoryName: String?, incognito: Boolean) =
+@Composable private fun EmptyAgentState(
+    modifier: Modifier,
+    repositoryName: String?,
+    incognito: Boolean,
+    title: String = if (incognito) "Private session" else "Let's iQuest on and on, Delfi.\nAre you ready?",
+    subtitle: String = if (incognito) "This chat is not saved to history or memory."
+        else "Running on your iQOO's NPU — no cloud, no laptop needed."
+) =
     Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(
             modifier = Modifier.padding(horizontal = 28.dp),
@@ -1601,7 +1608,7 @@ private fun displayModelText(text: String): String = text.trim()
             }
             Spacer(Modifier.height(22.dp))
             Text(
-                text = if (incognito) "Private session" else "Let's iQuest on and on, Delfi.\nAre you ready?",
+                text = title,
                 color = MaterialTheme.colorScheme.onBackground,
                 fontFamily = FontFamily.Serif,
                 fontSize = 25.sp,
@@ -1610,8 +1617,7 @@ private fun displayModelText(text: String): String = text.trim()
             )
             Spacer(Modifier.height(14.dp))
             Text(
-                if (incognito) "This chat is not saved to history or memory."
-                else "Running on your iQOO's NPU — no cloud, no laptop needed.",
+                subtitle,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodyMedium,
                 textAlign = androidx.compose.ui.text.style.TextAlign.Center
@@ -1833,6 +1839,42 @@ private fun displayModelText(text: String): String = text.trim()
 // Bottom bar & drawers
 // ---------------------------------------------------------------------------
 
+/** Same pill-shaped "which model answered" readout used by every composer — main chat and code chat alike. */
+@Composable private fun ModelStatusRow(agent: AgentViewModel) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(24.dp)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 17.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            val isNpu = agent.isNpuActive
+            val isOffline = isNpu || agent.selectedModel?.contains("on-device", ignoreCase = true) == true ||
+                agent.selectedModel?.contains("Snapdragon", ignoreCase = true) == true
+            Text(
+                if (isNpu) "Snapdragon NPU active (HTP v81)"
+                else if (isOffline) "On-device model (offline)"
+                else if (agent.modelServiceReady) "Connected coding model"
+                else "Private offline fallback",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium
+            )
+            Spacer(Modifier.weight(1f))
+            Text(
+                if (isNpu) (agent.lastNpuTokensPerSec?.let { "${String.format(java.util.Locale.US, "%.1f", it)} t/s NPU" } ?: "NPU active")
+                else if (isOffline) "${agent.offlineModelName?.substringBefore(" (") ?: "On-device"} active"
+                else if (agent.modelServiceReady) "Real model ready"
+                else "Offline fallback",
+                color = if (isOffline) Color(0xFF54C878) else MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.SemiBold,
+                style = MaterialTheme.typography.bodyMedium
+            )
+        }
+    }
+}
+
 @Composable private fun Composer(
     agent: AgentViewModel,
     onAdd: () -> Unit,
@@ -1854,38 +1896,7 @@ private fun displayModelText(text: String): String = text.trim()
             tonalElevation = 1.dp
         ) {
             Column(Modifier.padding(14.dp)) {
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                    shape = RoundedCornerShape(24.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 17.dp, vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        val isNpu = agent.isNpuActive
-                        val isOffline = isNpu || agent.selectedModel?.contains("on-device", ignoreCase = true) == true ||
-                            agent.selectedModel?.contains("Snapdragon", ignoreCase = true) == true
-                        Text(
-                            if (isNpu) "Snapdragon NPU active (HTP v81)"
-                            else if (isOffline) "On-device model (offline)"
-                            else if (agent.modelServiceReady) "Connected coding model"
-                            else "Private offline fallback",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                        Spacer(Modifier.weight(1f))
-                        Text(
-                            if (isNpu) (agent.lastNpuTokensPerSec?.let { "${String.format(java.util.Locale.US, "%.1f", it)} t/s NPU" } ?: "NPU active")
-                            else if (isOffline) "${agent.offlineModelName?.substringBefore(" (") ?: "On-device"} active"
-                            else if (agent.modelServiceReady) "Real model ready"
-                            else "Offline fallback",
-                            color = if (isOffline) Color(0xFF54C878) else MaterialTheme.colorScheme.primary,
-                            fontWeight = FontWeight.SemiBold,
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                    }
-                }
+                ModelStatusRow(agent)
 
                 if (agent.attachments.isNotEmpty() || agent.attachmentMessage != null) {
                     AttachmentStrip(agent)
@@ -2935,14 +2946,13 @@ private fun displayModelText(text: String): String = text.trim()
             }
         }
         if (session == null || session.messages.isEmpty()) {
-            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Text(
-                    "Ask the coding agent to explore, edit, or run something in this workspace.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 32.dp),
-                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
-                )
-            }
+            EmptyAgentState(
+                modifier = Modifier.weight(1f),
+                repositoryName = session?.repository,
+                incognito = false,
+                title = "Let's iQuest on and on, Delfi.\nReady to code?",
+                subtitle = "Ask the coding agent to explore, edit, or run something in this workspace."
+            )
         } else {
             LazyColumn(
                 Modifier.weight(1f).fillMaxWidth().padding(horizontal = 18.dp),
@@ -2960,28 +2970,88 @@ private fun displayModelText(text: String): String = text.trim()
                 item { Spacer(Modifier.height(4.dp)) }
             }
         }
-        Surface(modifier = Modifier.fillMaxWidth().imePadding(), color = MaterialTheme.colorScheme.background) {
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                OutlinedTextField(
+        CodeComposer(
+            agent = agent,
+            input = input,
+            onInputChange = { input = it },
+            busy = agent.codeSessionBusy,
+            onSend = {
+                val text = input
+                input = ""
+                agent.sendCodeSessionMessage(text)
+            }
+        )
+    }
+}
+
+/** Coding-chat counterpart of [Composer] — same rounded pill, status readout and send button. */
+@Composable private fun CodeComposer(
+    agent: AgentViewModel,
+    input: String,
+    onInputChange: (String) -> Unit,
+    busy: Boolean,
+    onSend: () -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().imePadding(),
+        color = MaterialTheme.colorScheme.background
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 8.dp, bottom = 16.dp),
+            color = MaterialTheme.colorScheme.surface,
+            shape = RoundedCornerShape(32.dp),
+            shadowElevation = 10.dp,
+            tonalElevation = 1.dp
+        ) {
+            Column(Modifier.padding(14.dp)) {
+                ModelStatusRow(agent)
+
+                TextField(
                     value = input,
-                    onValueChange = { input = it },
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("Message the coding agent…") },
-                    enabled = !agent.codeSessionBusy
-                )
-                Spacer(Modifier.width(8.dp))
-                IconButton(
-                    onClick = {
-                        val text = input
-                        input = ""
-                        agent.sendCodeSessionMessage(text)
+                    onValueChange = onInputChange,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 76.dp, max = 132.dp),
+                    placeholder = {
+                        Text(
+                            "Message the coding agent…",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .75f),
+                            fontSize = 22.sp
+                        )
                     },
-                    enabled = input.isNotBlank() && !agent.codeSessionBusy
-                ) {
-                    Icon(Icons.AutoMirrored.Filled.Send, "Send")
+                    enabled = !busy,
+                    maxLines = 4,
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(fontSize = 20.sp),
+                    colors = TextFieldDefaults.colors(
+                        focusedContainerColor = Color.Transparent,
+                        unfocusedContainerColor = Color.Transparent,
+                        disabledContainerColor = Color.Transparent,
+                        focusedIndicatorColor = Color.Transparent,
+                        unfocusedIndicatorColor = Color.Transparent,
+                        disabledIndicatorColor = Color.Transparent
+                    )
+                )
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Spacer(Modifier.weight(1f))
+                    FilledIconButton(
+                        onClick = { if (!busy && input.isNotBlank()) onSend() },
+                        enabled = input.isNotBlank() && !busy,
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = MaterialTheme.colorScheme.primary,
+                            contentColor = Color.White,
+                            disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                            disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
+                        )
+                    ) {
+                        if (busy) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(21.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.surface
+                            )
+                        } else {
+                            Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
+                        }
+                    }
                 }
             }
         }
