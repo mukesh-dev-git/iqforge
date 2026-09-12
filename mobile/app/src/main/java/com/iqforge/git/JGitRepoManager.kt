@@ -19,6 +19,39 @@ class JGitRepoManager(private val workspaceRoot: File) : RepoManager {
         )
     }
 
+    suspend fun create(name: String, description: String): Repo = withContext(Dispatchers.IO) {
+        val normalized = name.trim()
+        require(normalized.matches(Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,79}"))) {
+            "Use 1-80 letters, numbers, dots, dashes, or underscores for the project name"
+        }
+        val target = RepositoryPaths.requireInside(workspaceRoot, workspaceRoot.resolve(normalized))
+        require(!target.exists()) { "A project named $normalized already exists" }
+        target.mkdirs()
+        try {
+            target.resolve("README.md").writeText(
+                buildString {
+                    appendLine("# $normalized")
+                    if (description.isNotBlank()) {
+                        appendLine()
+                        appendLine(description.trim())
+                    }
+                }
+            )
+            Git.init().setDirectory(target).call().use { git ->
+                git.add().addFilepattern("README.md").call()
+                git.commit()
+                    .setMessage("Initialize $normalized")
+                    .setAuthor("iQForge", "iqforge@local")
+                    .setCommitter("iQForge", "iqforge@local")
+                    .call()
+                Repo(target, normalized)
+            }
+        } catch (error: Exception) {
+            target.deleteRecursively()
+            throw IllegalStateException(friendlyMessage("Project creation failed", error), error)
+        }
+    }
+
     override suspend fun clone(url: String, into: File): Repo = withContext(Dispatchers.IO) {
         require(url.startsWith("https://")) { "Use an HTTPS repository URL" }
         val target = RepositoryPaths.requireInside(workspaceRoot, into)

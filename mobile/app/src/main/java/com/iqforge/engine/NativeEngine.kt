@@ -9,7 +9,8 @@ import java.io.FileNotFoundException
 import android.util.Log
 
 class NativeEngine(private val context: Context) : CodeEngine {
-    private val modelFileName = "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
+    val modelFileName = "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
+    val displayName = "Qwen2.5 Coder 1.5B (on-device)"
     private var isReady = false
     private var modelPath: String = ""
 
@@ -29,6 +30,17 @@ class NativeEngine(private val context: Context) : CodeEngine {
                     }
                 }
             }
+            if (modelFile.length() < 100_000_000L) {
+                Log.e("NativeEngine", "Rejected incomplete GGUF model: ${modelFile.length()} bytes")
+                return@withContext false
+            }
+            modelFile.inputStream().use { input ->
+                val magic = ByteArray(4)
+                if (input.read(magic) != 4 || !magic.contentEquals(byteArrayOf('G'.code.toByte(), 'G'.code.toByte(), 'U'.code.toByte(), 'F'.code.toByte()))) {
+                    Log.e("NativeEngine", "Rejected model without GGUF header")
+                    return@withContext false
+                }
+            }
             modelPath = modelFile.absolutePath
             isReady = true
             true
@@ -40,6 +52,8 @@ class NativeEngine(private val context: Context) : CodeEngine {
             false
         }
     }
+
+    fun installedModelBytes(): Long = File(context.filesDir, modelFileName).takeIf(File::isFile)?.length() ?: 0L
 
     private external fun nativeGenerate(modelPath: String, prompt: String): String
 

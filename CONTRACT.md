@@ -54,7 +54,7 @@ single diff via the GitHub REST API.
 **Escalate to the bigger model** — `POST http://<laptop-ip>:8000/escalate`
 
 ```json
-{ "task": "review" | "debug" | "explain" | "write", "context": "...", "instruction": "..." }
+{ "task": "review" | "debug" | "explain" | "write", "context": "...", "instruction": "...", "effort": "low" | "medium" | "high" | "extra" | "max" }
 ```
 ```json
 { "result": "..." }
@@ -70,6 +70,45 @@ rename or alias it)*
 ```json
 { "stdout": "...", "stderr": "...", "exit_code": 0 }
 ```
+
+**Ground a prompt with web results** — `POST http://<laptop-ip>:8000/search`
+
+```json
+{ "query": "Android 16 KB page compatibility", "max_results": 5 }
+```
+```json
+{
+  "query": "Android 16 KB page compatibility",
+  "results": [
+    { "title": "...", "url": "https://...", "snippet": "..." }
+  ]
+}
+```
+
+Search is explicit and disabled by default in the phone UI. If enabled, results are appended to
+the on-device prompt context; provider failure never blocks the local engine response.
+
+**Discover installed real models** — `GET /models`
+
+The response is generated from Ollama's live `/api/tags` result. Models that are merely named in
+configuration but not installed are not returned.
+
+```json
+{ "models": [{ "id": "qwen2.5-coder:1.5b", "parameter_size": "1.5B", "quantization": "Q4_K_M", "capabilities": ["completion"], "selected": true }] }
+```
+
+**Select an installed model** — `POST /models/select`
+
+```json
+{ "model": "qwen2.5-coder:1.5b" }
+```
+
+The endpoint rejects names that Ollama does not report as installed.
+
+**Probe real connectors** — `GET /connectors`
+
+The bridge checks Ollama, authenticated GitHub access through the GitHub CLI OS keyring, and the
+live web-search provider. A failed probe is returned as unavailable and never as connected.
 
 Field names and casing must match exactly on both sides. If the shape changes, update this
 file first.

@@ -1,18 +1,33 @@
 package com.iqforge
 
 import android.os.Bundle
+import android.os.Build
 import android.content.Context
+import android.content.Intent
 import android.app.Application
+import android.Manifest
+import android.net.Uri
+import android.provider.Settings
+import android.speech.RecognizerIntent
+import android.speech.tts.TextToSpeech
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.lifecycle.AndroidViewModel
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -24,41 +39,85 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.CreationExtras
 import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
+import androidx.core.view.WindowCompat
+import androidx.core.content.FileProvider
+import androidx.core.content.ContextCompat
 import com.iqforge.engine.CodeEngine
 import com.iqforge.engine.NativeEngine
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.iqforge.bridge.BridgeTask
 import com.iqforge.bridge.LaptopBridgeClient
+import com.iqforge.bridge.BridgeConnector
+import com.iqforge.bridge.BridgeModel
+import com.iqforge.chat.AttachmentKind
+import com.iqforge.chat.ChatAttachment
+import com.iqforge.chat.ChatAttachmentService
+import com.iqforge.chat.ChatHistoryStore
+import com.iqforge.chat.SavedChat
+import com.iqforge.cowork.CoworkStatus
+import com.iqforge.cowork.CoworkTask
+import com.iqforge.cowork.CoworkTaskStore
+import com.iqforge.dispatch.DispatchRecord
+import com.iqforge.dispatch.DispatchStatus
+import com.iqforge.dispatch.DispatchStore
 import com.iqforge.engine.OfflineEngine
 import kotlinx.coroutines.launch
 import com.iqforge.workspace.WorkspaceEntry
 import com.iqforge.workspace.WorkspaceUiState
 import com.iqforge.workspace.WorkspaceViewModel
 import java.io.IOException
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
-private val ForgeDarkColors = darkColorScheme(primary = Color(0xFF5B9CFF), background = Color(0xFF141414), surface = Color(0xFF1B1B1B), surfaceVariant = Color(0xFF222222), outline = Color(0xFF373737))
+private val IqfCoral = Color(0xFFDA7756)
+private val ForgeDarkColors = darkColorScheme(
+    primary = IqfCoral,
+    background = Color(0xFF121311),
+    surface = Color(0xFF1D1E1B),
+    surfaceVariant = Color(0xFF282925),
+    outline = Color(0xFF3B3C37),
+    onBackground = Color(0xFFF2EFE9),
+    onSurface = Color(0xFFF2EFE9),
+    onSurfaceVariant = Color(0xFFAAA9A3)
+)
 private val ForgeLightColors = lightColorScheme(primary = Color(0xFF185ABC), background = Color(0xFFFFFBFF), surface = Color(0xFFFFFBFF), surfaceVariant = Color(0xFFE7E0EC))
 
 private enum class Appearance { SYSTEM, LIGHT, DARK }
+private enum class FontChoice { DEFAULT, SERIF, MONOSPACE }
+private enum class AppDestination { CHATS, DISPATCH, COWORK, PROJECTS, PROJECT_DETAIL, CODE, ARTIFACTS, SETTINGS }
+private enum class SettingsDialog { NONE, USAGE, CAPABILITIES, COLOR, FONT, VOICE, PRIVACY, DEVICE }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) = super.onCreate(savedInstanceState).also {
         setContent {
-            ForgeTheme { appearance, updateAppearance ->
+            ForgeTheme { appearance, updateAppearance, fontChoice, updateFontChoice ->
                 var showSplash by remember { mutableStateOf(true) }
                 if (showSplash) LaunchSplash { showSplash = false }
-                else AgentApp(appearance = appearance, onAppearanceChange = updateAppearance)
+                else AgentApp(
+                    appearance = appearance,
+                    onAppearanceChange = updateAppearance,
+                    fontChoice = fontChoice,
+                    onFontChoiceChange = updateFontChoice
+                )
             }
         }
     }
@@ -98,19 +157,72 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@Composable private fun ForgeTheme(content: @Composable (Appearance, (Appearance) -> Unit) -> Unit) {
+@Composable private fun ForgeTheme(
+    content: @Composable (Appearance, (Appearance) -> Unit, FontChoice, (FontChoice) -> Unit) -> Unit
+) {
     val context = LocalContext.current
     val preferences = remember { context.getSharedPreferences("iqforge_settings", Context.MODE_PRIVATE) }
     var appearance by rememberSaveable {
-        mutableStateOf(runCatching { Appearance.valueOf(preferences.getString("appearance", Appearance.SYSTEM.name) ?: Appearance.SYSTEM.name) }.getOrDefault(Appearance.SYSTEM))
+        mutableStateOf(runCatching { Appearance.valueOf(preferences.getString("appearance", Appearance.DARK.name) ?: Appearance.DARK.name) }.getOrDefault(Appearance.DARK))
+    }
+    var fontChoice by rememberSaveable {
+        mutableStateOf(runCatching { FontChoice.valueOf(preferences.getString("font_style", FontChoice.DEFAULT.name) ?: FontChoice.DEFAULT.name) }.getOrDefault(FontChoice.DEFAULT))
     }
     val dark = when (appearance) { Appearance.SYSTEM -> isSystemInDarkTheme(); Appearance.LIGHT -> false; Appearance.DARK -> true }
-    MaterialTheme(colorScheme = if (dark) ForgeDarkColors else ForgeLightColors) {
-        content(appearance) { value ->
-            appearance = value
-            preferences.edit().putString("appearance", value.name).apply()
+    val colors = if (dark) ForgeDarkColors else ForgeLightColors
+    SideEffect {
+        (context as? ComponentActivity)?.window?.let { window ->
+            window.statusBarColor = colors.background.toArgb()
+            window.navigationBarColor = colors.background.toArgb()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                window.isNavigationBarContrastEnforced = false
+            }
+            WindowCompat.getInsetsController(window, window.decorView).apply {
+                isAppearanceLightStatusBars = !dark
+                isAppearanceLightNavigationBars = !dark
+            }
         }
     }
+    MaterialTheme(colorScheme = colors, typography = forgeTypography(fontChoice)) {
+        content(
+            appearance,
+            { value ->
+                appearance = value
+                preferences.edit().putString("appearance", value.name).apply()
+            },
+            fontChoice,
+            { value ->
+                fontChoice = value
+                preferences.edit().putString("font_style", value.name).apply()
+            }
+        )
+    }
+}
+
+private fun forgeTypography(choice: FontChoice): Typography {
+    val family = when (choice) {
+        FontChoice.DEFAULT -> FontFamily.Default
+        FontChoice.SERIF -> FontFamily.Serif
+        FontChoice.MONOSPACE -> FontFamily.Monospace
+    }
+    val base = Typography()
+    return Typography(
+        displayLarge = base.displayLarge.copy(fontFamily = family),
+        displayMedium = base.displayMedium.copy(fontFamily = family),
+        displaySmall = base.displaySmall.copy(fontFamily = family),
+        headlineLarge = base.headlineLarge.copy(fontFamily = family),
+        headlineMedium = base.headlineMedium.copy(fontFamily = family),
+        headlineSmall = base.headlineSmall.copy(fontFamily = family),
+        titleLarge = base.titleLarge.copy(fontFamily = family),
+        titleMedium = base.titleMedium.copy(fontFamily = family),
+        titleSmall = base.titleSmall.copy(fontFamily = family),
+        bodyLarge = base.bodyLarge.copy(fontFamily = family),
+        bodyMedium = base.bodyMedium.copy(fontFamily = family),
+        bodySmall = base.bodySmall.copy(fontFamily = family),
+        labelLarge = base.labelLarge.copy(fontFamily = family),
+        labelMedium = base.labelMedium.copy(fontFamily = family),
+        labelSmall = base.labelSmall.copy(fontFamily = family)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -153,31 +265,427 @@ sealed interface FeedItem {
     ) : FeedItem
 }
 
+enum class ToolAccessMode(val label: String) {
+    AUTO("Auto"),
+    ASK("On demand"),
+    AUTOMATIC("Always available"),
+    OFF("Off")
+}
+
+enum class EffortLevel(val label: String, val wireName: String) {
+    LOW("Low", "low"),
+    MEDIUM("Medium", "medium"),
+    HIGH("High", "high"),
+    EXTRA("Extra", "extra"),
+    MAX("Max", "max")
+}
+
 // ---------------------------------------------------------------------------
 // ViewModel
 // ---------------------------------------------------------------------------
 
 class AgentViewModel(
     private val codeEngine: CodeEngine,
-    internal var bridgeClient: LaptopBridgeClient = LaptopBridgeClient()
+    internal var bridgeClient: LaptopBridgeClient = LaptopBridgeClient(),
+    private val preferences: android.content.SharedPreferences? = null,
+    private val attachmentService: ChatAttachmentService = ChatAttachmentService()
 ) : ViewModel() {
+    private val historyStore = preferences?.let(::ChatHistoryStore)
+    private val coworkStore = preferences?.let(::CoworkTaskStore)
+    private val dispatchStore = preferences?.let(::DispatchStore)
     var composer by mutableStateOf(""); private set
-    var bridgeUrl by mutableStateOf("http://192.168.1.2:8000"); private set
+    var bridgeUrl by mutableStateOf(preferences?.getString("bridge_url", DEFAULT_BRIDGE_URL) ?: DEFAULT_BRIDGE_URL); private set
     var sending by mutableStateOf(false); private set
     var feed by mutableStateOf<List<FeedItem>>(emptyList()); internal set
+    var attachments by mutableStateOf<List<ChatAttachment>>(emptyList()); private set
+    var attachmentBusy by mutableStateOf(false); private set
+    var attachmentMessage by mutableStateOf<String?>(null); private set
+    var webSearchEnabled by mutableStateOf(preferences?.getBoolean("web_search", false) ?: false); private set
+    var memoryEnabled by mutableStateOf(preferences?.getBoolean("memory", true) ?: true); private set
+    var toolAccessMode by mutableStateOf(
+        runCatching {
+            ToolAccessMode.valueOf(preferences?.getString("tool_access", ToolAccessMode.AUTO.name) ?: ToolAccessMode.AUTO.name)
+        }.getOrDefault(ToolAccessMode.AUTO)
+    ); private set
+    var effort by mutableStateOf(
+        runCatching {
+            EffortLevel.valueOf(preferences?.getString("effort", EffortLevel.MEDIUM.name) ?: EffortLevel.MEDIUM.name)
+        }.getOrDefault(EffortLevel.MEDIUM)
+    ); private set
+    var connectorStatus by mutableStateOf("Not checked"); private set
+    var checkingConnector by mutableStateOf(false); private set
+    var availableModels by mutableStateOf<List<BridgeModel>>(emptyList()); private set
+    var selectedModel by mutableStateOf<String?>(null); private set
+    var modelServiceReady by mutableStateOf(false); private set
+    var offlineModelReady by mutableStateOf(false); private set
+    var offlineModelBytes by mutableStateOf(0L); private set
+    var connectors by mutableStateOf<List<BridgeConnector>>(emptyList()); private set
+    var chats by mutableStateOf<List<SavedChat>>(historyStore?.load().orEmpty()); private set
+    var activeChatId by mutableStateOf<String?>(null); private set
+    var incognito by mutableStateOf(false); private set
+    var coworkTasks by mutableStateOf<List<CoworkTask>>(coworkStore?.markInterrupted().orEmpty()); private set
+    var dispatchRecords by mutableStateOf<List<DispatchRecord>>(dispatchStore?.load().orEmpty()); private set
+    var dispatchWorkspaces by mutableStateOf<List<String>>(emptyList()); private set
+    var dispatchBusy by mutableStateOf(false); private set
+    var dispatchError by mutableStateOf<String?>(null); private set
+    var fileEditBusy by mutableStateOf(false); private set
+    var fileEditError by mutableStateOf<String?>(null); private set
+    var remoteFiles by mutableStateOf<List<String>>(emptyList()); private set
+    var remoteFilePath by mutableStateOf<String?>(null); private set
+    var remoteFileText by mutableStateOf(""); private set
+    var remoteBusy by mutableStateOf(false); private set
+    var remoteResult by mutableStateOf<String?>(null); private set
+    var activeRemoteWorkspace by mutableStateOf(""); private set
 
     companion object {
+        private const val DEFAULT_BRIDGE_URL = "http://10.0.2.2:8000"
+        private const val USB_BRIDGE_URL = "http://127.0.0.1:8000"
+        private const val MEMORY_SEPARATOR = "\u001E"
+        private const val MAX_MEMORY_ITEMS = 6
+
         val Factory: ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>, extras: CreationExtras): T {
                 val application = checkNotNull(extras[APPLICATION_KEY])
-                return AgentViewModel(NativeEngine(application)) as T
+                val preferences = application.getSharedPreferences("iqforge_agent", Context.MODE_PRIVATE)
+                val looksLikeEmulator = Build.FINGERPRINT.contains("generic", ignoreCase = true) ||
+                    Build.MODEL.contains("Emulator", ignoreCase = true)
+                if (!looksLikeEmulator && preferences.getString("bridge_url", DEFAULT_BRIDGE_URL) == DEFAULT_BRIDGE_URL) {
+                    preferences.edit().putString("bridge_url", USB_BRIDGE_URL).apply()
+                }
+                return AgentViewModel(
+                    codeEngine = NativeEngine(application),
+                    preferences = preferences
+                ) as T
             }
         }
     }
 
+    init {
+        refreshOfflineModel()
+    }
+
+    fun refreshOfflineModel() {
+        val nativeEngine = codeEngine as? NativeEngine ?: return
+        viewModelScope.launch {
+            offlineModelReady = nativeEngine.initialize()
+            offlineModelBytes = nativeEngine.installedModelBytes()
+            if (offlineModelReady && selectedModel == null) selectedModel = nativeEngine.displayName
+        }
+    }
+
+    fun selectOfflineModel() {
+        if (offlineModelReady) selectedModel = (codeEngine as? NativeEngine)?.displayName
+    }
+
     fun updateComposer(value: String) { composer = value }
-    fun updateBridgeUrl(value: String) { bridgeUrl = value }
+    fun updateBridgeUrl(value: String) {
+        bridgeUrl = value
+        preferences?.edit()?.putString("bridge_url", value)?.apply()
+        connectorStatus = "Not checked"
+    }
+    fun updateWebSearch(enabled: Boolean) {
+        webSearchEnabled = enabled
+        preferences?.edit()?.putBoolean("web_search", enabled)?.apply()
+    }
+    fun updateMemory(enabled: Boolean) {
+        memoryEnabled = enabled
+        preferences?.edit()?.putBoolean("memory", enabled)?.apply()
+    }
+    fun updateToolAccess(mode: ToolAccessMode) {
+        toolAccessMode = mode
+        preferences?.edit()?.putString("tool_access", mode.name)?.apply()
+    }
+    fun updateEffort(level: EffortLevel) {
+        effort = level
+        preferences?.edit()?.putString("effort", level.name)?.apply()
+    }
+
+    fun newChat(privateMode: Boolean = false) {
+        activeChatId = if (privateMode) null else "chat-${System.currentTimeMillis()}"
+        incognito = privateMode
+        composer = ""
+        attachments = emptyList()
+        attachmentMessage = null
+        feed = emptyList()
+    }
+
+    fun clearSavedChats() {
+        historyStore?.clear()
+        chats = emptyList()
+        if (!incognito) newChat()
+    }
+
+    fun clearCurrentChat() {
+        activeChatId?.let { chats = historyStore?.remove(it).orEmpty() }
+        newChat(privateMode = incognito)
+    }
+
+    fun clearMemory() {
+        preferences?.edit()?.remove("chat_memory")?.apply()
+    }
+
+    fun createCoworkTask(title: String, instruction: String, repository: String?) {
+        require(title.isNotBlank()) { "Enter a task name" }
+        require(instruction.isNotBlank()) { "Describe what the task should achieve" }
+        val store = coworkStore ?: return
+        val task = store.create(title, instruction, repository)
+        coworkTasks = store.load()
+        viewModelScope.launch {
+            coworkTasks = try {
+                val context = repository?.let { "Repository: $it" }.orEmpty()
+                val result = bridgeClient.escalateWithOptions(
+                    laptopUrl = bridgeUrl,
+                    task = inferTask(instruction),
+                    context = context,
+                    instruction = instruction,
+                    effort = effort.wireName
+                )
+                store.finish(task.id, result)
+            } catch (error: Exception) {
+                store.fail(task.id, error.message ?: "Task failed")
+            }
+        }
+    }
+
+    fun removeCoworkTask(id: String) {
+        coworkTasks = coworkStore?.remove(id).orEmpty()
+    }
+
+    fun refreshDispatchWorkspaces() {
+        viewModelScope.launch {
+            dispatchWorkspaces = runCatching { bridgeClient.dispatchWorkspaces(bridgeUrl) }
+                .onFailure { dispatchError = it.message }
+                .getOrDefault(emptyList())
+            if (activeRemoteWorkspace.isBlank()) activeRemoteWorkspace = dispatchWorkspaces.firstOrNull().orEmpty()
+        }
+    }
+
+    fun selectRemoteWorkspace(path: String) {
+        activeRemoteWorkspace = path
+        refreshRemoteFiles(path)
+    }
+
+    fun cloneRemoteRepository(root: String, url: String) {
+        if (remoteBusy) return
+        remoteBusy = true; remoteResult = "Cloning repository…"
+        viewModelScope.launch {
+            try {
+                val result = bridgeClient.cloneRepository(bridgeUrl, root, url.trim())
+                activeRemoteWorkspace = result.path
+                remoteResult = "Repository cloned\n${result.output}"
+                remoteBusy = false
+                refreshRemoteFiles(result.path)
+            } catch (error: Exception) { remoteResult = error.message ?: "Clone failed" }
+            finally { remoteBusy = false }
+        }
+    }
+
+    fun createRemoteRepository(root: String, name: String, publish: Boolean) {
+        if (remoteBusy) return
+        remoteBusy = true; remoteResult = if (publish) "Creating and publishing repository…" else "Creating repository…"
+        viewModelScope.launch {
+            try {
+                val result = bridgeClient.createRepository(bridgeUrl, root, name.trim(), publish)
+                activeRemoteWorkspace = result.path
+                remoteResult = if (publish) "Private GitHub repository created and pushed" else "Local Git repository created"
+                remoteBusy = false
+                refreshRemoteFiles(result.path)
+            } catch (error: Exception) { remoteResult = error.message ?: "Repository creation failed" }
+            finally { remoteBusy = false }
+        }
+    }
+
+    fun runRemoteCommand(cwd: String, command: String) {
+        if (remoteBusy || command.isBlank()) return
+        remoteBusy = true; remoteResult = "$ $command\nRunning…"
+        viewModelScope.launch {
+            try {
+                val result = bridgeClient.execute(bridgeUrl, command.trim(), cwd)
+                remoteResult = "$ $command\n" + (result.stdout + result.stderr).trim() + "\nExit ${result.exitCode}"
+                remoteBusy = false
+                refreshRemoteFiles(cwd)
+            } catch (error: Exception) { remoteResult = error.message ?: "Command failed" }
+            finally { remoteBusy = false }
+        }
+    }
+
+    fun planDispatch(instruction: String, cwd: String) {
+        if (instruction.isBlank() || cwd.isBlank() || dispatchBusy) return
+        val store = dispatchStore ?: return
+        dispatchBusy = true
+        dispatchError = null
+        viewModelScope.launch {
+            try {
+                val plan = bridgeClient.planDispatch(bridgeUrl, instruction.trim(), cwd)
+                dispatchRecords = store.add(
+                    DispatchRecord(
+                        id = "dispatch-${System.currentTimeMillis()}",
+                        instruction = instruction.trim(),
+                        summary = plan.summary,
+                        command = plan.command,
+                        cwd = plan.cwd,
+                        executable = plan.executable
+                    )
+                )
+            } catch (error: Exception) {
+                dispatchError = error.message ?: "Dispatch planning failed"
+            } finally {
+                dispatchBusy = false
+            }
+        }
+    }
+
+    fun executeDispatch(record: DispatchRecord) {
+        val command = record.command ?: return
+        val store = dispatchStore ?: return
+        if (!record.executable || dispatchBusy) return
+        dispatchBusy = true
+        dispatchError = null
+        dispatchRecords = store.update(record.id) { it.copy(status = DispatchStatus.RUNNING) }
+        viewModelScope.launch {
+            try {
+                val result = bridgeClient.execute(bridgeUrl, command, record.cwd)
+                dispatchRecords = store.update(record.id) {
+                    it.copy(
+                        status = if (result.exitCode == 0) DispatchStatus.COMPLETED else DispatchStatus.FAILED,
+                        stdout = result.stdout,
+                        stderr = result.stderr,
+                        exitCode = result.exitCode
+                    )
+                }
+            } catch (error: Exception) {
+                dispatchRecords = store.update(record.id) {
+                    it.copy(status = DispatchStatus.FAILED, stderr = error.message ?: "Execution failed")
+                }
+            } finally {
+                dispatchBusy = false
+            }
+        }
+    }
+
+    fun openChat(id: String) {
+        val chat = chats.firstOrNull { it.id == id } ?: return
+        activeChatId = chat.id
+        incognito = false
+        composer = ""
+        attachments = emptyList()
+        feed = chat.messages.map { message ->
+            if (message.role == "user") FeedItem.User(message.text) else FeedItem.Reply(message.text)
+        }
+    }
+
+    private fun saveChatMessage(role: String, text: String) {
+        if (incognito) return
+        val id = activeChatId ?: "chat-${System.currentTimeMillis()}".also { activeChatId = it }
+        chats = historyStore?.append(id, role, text).orEmpty()
+    }
+
+    fun attachCamera(bitmap: android.graphics.Bitmap) = attach("Camera") {
+        attachmentService.fromCamera(bitmap)
+    }
+
+    fun attachCamera(context: Context, uri: android.net.Uri) = attach("Camera") {
+        attachmentService.fromCamera(context, uri)
+    }
+
+    fun attachPhoto(context: Context, uri: android.net.Uri) = attach("Photo") {
+        attachmentService.fromPhoto(context, uri)
+    }
+
+    fun attachFile(context: Context, uri: android.net.Uri) = attach("File") {
+        attachmentService.fromFile(context, uri)
+    }
+
+    fun removeAttachment(id: String) {
+        attachments = attachments.filterNot { it.id == id }
+        attachmentMessage = if (attachments.isEmpty()) null else "${attachments.size} item(s) attached"
+    }
+
+    fun reportAttachmentError(message: String) {
+        attachmentMessage = message
+    }
+
+    private fun attach(source: String, loader: suspend () -> ChatAttachment) {
+        if (attachmentBusy) return
+        attachmentBusy = true
+        attachmentMessage = "Reading $source..."
+        viewModelScope.launch {
+            try {
+                val attachment = loader()
+                attachments = (attachments.filterNot { it.id == attachment.id } + attachment).takeLast(5)
+                attachmentMessage = "Attached ${attachment.name} (${attachment.content.length} characters)"
+            } catch (error: Exception) {
+                attachmentMessage = error.message ?: "$source could not be attached."
+            } finally {
+                attachmentBusy = false
+            }
+        }
+    }
+
+    fun checkBridge() {
+        if (checkingConnector) return
+        checkingConnector = true
+        connectorStatus = "Checking..."
+        viewModelScope.launch {
+            connectorStatus = try {
+                val health = bridgeClient.health(bridgeUrl)
+                modelServiceReady = health.modelReachable
+                selectedModel = health.model
+                if (health.modelReachable) {
+                    "Connected - ${health.backend}${health.model?.let { " / $it" }.orEmpty()}"
+                } else {
+                    "Bridge online - model unavailable"
+                }
+            } catch (error: Exception) {
+                "Unavailable - ${error.message ?: "connection failed"}"
+            } finally {
+                checkingConnector = false
+            }
+        }
+    }
+
+    fun refreshServices() {
+        if (checkingConnector) return
+        checkingConnector = true
+        connectorStatus = "Checking live services..."
+        viewModelScope.launch {
+            try {
+                val health = bridgeClient.health(bridgeUrl)
+                var discoveredModels = bridgeClient.models(bridgeUrl)
+                if (discoveredModels.isNotEmpty() && discoveredModels.none { it.selected }) {
+                    val verified = bridgeClient.selectModel(bridgeUrl, discoveredModels.first().id)
+                    discoveredModels = discoveredModels.map { it.copy(selected = it.id == verified.id) }
+                }
+                val discoveredConnectors = bridgeClient.connectors(bridgeUrl)
+                availableModels = discoveredModels
+                connectors = discoveredConnectors
+                selectedModel = discoveredModels.firstOrNull { it.selected }?.id ?: health.model
+                modelServiceReady = discoveredModels.any { it.id == selectedModel }
+                val connectedCount = discoveredConnectors.count { it.connected }
+                connectorStatus = "$connectedCount live connector(s)"
+            } catch (error: Exception) {
+                modelServiceReady = false
+                connectorStatus = "Unavailable - ${error.message ?: "connection failed"}"
+            } finally {
+                checkingConnector = false
+            }
+        }
+    }
+
+    fun selectModel(model: BridgeModel) {
+        viewModelScope.launch {
+            try {
+                val selected = bridgeClient.selectModel(bridgeUrl, model.id)
+                selectedModel = selected.id
+                availableModels = availableModels.map { it.copy(selected = it.id == selected.id) }
+                modelServiceReady = true
+                connectorStatus = "Connected - ollama / ${selected.id}"
+            } catch (error: Exception) {
+                connectorStatus = "Model selection failed - ${error.message.orEmpty()}"
+            }
+        }
+    }
     fun showClone(name: String) {
         if (feed.none { it is FeedItem.Status && it.text == "Cloned $name" })
             feed += FeedItem.Status("Cloned $name", success = true)
@@ -196,27 +704,59 @@ class AgentViewModel(
 
     fun send(fileContext: String = "") {
         val prompt = composer.trim(); if (prompt.isEmpty() || sending) return
+        val selectedAttachments = attachments
+        val remembered = if (memoryEnabled && !incognito) rememberedContext() else ""
         composer = ""; sending = true
+        attachments = emptyList()
+        attachmentMessage = null
         feed += FeedItem.User(prompt)
-        feed += FeedItem.Tool("iQForge — preparing an on-device response...")
+        saveChatMessage("user", prompt)
         viewModelScope.launch {
             try {
                 val task = inferTask(prompt)
-                val response = when (task) {
-                    BridgeTask.REVIEW  -> {
-                        val findings = codeEngine.review(fileContext)
-                        if (findings.isEmpty()) "No issues found."
-                        else findings.joinToString("\n") { "Line ${it.line}: [${it.severity}] ${it.message}" }
+                var enrichedContext = buildContext(fileContext, selectedAttachments, remembered)
+                if (webSearchEnabled) {
+                    try {
+                        val results = bridgeClient.search(bridgeUrl, prompt)
+                        if (results.isNotEmpty()) {
+                            val grounding = results.joinToString("\n") {
+                                "- ${it.title}: ${it.snippet} (${it.url})"
+                            }
+                            enrichedContext += "\n\nWeb search grounding:\n$grounding"
+                            feed += FeedItem.Status("Web search added ${results.size} live source(s).", success = true)
+                        } else {
+                            feed += FeedItem.Status("Web search completed with no matching instant results.")
+                        }
+                    } catch (error: Exception) {
+                        feed += FeedItem.Status("Web search unavailable; continuing on-device. ${error.message.orEmpty()}", error = true)
                     }
-                    BridgeTask.DEBUG   -> codeEngine.debug(prompt, fileContext)
-                    BridgeTask.EXPLAIN -> codeEngine.explain(fileContext)
-                    BridgeTask.WRITE   -> codeEngine.write(prompt, fileContext)
                 }
-                feed += FeedItem.Reply(response)
-                // Offer escalation when a bridge URL is configured.
-                // Always explicit — the user must tap "Ask laptop"; nothing is sent automatically.
-                if (bridgeUrl.isNotBlank()) {
-                    feed += FeedItem.EscalatePrompt(prompt = prompt, context = fileContext, task = task)
+                val useRealModel = modelServiceReady &&
+                    (toolAccessMode == ToolAccessMode.AUTO || toolAccessMode == ToolAccessMode.AUTOMATIC)
+                val response = if (useRealModel) {
+                    bridgeClient.escalateWithOptions(
+                        laptopUrl = bridgeUrl,
+                        task = task,
+                        context = enrichedContext,
+                        instruction = prompt,
+                        effort = effort.wireName
+                    ).also { feed += FeedItem.LaptopReply(it) }
+                } else {
+                    when (task) {
+                        BridgeTask.REVIEW  -> {
+                            val findings = codeEngine.review(enrichedContext)
+                            if (findings.isEmpty()) "No issues found."
+                            else findings.joinToString("\n") { "Line ${it.line}: [${it.severity}] ${it.message}" }
+                        }
+                        BridgeTask.DEBUG   -> codeEngine.debug(prompt, enrichedContext)
+                        BridgeTask.EXPLAIN -> codeEngine.explain(enrichedContext)
+                        BridgeTask.WRITE   -> codeEngine.write(prompt, enrichedContext)
+                    }.also { feed += FeedItem.Reply(it) }
+                }
+                saveChatMessage("assistant", response)
+                if (memoryEnabled && !incognito) remember("User: $prompt\nIQF: ${response.take(1_500)}")
+                if (!useRealModel && bridgeUrl.isNotBlank() && toolAccessMode != ToolAccessMode.OFF) {
+                    feed += FeedItem.EscalatePrompt(prompt = prompt, context = enrichedContext, task = task)
                 }
             } catch (error: Exception) {
                 feed += FeedItem.Status(error.message ?: "The offline engine could not complete this request.", error = true)
@@ -264,6 +804,7 @@ class AgentViewModel(
                     matchType = { it is FeedItem.EscalatePrompt },
                     replacement = FeedItem.LaptopReply(result)
                 )
+                saveChatMessage("assistant", result)
             } catch (e: IOException) {
                 replaceLast(
                     matchType = { it is FeedItem.EscalatePrompt },
@@ -295,6 +836,132 @@ class AgentViewModel(
             feed = mutable
         }
     }
+
+    fun generateFileEdit(path: String, currentText: String, instruction: String, onResult: (String) -> Unit) {
+        if (instruction.isBlank() || fileEditBusy) return
+        fileEditBusy = true
+        fileEditError = null
+        viewModelScope.launch {
+            try {
+                val generated = if (modelServiceReady) {
+                    bridgeClient.escalateWithOptions(
+                        bridgeUrl,
+                        BridgeTask.WRITE,
+                        "File: $path\n\n$currentText",
+                        "Apply this change and return the complete updated file only: ${instruction.trim()}",
+                        effort.wireName
+                    )
+                } else {
+                    codeEngine.write(
+                        "Apply this change and return the complete updated file only: ${instruction.trim()}",
+                        "File: $path\n\n$currentText"
+                    )
+                }
+                val cleaned = generated.trim()
+                    .replace(Regex("^```[A-Za-z0-9_+.-]*\\s*"), "")
+                    .replace(Regex("\\s*```$"), "")
+                    .trim()
+                require(cleaned.isNotBlank() && !cleaned.startsWith("ERROR:")) {
+                    cleaned.ifBlank { "Model returned an empty edit" }
+                }
+                onResult(cleaned)
+            } catch (error: Exception) {
+                fileEditError = error.message ?: "IQForge could not generate the edit"
+            } finally {
+                fileEditBusy = false
+            }
+        }
+    }
+
+    fun refreshRemoteFiles(cwd: String) {
+        if (cwd.isBlank() || remoteBusy) return
+        remoteBusy = true
+        remoteResult = null
+        viewModelScope.launch {
+            try { remoteFiles = bridgeClient.workspaceFiles(bridgeUrl, cwd) }
+            catch (error: Exception) { remoteResult = error.message ?: "Could not load laptop files" }
+            finally { remoteBusy = false }
+        }
+    }
+
+    fun openRemoteFile(cwd: String, path: String) {
+        remoteBusy = true
+        remoteResult = null
+        viewModelScope.launch {
+            try {
+                remoteFileText = bridgeClient.workspaceFile(bridgeUrl, cwd, path)
+                remoteFilePath = path
+            } catch (error: Exception) { remoteResult = error.message ?: "Could not read $path" }
+            finally { remoteBusy = false }
+        }
+    }
+
+    fun updateRemoteFile(value: String) { remoteFileText = value }
+    fun closeRemoteFile() { remoteFilePath = null; remoteFileText = "" }
+
+    fun saveRemoteFile(cwd: String) {
+        val path = remoteFilePath ?: return
+        remoteBusy = true
+        remoteResult = null
+        viewModelScope.launch {
+            try {
+                val bytes = bridgeClient.writeWorkspaceFile(bridgeUrl, cwd, path, remoteFileText)
+                remoteResult = "Saved $path on laptop ($bytes bytes)"
+            } catch (error: Exception) { remoteResult = error.message ?: "Could not save $path" }
+            finally { remoteBusy = false }
+        }
+    }
+
+    fun runRemoteTests(cwd: String) {
+        remoteBusy = true
+        remoteResult = "Running tests on laptop…"
+        viewModelScope.launch {
+            try {
+                val result = bridgeClient.execute(
+                    bridgeUrl,
+                    "bridge/.venv/Scripts/python.exe -m pytest -q bridge/tests examples/mobile-edit-demo",
+                    cwd
+                )
+                remoteResult = (result.stdout + result.stderr).trim().ifBlank { "Tests finished with exit code ${result.exitCode}" }
+            } catch (error: Exception) { remoteResult = error.message ?: "Test run failed" }
+            finally { remoteBusy = false }
+        }
+    }
+
+    private fun buildContext(
+        fileContext: String,
+        selectedAttachments: List<ChatAttachment>,
+        remembered: String
+    ): String = buildString {
+        if (fileContext.isNotBlank()) append("Open editor context:\n$fileContext")
+        selectedAttachments.forEach { attachment ->
+            if (isNotEmpty()) append("\n\n")
+            append("Attached ${attachment.kind.name.lowercase()} - ${attachment.name}:\n")
+            append(attachment.content)
+        }
+        if (remembered.isNotBlank()) {
+            if (isNotEmpty()) append("\n\n")
+            append("Recent local memory:\n$remembered")
+        }
+    }.take(96_000)
+
+    private fun rememberedContext(): String = preferences
+        ?.getString("chat_memory", "")
+        .orEmpty()
+        .split(MEMORY_SEPARATOR)
+        .filter { it.isNotBlank() }
+        .takeLast(3)
+        .joinToString("\n\n")
+
+    private fun remember(entry: String) {
+        val history = preferences?.getString("chat_memory", "")
+            .orEmpty()
+            .split(MEMORY_SEPARATOR)
+            .filter { it.isNotBlank() }
+            .plus(entry.take(2_000))
+            .takeLast(MAX_MEMORY_ITEMS)
+        preferences?.edit()?.putString("chat_memory", history.joinToString(MEMORY_SEPARATOR))?.apply()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -305,27 +972,349 @@ class AgentViewModel(
 @Composable private fun AgentApp(
     appearance: Appearance,
     onAppearanceChange: (Appearance) -> Unit,
+    fontChoice: FontChoice,
+    onFontChoiceChange: (FontChoice) -> Unit,
     workspace: WorkspaceViewModel = viewModel(),
     agent: AgentViewModel = viewModel(factory = AgentViewModel.Factory)
 ) {
     val state by workspace.state
-    var drawerOpen by remember { mutableStateOf(false) }
-    state.repo?.let { agent.showClone(it.name) }
-    if (state.selectedFile != null) { EditorScreen(state, workspace); return }
-    Scaffold(
-        topBar = { TopAppBar(
-            title = { Column { Text(state.repo?.name ?: "iQForge", style = MaterialTheme.typography.titleMedium); Text("Local code agent", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .65f)) } },
-            navigationIcon = { IconButton({ drawerOpen = !drawerOpen }) { Icon(Icons.Default.Menu, "Open repository drawer") } },
-            actions = { IconButton({ drawerOpen = true }) { Icon(Icons.Default.Folder, "Repository files") } }
-        ) },
-        bottomBar = { Composer(agent) { agent.send(state.editorText) } }
-    ) { padding ->
-        Row(Modifier.fillMaxSize().padding(padding)) {
-            if (drawerOpen) RepositoryDrawer(state, workspace, agent, appearance, onAppearanceChange) { drawerOpen = false }
-            Feed(Modifier.weight(1f), agent, state)
+    val context = LocalContext.current
+    val settingsPreferences = remember { context.getSharedPreferences("iqforge_settings", Context.MODE_PRIVATE) }
+    var hapticEnabled by rememberSaveable { mutableStateOf(settingsPreferences.getBoolean("haptic_feedback", true)) }
+    var voiceLanguage by rememberSaveable { mutableStateOf(settingsPreferences.getString("voice_language", Locale.getDefault().toLanguageTag()) ?: Locale.getDefault().toLanguageTag()) }
+    var voiceName by rememberSaveable { mutableStateOf(settingsPreferences.getString("tts_voice", "").orEmpty()) }
+    var voicePace by rememberSaveable { mutableStateOf(settingsPreferences.getFloat("voice_pace", 1f)) }
+    var navigationOpen by remember { mutableStateOf(false) }
+    var destination by rememberSaveable { mutableStateOf(AppDestination.CHATS) }
+    var selectedProjectName by rememberSaveable { mutableStateOf<String?>(null) }
+    var showAddToChat by rememberSaveable { mutableStateOf(false) }
+    var showToolAccess by rememberSaveable { mutableStateOf(false) }
+    var showConnectors by rememberSaveable { mutableStateOf(false) }
+    var showProjects by rememberSaveable { mutableStateOf(false) }
+    var showModels by rememberSaveable { mutableStateOf(false) }
+    var showEffort by rememberSaveable { mutableStateOf(false) }
+    var showCreateTask by rememberSaveable { mutableStateOf(false) }
+    var showCreateProject by rememberSaveable { mutableStateOf(false) }
+    var settingsDialog by rememberSaveable { mutableStateOf(SettingsDialog.NONE) }
+    var cameraUri by remember { mutableStateOf<android.net.Uri?>(null) }
+    val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { captured ->
+        val uri = cameraUri
+        if (captured && uri != null) agent.attachCamera(context, uri)
+        else if (!captured) agent.reportAttachmentError("Camera capture was cancelled.")
+    }
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) cameraUri?.let(cameraLauncher::launch)
+        else agent.reportAttachmentError("Camera permission is required to scan code.")
+    }
+    val photoLauncher = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        uri?.let { agent.attachPhoto(context, it) }
+    }
+    val fileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let { agent.attachFile(context, it) }
+    }
+    val speechLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK) {
+            val spoken = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()
+            if (!spoken.isNullOrBlank()) agent.updateComposer(spoken)
         }
     }
+    val launchSpeech: () -> Unit = {
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, voiceLanguage)
+            putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak your IQF request")
+        }
+        runCatching { speechLauncher.launch(intent) }
+            .onFailure { agent.reportAttachmentError("No Android speech recognition service is available.") }
+        Unit
+    }
+    val audioPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) launchSpeech() else agent.reportAttachmentError("Microphone permission is required for voice input.")
+    }
+    val startVoiceInput: () -> Unit = {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            launchSpeech()
+        } else {
+            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+    LaunchedEffect(Unit) {
+        agent.refreshServices()
+        agent.refreshDispatchWorkspaces()
+    }
+    state.repo?.let { agent.showClone(it.name) }
+    if (state.selectedFile != null) { EditorScreen(state, workspace, agent); return }
+    Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
+        topBar = {
+            MinimalAgentHeader(
+                incognito = agent.incognito,
+                onMenu = { navigationOpen = !navigationOpen },
+                onIncognito = {
+                    agent.newChat(privateMode = !agent.incognito)
+                    destination = AppDestination.CHATS
+                }
+            )
+        },
+        bottomBar = {
+            if (destination == AppDestination.CHATS) {
+                Composer(
+                    agent = agent,
+                    onAdd = { showAddToChat = true },
+                    onModel = { showModels = true },
+                    onVoice = startVoiceInput,
+                    hapticEnabled = hapticEnabled,
+                    send = { agent.send(state.editorText) }
+                )
+            }
+        }
+    ) { padding ->
+        Box(Modifier.fillMaxSize().padding(padding)) {
+            when (destination) {
+                AppDestination.CHATS -> Feed(Modifier.fillMaxSize(), agent, state)
+                AppDestination.DISPATCH -> DispatchPage(agent)
+                AppDestination.COWORK -> CoworkPage(agent, state) { showCreateTask = true }
+                AppDestination.PROJECTS -> ProjectsPage(
+                    state = state,
+                    workspace = workspace,
+                    onOpen = {
+                        workspace.selectRepository(it)
+                        selectedProjectName = it
+                        destination = AppDestination.PROJECT_DETAIL
+                    },
+                    onNew = {
+                        showCreateProject = true
+                    }
+                )
+                AppDestination.PROJECT_DETAIL -> ProjectDetailPage(
+                    name = selectedProjectName,
+                    state = state,
+                    workspace = workspace,
+                    agent = agent,
+                    onArtifacts = { destination = AppDestination.ARTIFACTS },
+                    onNewChat = {
+                        agent.newChat()
+                        destination = AppDestination.CHATS
+                    },
+                    onBack = { destination = AppDestination.PROJECTS }
+                )
+                AppDestination.CODE -> CodeSessionsPage(
+                    state = state,
+                    workspace = workspace,
+                    agent = agent,
+                    onAddDevice = { settingsDialog = SettingsDialog.DEVICE }
+                )
+                AppDestination.ARTIFACTS -> ArtifactsPage(state, workspace)
+                AppDestination.SETTINGS -> SettingsPage(
+                    appearance = appearance,
+                    fontChoice = fontChoice,
+                    hapticEnabled = hapticEnabled,
+                    agent = agent,
+                    onDialog = { settingsDialog = it },
+                    onConnectors = {
+                        showConnectors = true
+                        agent.refreshServices()
+                    },
+                    onHaptic = {
+                        hapticEnabled = it
+                        settingsPreferences.edit().putBoolean("haptic_feedback", it).apply()
+                    }
+                )
+            }
+        }
+    }
+    if (navigationOpen) {
+        NavigationMenu(
+            state = state,
+            workspace = workspace,
+            agent = agent,
+            appearance = appearance,
+            onAppearanceChange = onAppearanceChange,
+            onDestination = {
+                destination = it
+                navigationOpen = false
+            },
+            onChat = {
+                agent.openChat(it)
+                destination = AppDestination.CHATS
+                navigationOpen = false
+            },
+            onNewChat = {
+                agent.newChat()
+                destination = AppDestination.CHATS
+                navigationOpen = false
+            },
+            onIncognito = {
+                agent.newChat(privateMode = true)
+                destination = AppDestination.CHATS
+                navigationOpen = false
+            },
+            onDismiss = { navigationOpen = false }
+        )
+    }
+    if (showAddToChat) {
+        AddToChatSheet(
+            agent = agent,
+            hasProject = state.repo != null,
+            onDismiss = { showAddToChat = false },
+            onCamera = {
+                val directory = File(context.cacheDir, "camera").apply { mkdirs() }
+                val target = File(directory, "capture-${System.currentTimeMillis()}.jpg")
+                cameraUri = FileProvider.getUriForFile(context, "${context.packageName}.files", target)
+                cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+            },
+            onPhotos = {
+                photoLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            },
+            onFiles = {
+                fileLauncher.launch(arrayOf("text/*", "application/json", "application/xml", "application/javascript"))
+            },
+            onProject = {
+                showAddToChat = false
+                showProjects = true
+            },
+            onToolAccess = {
+                showAddToChat = false
+                showToolAccess = true
+            },
+            onConnectors = {
+                showAddToChat = false
+                showConnectors = true
+                agent.refreshServices()
+            }
+        )
+    }
+    if (showToolAccess) {
+        ToolAccessDialog(
+            selected = agent.toolAccessMode,
+            onSelect = {
+                agent.updateToolAccess(it)
+                showToolAccess = false
+            },
+            onDismiss = { showToolAccess = false }
+        )
+    }
+    if (showConnectors) {
+        ConnectorsSheet(agent = agent, onDismiss = { showConnectors = false })
+    }
+    if (showProjects) {
+        ProjectSelectorSheet(
+            state = state,
+            onSelect = {
+                workspace.selectRepository(it)
+                showProjects = false
+            },
+            onClone = {
+                showProjects = false
+                workspace.startNewRepository()
+                destination = AppDestination.CODE
+            },
+            onDismiss = { showProjects = false }
+        )
+    }
+    if (showModels) {
+        ModelSelectorSheet(
+            agent = agent,
+            onEffort = {
+                showModels = false
+                showEffort = true
+            },
+            onDismiss = { showModels = false }
+        )
+    }
+    if (showEffort) {
+        EffortSheet(agent = agent, onDismiss = { showEffort = false })
+    }
+    if (showCreateTask) {
+        CreateCoworkTaskSheet(
+            repositories = state.repositories.map { it.name },
+            onCreate = { title, instruction, repository ->
+                agent.createCoworkTask(title, instruction, repository)
+                showCreateTask = false
+                destination = AppDestination.COWORK
+            },
+            onDismiss = { showCreateTask = false }
+        )
+    }
+    if (showCreateProject) {
+        CreateProjectSheet(
+            busy = state.busy,
+            onCreate = { name, goal ->
+                workspace.createRepository(name, goal)
+                showCreateProject = false
+                destination = AppDestination.PROJECTS
+            },
+            onClone = {
+                workspace.startNewRepository()
+                showCreateProject = false
+                destination = AppDestination.CODE
+            },
+            onDismiss = { showCreateProject = false }
+        )
+    }
+    if (settingsDialog != SettingsDialog.NONE) {
+        SettingsDetailDialog(
+            dialog = settingsDialog,
+            appearance = appearance,
+            fontChoice = fontChoice,
+            voiceLanguage = voiceLanguage,
+            voiceName = voiceName,
+            voicePace = voicePace,
+            agent = agent,
+            workspace = state,
+            onAppearance = onAppearanceChange,
+            onFont = onFontChoiceChange,
+            onVoiceLanguage = {
+                voiceLanguage = it
+                settingsPreferences.edit().putString("voice_language", it).apply()
+            },
+            onVoiceName = {
+                voiceName = it
+                settingsPreferences.edit().putString("tts_voice", it).apply()
+            },
+            onVoicePace = {
+                voicePace = it
+                settingsPreferences.edit().putFloat("voice_pace", it).apply()
+            },
+            onStartVoice = startVoiceInput,
+            onDismiss = { settingsDialog = SettingsDialog.NONE }
+        )
+    }
 }
+
+@Composable private fun MinimalAgentHeader(
+    incognito: Boolean,
+    onMenu: () -> Unit,
+    onIncognito: () -> Unit
+) =
+    Surface(color = MaterialTheme.colorScheme.background) {
+        Row(
+            modifier = Modifier.fillMaxWidth().height(70.dp).padding(horizontal = 14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = onMenu) {
+                Icon(
+                    Icons.Default.Menu,
+                    contentDescription = "Open navigation",
+                    tint = MaterialTheme.colorScheme.onSurface.copy(alpha = .72f),
+                    modifier = Modifier.size(30.dp)
+                )
+            }
+            Spacer(Modifier.weight(1f))
+            if (incognito) {
+                Text("Incognito chat", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.weight(1f))
+            }
+            IconButton(onClick = onIncognito) {
+                Icon(
+                    if (incognito) Icons.Default.Close else Icons.Default.VisibilityOff,
+                    contentDescription = if (incognito) "Exit incognito chat" else "Start incognito chat",
+                    tint = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.size(27.dp)
+                )
+            }
+        }
+    }
 
 // ---------------------------------------------------------------------------
 // Feed & card composables
@@ -334,32 +1323,105 @@ class AgentViewModel(
 @Composable private fun Feed(modifier: Modifier, agent: AgentViewModel, workspace: WorkspaceUiState) {
     val listState = rememberLazyListState()
     val feedSize = agent.feed.size
-    LaunchedEffect(feedSize) { if (feedSize > 0) listState.animateScrollToItem(feedSize - 1) }
+    LaunchedEffect(feedSize, agent.sending) {
+        val visibleItems = feedSize + if (agent.sending) 1 else 0
+        if (visibleItems > 0) listState.animateScrollToItem(visibleItems - 1)
+    }
+
+    if (agent.feed.isEmpty()) {
+        EmptyAgentState(modifier, workspace.repo?.name, agent.incognito)
+        return
+    }
 
     LazyColumn(
-        modifier.fillMaxSize().padding(horizontal = 16.dp),
+        modifier.fillMaxSize().padding(horizontal = 18.dp),
         state = listState,
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        item { Spacer(Modifier.height(4.dp)) }
-        if (workspace.repo == null && agent.feed.isEmpty()) item { StatusCard("Open the repository drawer to clone a project, then ask iQForge to review, explain, or fix code.") }
+        item { Spacer(Modifier.height(12.dp)) }
         items(agent.feed) { item -> when (item) {
             is FeedItem.User           -> UserBubble(item.text)
             is FeedItem.Status         -> StatusCard(item.text, item.success, item.error)
             is FeedItem.Tool           -> ToolCard(item.text)
-            is FeedItem.Reply          -> Text(item.text, style = MaterialTheme.typography.bodyLarge)
+            is FeedItem.Reply          -> Text(displayModelText(item.text), style = MaterialTheme.typography.bodyLarge)
             is FeedItem.Diff           -> DiffCard(item)
             is FeedItem.EscalatePrompt -> EscalatePromptCard(item) { agent.escalate(item.prompt, item.context, item.task) }
             is FeedItem.LaptopReply    -> LaptopReplyCard(item.text)
             is FeedItem.EscalateError  -> EscalateErrorCard(item) { agent.escalate(item.prompt, item.context, item.task) }
         } }
+        if (agent.sending) item { ThinkingIndicator() }
         item { Spacer(Modifier.height(8.dp)) }
     }
 }
 
+@Composable private fun ThinkingIndicator() {
+    Row(Modifier.padding(horizontal = 10.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+        CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+        Spacer(Modifier.width(12.dp))
+        Text("Thinking…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+private fun displayModelText(text: String): String = text
+    .replace(Regex("```[A-Za-z0-9_+.-]*"), "")
+    .replace("```", "")
+    .replace("**", "")
+    .replace("`", "")
+    .trim()
+
+@Composable private fun EmptyAgentState(modifier: Modifier, repositoryName: String?, incognito: Boolean) =
+    Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(
+            modifier = Modifier.padding(horizontal = 28.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            if (incognito) {
+                Icon(
+                    Icons.Default.VisibilityOff,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.size(44.dp)
+                )
+            } else {
+                Text(
+                    "IQF",
+                    color = IqfCoral,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 30.sp,
+                    letterSpacing = 2.sp
+                )
+            }
+            Spacer(Modifier.height(22.dp))
+            Text(
+                text = if (incognito) "Private session" else "Up late, Delfi?",
+                color = MaterialTheme.colorScheme.onBackground,
+                fontFamily = FontFamily.Serif,
+                fontSize = 25.sp,
+                lineHeight = 32.sp
+            )
+            if (incognito) {
+                Spacer(Modifier.height(14.dp))
+                Text(
+                    "This chat is not saved to history or memory.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodyMedium,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                )
+            }
+            if (repositoryName != null) {
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    text = repositoryName,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelLarge
+                )
+            }
+        }
+    }
+
 @Composable private fun UserBubble(text: String) =
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-        Surface(color = Color(0xFF0B4D93), shape = RoundedCornerShape(20.dp, 20.dp, 4.dp, 20.dp)) {
+        Surface(color = Color(0xFF553126), shape = RoundedCornerShape(20.dp, 20.dp, 4.dp, 20.dp)) {
             Text(text, Modifier.padding(horizontal = 16.dp, vertical = 11.dp))
         }
     }
@@ -470,7 +1532,7 @@ class AgentViewModel(
                 )
             }
             Spacer(Modifier.height(6.dp))
-            Text(text, style = MaterialTheme.typography.bodyLarge)
+            Text(displayModelText(text), style = MaterialTheme.typography.bodyLarge)
         }
     }
 }
@@ -526,20 +1588,1809 @@ class AgentViewModel(
 // Bottom bar & drawers
 // ---------------------------------------------------------------------------
 
-@Composable private fun Composer(agent: AgentViewModel, send: () -> Unit) =
-    Surface(color = MaterialTheme.colorScheme.background, shadowElevation = 8.dp) {
-        Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton({}) { Icon(Icons.Default.CameraAlt, "Attach code from camera") }
-            IconButton({}) { Icon(Icons.Default.Mic, "Voice prompt") }
-            OutlinedTextField(
-                agent.composer, agent::updateComposer, Modifier.weight(1f),
-                placeholder = { Text("Ask iQForge...") }, singleLine = true
-            )
-            IconButton(send, enabled = agent.composer.isNotBlank() && !agent.sending) {
-                Icon(Icons.AutoMirrored.Filled.Send, "Send", tint = MaterialTheme.colorScheme.primary)
+@Composable private fun Composer(
+    agent: AgentViewModel,
+    onAdd: () -> Unit,
+    onModel: () -> Unit,
+    onVoice: () -> Unit,
+    hapticEnabled: Boolean,
+    send: () -> Unit
+) {
+    val haptics = LocalHapticFeedback.current
+    Surface(
+        modifier = Modifier.fillMaxWidth().imePadding(),
+        color = MaterialTheme.colorScheme.background
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 8.dp, bottom = 16.dp),
+            color = MaterialTheme.colorScheme.surface,
+            shape = RoundedCornerShape(32.dp),
+            shadowElevation = 10.dp,
+            tonalElevation = 1.dp
+        ) {
+            Column(Modifier.padding(14.dp)) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(24.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 17.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            if (agent.modelServiceReady) "Connected coding model" else "Private offline fallback",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Spacer(Modifier.weight(1f))
+                        Text(
+                            if (agent.modelServiceReady) "Real model ready" else "Offline fallback",
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.SemiBold,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                }
+
+                if (agent.attachments.isNotEmpty() || agent.attachmentMessage != null) {
+                    AttachmentStrip(agent)
+                }
+
+                TextField(
+                    value = agent.composer,
+                    onValueChange = agent::updateComposer,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 76.dp, max = 132.dp),
+                    placeholder = {
+                        Text(
+                            "Chat with IQF...",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .75f),
+                            fontSize = 22.sp
+                        )
+                    },
+                    enabled = !agent.sending,
+                    maxLines = 4,
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(fontSize = 20.sp),
+                    colors = TextFieldDefaults.colors(
+                        focusedContainerColor = Color.Transparent,
+                        unfocusedContainerColor = Color.Transparent,
+                        disabledContainerColor = Color.Transparent,
+                        focusedIndicatorColor = Color.Transparent,
+                        unfocusedIndicatorColor = Color.Transparent,
+                        disabledIndicatorColor = Color.Transparent
+                    )
+                )
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    FilledIconButton(
+                        onClick = onAdd,
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                            contentColor = MaterialTheme.colorScheme.onSurface
+                        )
+                    ) {
+                        Icon(Icons.Default.Add, "Attach code from camera")
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    Surface(
+                        onClick = onModel,
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        shape = RoundedCornerShape(24.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 11.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                Icons.Default.AutoAwesome,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(17.dp)
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                agent.selectedModel?.substringBefore(':') ?: "Select model",
+                                fontWeight = FontWeight.Medium,
+                                maxLines = 1
+                            )
+                        }
+                    }
+                    Spacer(Modifier.weight(1f))
+                    IconButton(onClick = onVoice) {
+                        Icon(
+                            Icons.Default.Mic,
+                            contentDescription = "Voice prompt",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(25.dp)
+                        )
+                    }
+                    Spacer(Modifier.width(4.dp))
+                    FilledIconButton(
+                        onClick = {
+                            if (agent.composer.isBlank()) onVoice()
+                            else if (!agent.sending) {
+                                if (hapticEnabled) haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                send()
+                            }
+                        },
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = if (agent.composer.isNotBlank()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                            contentColor = if (agent.composer.isNotBlank()) Color.White else MaterialTheme.colorScheme.surface
+                        )
+                    ) {
+                        if (agent.sending) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(21.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.surface
+                            )
+                        } else {
+                            Icon(
+                                if (agent.composer.isBlank()) Icons.Default.GraphicEq else Icons.AutoMirrored.Filled.Send,
+                                contentDescription = if (agent.composer.isBlank()) "Voice conversation" else "Send"
+                            )
+                        }
+                    }
+                }
             }
         }
     }
+}
+
+@Composable private fun AttachmentStrip(agent: AgentViewModel) {
+    Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+        if (agent.attachments.isNotEmpty()) {
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(agent.attachments, key = { it.id }) { attachment ->
+                    InputChip(
+                        selected = true,
+                        onClick = { agent.removeAttachment(attachment.id) },
+                        label = { Text(attachment.name, maxLines = 1) },
+                        avatar = {
+                            Icon(
+                                when (attachment.kind) {
+                                    AttachmentKind.CAMERA -> Icons.Default.CameraAlt
+                                    AttachmentKind.PHOTO -> Icons.Default.Photo
+                                    AttachmentKind.FILE -> Icons.Default.Description
+                                },
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        },
+                        trailingIcon = { Icon(Icons.Default.Close, "Remove ${attachment.name}", Modifier.size(16.dp)) }
+                    )
+                }
+            }
+        }
+        agent.attachmentMessage?.let { message ->
+            Row(
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (agent.attachmentBusy) {
+                    CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(7.dp))
+                }
+                Text(
+                    message,
+                    color = if (message.contains("could not", true) || message.contains("required", true) || message.startsWith("No "))
+                        MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun AddToChatSheet(
+    agent: AgentViewModel,
+    hasProject: Boolean,
+    onDismiss: () -> Unit,
+    onCamera: () -> Unit,
+    onPhotos: () -> Unit,
+    onFiles: () -> Unit,
+    onProject: () -> Unit,
+    onToolAccess: () -> Unit,
+    onConnectors: () -> Unit
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = Color(0xFF151614),
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        dragHandle = { BottomSheetDefaults.DragHandle(color = MaterialTheme.colorScheme.outline) }
+    ) {
+        LazyColumn(
+            modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            item {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onDismiss) { Icon(Icons.Default.Close, "Close add to chat") }
+                    Text(
+                        "Add to chat",
+                        modifier = Modifier.weight(1f),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(Modifier.size(48.dp))
+                }
+            }
+            item {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    AddToChatTile("Camera", Icons.Default.CameraAlt, onCamera, Modifier.weight(1f))
+                    AddToChatTile("Photos", Icons.Default.PhotoLibrary, onPhotos, Modifier.weight(1f))
+                    AddToChatTile("Files", Icons.Default.UploadFile, onFiles, Modifier.weight(1f))
+                }
+            }
+            item {
+                Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(24.dp)) {
+                    Column {
+                        AddToChatToggle(
+                            title = "Web search",
+                            subtitle = "Ground prompts with live sources through the laptop bridge",
+                            icon = Icons.Default.Language,
+                            checked = agent.webSearchEnabled,
+                            onCheckedChange = agent::updateWebSearch
+                        )
+                        HorizontalDivider(color = MaterialTheme.colorScheme.background)
+                        AddToChatToggle(
+                            title = "Memory",
+                            subtitle = "Remember recent context privately on this device",
+                            icon = Icons.Default.History,
+                            checked = agent.memoryEnabled,
+                            onCheckedChange = agent::updateMemory
+                        )
+                    }
+                }
+            }
+            item {
+                Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(24.dp)) {
+                    Column {
+                        AddToChatRow(
+                            title = "Add to project",
+                            subtitle = if (hasProject) "Current repository attached" else "Choose or clone a repository",
+                            icon = Icons.Default.Inventory2,
+                            onClick = onProject
+                        )
+                        HorizontalDivider(color = MaterialTheme.colorScheme.background)
+                        AddToChatRow(
+                            title = "Tool access",
+                            subtitle = agent.toolAccessMode.label,
+                            icon = Icons.Default.BusinessCenter,
+                            onClick = onToolAccess
+                        )
+                    }
+                }
+            }
+            item {
+                Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(24.dp)) {
+                    AddToChatRow(
+                        title = "Connectors & plugins",
+                        subtitle = agent.connectorStatus,
+                        icon = Icons.Default.Link,
+                        loading = agent.checkingConnector,
+                        onClick = onConnectors
+                    )
+                }
+            }
+            item {
+                Text(
+                    "Connection states come from live provider checks. Unreachable services are never shown as connected.",
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            item { Spacer(Modifier.height(8.dp)) }
+        }
+    }
+}
+
+@Composable private fun AddToChatTile(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) = Surface(
+    onClick = onClick,
+    modifier = modifier.height(142.dp),
+    color = MaterialTheme.colorScheme.surface,
+    shape = RoundedCornerShape(22.dp)
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(50)) {
+            Icon(icon, null, Modifier.padding(15.dp).size(25.dp))
+        }
+        Spacer(Modifier.height(12.dp))
+        Text(label, style = MaterialTheme.typography.titleMedium)
+    }
+}
+
+@Composable private fun AddToChatToggle(
+    title: String,
+    subtitle: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) = Row(
+    modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 14.dp),
+    verticalAlignment = Alignment.CenterVertically
+) {
+    SheetIcon(icon)
+    Spacer(Modifier.width(14.dp))
+    Column(Modifier.weight(1f)) {
+        Text(title, style = MaterialTheme.typography.titleMedium)
+        Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+    }
+    Spacer(Modifier.width(10.dp))
+    Switch(
+        checked = checked,
+        onCheckedChange = onCheckedChange,
+        colors = SwitchDefaults.colors(
+            checkedThumbColor = Color.White,
+            checkedTrackColor = MaterialTheme.colorScheme.primary,
+            uncheckedThumbColor = MaterialTheme.colorScheme.onSurfaceVariant,
+            uncheckedTrackColor = MaterialTheme.colorScheme.surfaceVariant
+        )
+    )
+}
+
+@Composable private fun AddToChatRow(
+    title: String,
+    subtitle: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    loading: Boolean = false,
+    onClick: () -> Unit
+) = Surface(onClick = onClick, color = Color.Transparent) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 15.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        SheetIcon(icon)
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.titleMedium)
+            Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
+        }
+        if (loading) CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+        else Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+@Composable private fun SheetIcon(icon: androidx.compose.ui.graphics.vector.ImageVector) =
+    Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(50)) {
+        Icon(icon, null, Modifier.padding(12.dp).size(23.dp))
+    }
+
+@Composable private fun ToolAccessDialog(
+    selected: ToolAccessMode,
+    onSelect: (ToolAccessMode) -> Unit,
+    onDismiss: () -> Unit
+) = AlertDialog(
+    onDismissRequest = onDismiss,
+    title = { Text("Laptop tool access") },
+    text = {
+        Column {
+            Text(
+                "Controls whether IQF may send the current prompt and attached context to your configured laptop bridge.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium
+            )
+            Spacer(Modifier.height(12.dp))
+            listOf(ToolAccessMode.AUTO, ToolAccessMode.ASK, ToolAccessMode.AUTOMATIC).forEach { mode ->
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    RadioButton(selected = selected == mode, onClick = { onSelect(mode) })
+                    Column {
+                        Text(mode.label, fontWeight = FontWeight.Medium)
+                        Text(
+                            when (mode) {
+                                ToolAccessMode.AUTO -> "IQF chooses the verified real model when it is available."
+                                ToolAccessMode.ASK -> "Load the laptop model only when you tap Ask laptop."
+                                ToolAccessMode.AUTOMATIC -> "Keep the verified model ready for every request."
+                                ToolAccessMode.OFF -> "Never send prompts to the laptop bridge."
+                            },
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+        }
+    },
+    confirmButton = { TextButton(onDismiss) { Text("Done") } }
+)
+
+@Composable private fun NavigationMenu(
+    state: WorkspaceUiState,
+    workspace: WorkspaceViewModel,
+    agent: AgentViewModel,
+    appearance: Appearance,
+    onAppearanceChange: (Appearance) -> Unit,
+    onDestination: (AppDestination) -> Unit,
+    onChat: (String) -> Unit,
+    onNewChat: () -> Unit,
+    onIncognito: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    Box(Modifier.fillMaxSize()) {
+        Surface(onClick = onDismiss, color = Color.Black.copy(alpha = .42f), modifier = Modifier.fillMaxSize()) {}
+        Surface(
+            color = MaterialTheme.colorScheme.background,
+            modifier = Modifier.width(350.dp).fillMaxHeight(),
+            shadowElevation = 18.dp
+        ) {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize().padding(horizontal = 22.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                item {
+                    Row(
+                        Modifier.fillMaxWidth().padding(top = 28.dp, bottom = 20.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "IQF",
+                            color = MaterialTheme.colorScheme.onSurface,
+                            fontFamily = FontFamily.Serif,
+                            fontSize = 30.sp,
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(onIncognito) {
+                            Icon(
+                                Icons.Default.VisibilityOff,
+                                "Start incognito chat",
+                                tint = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                    }
+                }
+                item { NavigationItem("Chats", Icons.Default.Forum) { onDestination(AppDestination.CHATS) } }
+                item { NavigationItem("Clear current chat", Icons.Default.DeleteSweep) { agent.clearCurrentChat(); onDestination(AppDestination.CHATS) } }
+                item { NavigationItem("Dispatch", Icons.Default.Terminal) { onDestination(AppDestination.DISPATCH) } }
+                item { NavigationItem("Cowork", Icons.Default.TaskAlt) { onDestination(AppDestination.COWORK) } }
+                item { NavigationItem("Projects", Icons.Default.Inventory2) { onDestination(AppDestination.PROJECTS) } }
+                item { NavigationItem("Code", Icons.Default.Code) { onDestination(AppDestination.CODE) } }
+                item { NavigationItem("Artifacts", Icons.Default.Category) { onDestination(AppDestination.ARTIFACTS) } }
+                item { NavigationItem("Settings", Icons.Default.Settings) { onDestination(AppDestination.SETTINGS) } }
+                item { HorizontalDivider(Modifier.padding(vertical = 12.dp)) }
+                if (state.pinnedRepositoryNames.isNotEmpty()) {
+                    item { NavigationSection("Pinned") }
+                    items(
+                        state.repositories.filter { it.name in state.pinnedRepositoryNames },
+                        key = { "pin-${it.root.absolutePath}" }
+                    ) { repo ->
+                        NavigationItem(repo.name, Icons.Default.Folder) {
+                            workspace.selectRepository(repo.name)
+                            onDestination(AppDestination.CODE)
+                        }
+                    }
+                    item { HorizontalDivider(Modifier.padding(vertical = 12.dp)) }
+                }
+                item { NavigationSection("Recents") }
+                if (agent.chats.isEmpty()) {
+                    item {
+                        Text(
+                            "Your saved chats will appear here.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                        )
+                    }
+                } else {
+                    items(agent.chats.take(12), key = { it.id }) { chat ->
+                        TextButton(onClick = { onChat(chat.id) }, modifier = Modifier.fillMaxWidth()) {
+                            Text(chat.title, Modifier.fillMaxWidth(), maxLines = 1, color = MaterialTheme.colorScheme.onSurface)
+                        }
+                    }
+                }
+                item { Spacer(Modifier.height(90.dp)) }
+            }
+            Column(
+                Modifier.fillMaxSize().padding(22.dp),
+                verticalArrangement = Arrangement.Bottom
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    FilledIconButton(
+                        onClick = {
+                            onAppearanceChange(
+                                when (appearance) {
+                                    Appearance.DARK -> Appearance.LIGHT
+                                    Appearance.LIGHT -> Appearance.SYSTEM
+                                    Appearance.SYSTEM -> Appearance.DARK
+                                }
+                            )
+                        },
+                        colors = IconButtonDefaults.filledIconButtonColors(containerColor = IqfCoral)
+                    ) { Icon(Icons.Default.Tune, "Cycle appearance") }
+                    Spacer(Modifier.weight(1f))
+                    val darkTheme = MaterialTheme.colorScheme.background.luminance() < .5f
+                    Button(
+                        onClick = onNewChat,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (darkTheme) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.surfaceVariant,
+                            contentColor = if (darkTheme) MaterialTheme.colorScheme.surface else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    ) {
+                        Icon(Icons.Default.Add, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("New chat")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable private fun NavigationItem(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    onClick: () -> Unit
+) = TextButton(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
+    Icon(icon, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+    Spacer(Modifier.width(14.dp))
+    Text(label, Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurface, textAlign = androidx.compose.ui.text.style.TextAlign.Start)
+}
+
+@Composable private fun NavigationSection(label: String) {
+    Text(
+        label,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+    )
+}
+
+@Composable private fun DispatchPage(agent: AgentViewModel) {
+    var instruction by rememberSaveable { mutableStateOf("") }
+    var selectedWorkspace by rememberSaveable(agent.dispatchWorkspaces) {
+        mutableStateOf(agent.dispatchWorkspaces.firstOrNull().orEmpty())
+    }
+    var workspaceMenu by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxSize().padding(horizontal = 22.dp)) {
+        Text("Dispatch", style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 14.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.weight(1f)) {
+                TextButton(onClick = { workspaceMenu = true }, enabled = agent.dispatchWorkspaces.isNotEmpty()) {
+                    Icon(Icons.Default.Folder, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(selectedWorkspace.ifBlank { "No bridge workspace available" }, maxLines = 1)
+                    Icon(Icons.Default.ArrowDropDown, null)
+                }
+                DropdownMenu(expanded = workspaceMenu, onDismissRequest = { workspaceMenu = false }) {
+                    agent.dispatchWorkspaces.forEach { root ->
+                        DropdownMenuItem(
+                            text = { Text(root, maxLines = 1) },
+                            onClick = {
+                                selectedWorkspace = root
+                                workspaceMenu = false
+                            }
+                        )
+                    }
+                }
+            }
+            IconButton(agent::refreshDispatchWorkspaces) { Icon(Icons.Default.Refresh, "Refresh workspaces") }
+        }
+        if (agent.dispatchRecords.isEmpty()) {
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text(
+                    if (selectedWorkspace.isBlank()) "Connect the laptop bridge to discover an allowed workspace."
+                    else "Describe one code search, Git, build, or test action. IQF will create a safe plan for your approval.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                )
+            }
+        } else {
+            LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                items(agent.dispatchRecords, key = { it.id }) { record ->
+                    ElevatedCard(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(record.instruction, style = MaterialTheme.typography.titleMedium)
+                            Text(record.summary, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            record.command?.let {
+                                Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(8.dp)) {
+                                    Text(it, Modifier.fillMaxWidth().padding(10.dp), fontFamily = FontFamily.Monospace)
+                                }
+                            }
+                            if (record.stdout.isNotBlank()) Text(record.stdout.take(4_000), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                            if (record.stderr.isNotBlank()) Text(record.stderr.take(2_000), color = MaterialTheme.colorScheme.error, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(record.status.name.lowercase().replaceFirstChar { it.uppercase() }, color = MaterialTheme.colorScheme.primary, modifier = Modifier.weight(1f))
+                                if (record.status == DispatchStatus.PLANNED && record.executable) {
+                                    Button(onClick = { agent.executeDispatch(record) }, enabled = !agent.dispatchBusy) {
+                                        Icon(Icons.Default.PlayArrow, null)
+                                        Text("Run approved command")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        agent.dispatchError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+        OutlinedTextField(
+            instruction,
+            { instruction = it },
+            Modifier.fillMaxWidth().padding(vertical = 8.dp),
+            placeholder = { Text("Ask IQF to search, build, test, or inspect") },
+            maxLines = 3
+        )
+        Button(
+            onClick = {
+                agent.planDispatch(instruction, selectedWorkspace)
+                instruction = ""
+            },
+            enabled = instruction.isNotBlank() && selectedWorkspace.isNotBlank() && !agent.dispatchBusy,
+            modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp)
+        ) { Text(if (agent.dispatchBusy) "Working…" else "Create safe plan") }
+    }
+}
+
+@Composable private fun ProjectDetailPage(
+    name: String?,
+    state: WorkspaceUiState,
+    workspace: WorkspaceViewModel,
+    agent: AgentViewModel,
+    onArtifacts: () -> Unit,
+    onNewChat: () -> Unit,
+    onBack: () -> Unit
+) {
+    val repo = state.repositories.firstOrNull { it.name == name }
+    if (repo == null) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Project is no longer available") }
+        return
+    }
+    val metadata = state.projectMetadata[repo.name] ?: com.iqforge.workspace.ProjectMetadata(repo.name)
+    val projectTasks = agent.coworkTasks.filter { it.repository == repo.name }
+    var menuOpen by remember { mutableStateOf(false) }
+    var editing by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
+    var description by remember(metadata.description) { mutableStateOf(metadata.description) }
+    var instructions by remember(metadata.instructions) { mutableStateOf(metadata.instructions) }
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(Modifier.fillMaxSize().padding(horizontal = 22.dp), contentPadding = PaddingValues(bottom = 100.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            item {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back to projects") }
+                    Spacer(Modifier.weight(1f))
+                    Box {
+                        IconButton(onClick = { menuOpen = true }) { Icon(Icons.Default.MoreVert, "Project actions") }
+                        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                            DropdownMenuItem(
+                                text = { Text(if (repo.name in state.pinnedRepositoryNames) "Unpin" else "Pin") },
+                                leadingIcon = { Icon(Icons.Default.PushPin, null) },
+                                onClick = { workspace.togglePinned(repo.name); menuOpen = false }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Edit details") },
+                                leadingIcon = { Icon(Icons.Default.Edit, null) },
+                                onClick = { editing = true; menuOpen = false }
+                            )
+                            DropdownMenuItem(
+                                text = { Text(if (metadata.archived) "Restore" else "Archive") },
+                                leadingIcon = { Icon(Icons.Default.Archive, null) },
+                                onClick = { workspace.toggleArchived(repo.name); menuOpen = false; onBack() }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Delete", color = MaterialTheme.colorScheme.error) },
+                                leadingIcon = { Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error) },
+                                onClick = { confirmDelete = true; menuOpen = false }
+                            )
+                        }
+                    }
+                }
+            }
+            item { Text(repo.name, style = MaterialTheme.typography.displaySmall) }
+            item {
+                AssistChip(
+                    onClick = {},
+                    label = { Text("Local Git repository") },
+                    leadingIcon = { Icon(Icons.Default.Lock, null) }
+                )
+            }
+            item {
+                ElevatedCard(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text("Memory", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            metadata.description.ifBlank { "No project memory has been added." },
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+            item {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    ElevatedCard(onClick = onArtifacts, modifier = Modifier.weight(1f)) {
+                        Column(Modifier.padding(16.dp)) {
+                            Text("Project knowledge", style = MaterialTheme.typography.titleSmall)
+                            Text("${state.artifacts.size} readable files", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                    ElevatedCard(onClick = { editing = true }, modifier = Modifier.weight(1f)) {
+                        Column(Modifier.padding(16.dp)) {
+                            Text("Custom instructions", style = MaterialTheme.typography.titleSmall)
+                            Text(if (metadata.instructions.isBlank()) "Add instructions" else "Configured", color = MaterialTheme.colorScheme.primary)
+                        }
+                    }
+                }
+            }
+            if (projectTasks.isEmpty()) {
+                item { Text("No Cowork tasks are linked to this project yet.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 22.dp)) }
+            } else {
+                items(projectTasks, key = { "project-task-${it.id}" }) { task ->
+                    ElevatedCard(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(16.dp)) {
+                            Text(task.title, style = MaterialTheme.typography.titleMedium)
+                            Text(task.status.name.lowercase(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            task.result?.let { Text(it.take(240), maxLines = 4, modifier = Modifier.padding(top = 8.dp)) }
+                        }
+                    }
+                }
+            }
+        }
+        Button(onClick = onNewChat, modifier = Modifier.align(Alignment.BottomEnd).padding(22.dp)) {
+            Icon(Icons.Default.Add, null)
+            Text("New chat")
+        }
+    }
+    if (editing) {
+        AlertDialog(
+            onDismissRequest = { editing = false },
+            title = { Text("Edit ${repo.name}") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedTextField(description, { description = it }, label = { Text("Memory and purpose") }, minLines = 3)
+                    OutlinedTextField(instructions, { instructions = it }, label = { Text("Custom model instructions") }, minLines = 3)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    workspace.updateProjectDetails(repo.name, description, instructions)
+                    editing = false
+                }) { Text("Save") }
+            },
+            dismissButton = { TextButton(onClick = { editing = false }) { Text("Cancel") } }
+        )
+    }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Delete ${repo.name}?") },
+            text = { Text("This removes the repository and its local files from this device. This cannot be undone.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    workspace.deleteRepository(repo.name)
+                    confirmDelete = false
+                    onBack()
+                }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } }
+        )
+    }
+}
+
+@Composable private fun ProjectsPage(
+    state: WorkspaceUiState,
+    workspace: WorkspaceViewModel,
+    onOpen: (String) -> Unit,
+    onNew: () -> Unit
+) {
+    var query by rememberSaveable { mutableStateOf("") }
+    val repositories = state.repositories
+        .filter { state.showArchivedProjects || state.projectMetadata[it.name]?.archived != true }
+        .filter { it.name.contains(query, ignoreCase = true) }
+        .sortedWith(compareByDescending<com.iqforge.git.Repo> { it.name in state.pinnedRepositoryNames }.thenBy { it.name.lowercase() })
+    Column(Modifier.fillMaxSize().padding(horizontal = 22.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Projects", style = MaterialTheme.typography.displaySmall, modifier = Modifier.weight(1f).padding(top = 14.dp, bottom = 20.dp))
+            IconButton(onClick = { workspace.setShowArchived(!state.showArchivedProjects) }) {
+                Icon(if (state.showArchivedProjects) Icons.Default.Inventory2 else Icons.Default.FilterList, "Toggle archived projects")
+            }
+        }
+        OutlinedTextField(
+            value = query,
+            onValueChange = { query = it },
+            modifier = Modifier.fillMaxWidth(),
+            placeholder = { Text("Search projects") },
+            leadingIcon = { Icon(Icons.Default.Search, null) },
+            singleLine = true,
+            shape = RoundedCornerShape(18.dp)
+        )
+        if (repositories.isEmpty()) {
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text(
+                    if (query.isBlank()) "No repositories are cloned on this device yet." else "No project matches '$query'.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        } else {
+            LazyColumn(Modifier.weight(1f).padding(top = 14.dp)) {
+                items(repositories, key = { it.root.absolutePath }) { repo ->
+                    Surface(onClick = { onOpen(repo.name) }, color = Color.Transparent) {
+                        Row(
+                            Modifier.fillMaxWidth().padding(vertical = 13.dp, horizontal = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(repo.name, style = MaterialTheme.typography.titleLarge)
+                                Text(
+                                    "Edited ${formatProjectDate(repo.root.resolve(".git/index").lastModified())}",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            IconButton(onClick = { workspace.togglePinned(repo.name) }) {
+                                Icon(
+                                    if (repo.name in state.pinnedRepositoryNames) Icons.Default.PushPin else Icons.Default.PushPin,
+                                    contentDescription = if (repo.name in state.pinnedRepositoryNames) "Unpin ${repo.name}" else "Pin ${repo.name}",
+                                    tint = if (repo.name in state.pinnedRepositoryNames) IqfCoral else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Button(
+            onClick = onNew,
+            modifier = Modifier.align(Alignment.End).padding(bottom = 22.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.onSurface, contentColor = MaterialTheme.colorScheme.surface)
+        ) {
+            Icon(Icons.Default.Add, null)
+            Spacer(Modifier.width(8.dp))
+            Text("New project")
+        }
+        state.message?.let { Text(it, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(bottom = 8.dp)) }
+        state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(bottom = 8.dp)) }
+    }
+}
+
+@Composable private fun CoworkPage(agent: AgentViewModel, state: WorkspaceUiState, onNewTask: () -> Unit) {
+    var selected by remember { mutableStateOf<CoworkTask?>(null) }
+    Column(Modifier.fillMaxSize().padding(horizontal = 22.dp)) {
+        Text("Cowork", style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 14.dp, bottom = 18.dp))
+        if (agent.coworkTasks.isEmpty()) {
+            Column(
+                Modifier.weight(1f).fillMaxWidth().padding(horizontal = 22.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Icon(Icons.Default.Workspaces, null, tint = IqfCoral, modifier = Modifier.size(78.dp))
+                Spacer(Modifier.height(22.dp))
+                Text("Run coding work from your phone", style = MaterialTheme.typography.headlineMedium, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                Spacer(Modifier.height(18.dp))
+                Text("Tasks are sent to your connected model and their real result is saved here.", color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                state.repo?.let {
+                    Spacer(Modifier.height(10.dp))
+                    Text("Current repository: ${it.name}", color = MaterialTheme.colorScheme.primary)
+                }
+            }
+        } else {
+            LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                items(agent.coworkTasks, key = { it.id }) { task ->
+                    ElevatedCard(onClick = { selected = task }, modifier = Modifier.fillMaxWidth()) {
+                        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                when (task.status) {
+                                    CoworkStatus.RUNNING -> Icons.Default.Sync
+                                    CoworkStatus.COMPLETED -> Icons.Default.TaskAlt
+                                    CoworkStatus.FAILED, CoworkStatus.INTERRUPTED -> Icons.Default.ErrorOutline
+                                },
+                                null,
+                                tint = when (task.status) {
+                                    CoworkStatus.RUNNING -> MaterialTheme.colorScheme.primary
+                                    CoworkStatus.COMPLETED -> Color(0xFF2EAD5B)
+                                    else -> MaterialTheme.colorScheme.error
+                                }
+                            )
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(task.title, style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                                Text(
+                                    listOfNotNull(task.repository, task.status.name.lowercase().replaceFirstChar(Char::uppercase)).joinToString(" · "),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Text(formatProjectDate(task.updatedAt), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                }
+            }
+        }
+        Button(onClick = onNewTask, modifier = Modifier.align(Alignment.End).padding(bottom = 22.dp)) {
+            Icon(Icons.Default.Add, null)
+            Spacer(Modifier.width(8.dp))
+            Text("New task")
+        }
+    }
+    selected?.let { task ->
+        AlertDialog(
+            onDismissRequest = { selected = null },
+            title = { Text(task.title) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(task.instruction)
+                    task.result?.let { Text(it, color = MaterialTheme.colorScheme.onSurface) }
+                    task.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                }
+            },
+            confirmButton = { TextButton(onClick = { selected = null }) { Text("Done") } },
+            dismissButton = {
+                TextButton(onClick = {
+                    agent.removeCoworkTask(task.id)
+                    selected = null
+                }) { Text("Delete") }
+            }
+        )
+    }
+}
+
+@Composable private fun CodeSessionsPage(
+    state: WorkspaceUiState,
+    workspace: WorkspaceViewModel,
+    agent: AgentViewModel,
+    onAddDevice: () -> Unit
+) {
+    var filesOpen by rememberSaveable { mutableStateOf(false) }
+    var laptopFilesOpen by rememberSaveable { mutableStateOf(false) }
+    var showRepositoryDialog by rememberSaveable { mutableStateOf(false) }
+    val laptopRoot = agent.dispatchWorkspaces.firstOrNull().orEmpty()
+    val activeRoot = agent.activeRemoteWorkspace.ifBlank { laptopRoot }
+    Column(Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 10.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Code", style = MaterialTheme.typography.displaySmall, modifier = Modifier.weight(1f))
+            TextButton(
+                enabled = laptopRoot.isNotBlank(),
+                onClick = {
+                    laptopFilesOpen = !laptopFilesOpen
+                    filesOpen = false
+                    if (laptopFilesOpen) agent.refreshRemoteFiles(activeRoot)
+                }
+            ) { Text(if (laptopFilesOpen) "Sessions" else "Laptop files") }
+            if (state.repo != null) TextButton(onClick = { filesOpen = !filesOpen }) {
+                Text(if (filesOpen) "Sessions" else "Files")
+            }
+        }
+        if (laptopFilesOpen) {
+            RemoteLaptopFiles(agent, activeRoot)
+            return@Column
+        }
+        if (filesOpen && state.repo != null) {
+            FilePanel(state, workspace)
+            return@Column
+        }
+        Text("Devices", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 24.dp))
+        AssistChip(onClick = onAddDevice, label = { Text("Add or configure device") }, leadingIcon = { Icon(Icons.Default.Add, null) })
+        ElevatedCard(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+            Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(if (agent.modelServiceReady) Icons.Default.Laptop else Icons.Default.Computer, null)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(agent.bridgeUrl, maxLines = 1, style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        if (agent.modelServiceReady) "Connected · ${agent.selectedModel ?: "model ready"}" else agent.connectorStatus,
+                        color = if (agent.modelServiceReady) Color(0xFF2EAD5B) else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                IconButton(agent::checkBridge) { Icon(Icons.Default.Refresh, "Check connection") }
+            }
+        }
+        Text("Sessions", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 26.dp, bottom = 8.dp))
+        if (agent.coworkTasks.isEmpty()) {
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text("No model-backed coding sessions yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        } else {
+            LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                items(agent.coworkTasks, key = { "session-${it.id}" }) { task ->
+                    ElevatedCard(Modifier.fillMaxWidth()) {
+                        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Code, null)
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(task.title, maxLines = 1)
+                                Text(
+                                    "${task.status.name.lowercase()}${task.repository?.let { " · $it" }.orEmpty()}",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Button(onClick = { showRepositoryDialog = true }, modifier = Modifier.align(Alignment.End).padding(bottom = 22.dp)) {
+            Icon(Icons.Default.Add, null)
+            Spacer(Modifier.width(8.dp))
+            Text("New session")
+        }
+    }
+    if (showRepositoryDialog) RepositorySessionDialog(
+        agent = agent,
+        root = laptopRoot,
+        onDismiss = { showRepositoryDialog = false },
+        onCreated = { showRepositoryDialog = false; laptopFilesOpen = true }
+    )
+}
+
+@Composable private fun ColumnScope.RemoteLaptopFiles(agent: AgentViewModel, cwd: String) {
+    var query by rememberSaveable { mutableStateOf("") }
+    var command by rememberSaveable { mutableStateOf("") }
+    val shown = agent.remoteFiles.filter { it.contains(query, ignoreCase = true) }
+    OutlinedTextField(
+        query, { query = it }, Modifier.fillMaxWidth(),
+        placeholder = { Text("Search laptop workspace files") },
+        leadingIcon = { Icon(Icons.Default.Search, null) }, singleLine = true
+    )
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text("${shown.size} editable files", Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant)
+        TextButton(onClick = { agent.runRemoteTests(cwd) }, enabled = !agent.remoteBusy) {
+            Icon(Icons.Default.PlayArrow, null)
+            Text("Run tests")
+        }
+        IconButton(onClick = { agent.refreshRemoteFiles(cwd) }, enabled = !agent.remoteBusy) { Icon(Icons.Default.Refresh, "Refresh laptop files") }
+    }
+    if (agent.remoteBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
+    agent.remoteResult?.let { Text(it.take(1_500), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
+    OutlinedTextField(
+        command, { command = it }, Modifier.fillMaxWidth(),
+        placeholder = { Text("CLI: git status, git add ., git commit -m …, git push") },
+        trailingIcon = {
+            IconButton(onClick = { agent.runRemoteCommand(cwd, command) }, enabled = command.isNotBlank() && !agent.remoteBusy) {
+                Icon(Icons.Default.Send, "Run command")
+            }
+        }, singleLine = true
+    )
+    LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        items(shown, key = { "remote-$it" }) { path ->
+            ListItem(
+                headlineContent = { Text(path, maxLines = 1) },
+                leadingContent = { Icon(Icons.Default.Description, null) },
+                modifier = Modifier.clickable { agent.openRemoteFile(cwd, path) }
+            )
+        }
+    }
+    agent.remoteFilePath?.let { path ->
+        AlertDialog(
+            onDismissRequest = agent::closeRemoteFile,
+            title = { Text(path, maxLines = 2) },
+            text = {
+                OutlinedTextField(
+                    agent.remoteFileText, agent::updateRemoteFile,
+                    Modifier.fillMaxWidth().heightIn(min = 320.dp, max = 520.dp),
+                    textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                )
+            },
+            confirmButton = { Button(onClick = { agent.saveRemoteFile(cwd) }, enabled = !agent.remoteBusy) { Text("Save to laptop") } },
+            dismissButton = { TextButton(onClick = agent::closeRemoteFile) { Text("Close") } }
+        )
+    }
+}
+
+@Composable private fun RepositorySessionDialog(
+    agent: AgentViewModel,
+    root: String,
+    onDismiss: () -> Unit,
+    onCreated: () -> Unit
+) {
+    var cloneMode by rememberSaveable { mutableStateOf(true) }
+    var value by rememberSaveable { mutableStateOf("") }
+    var publish by rememberSaveable { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("New coding session") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(cloneMode, { cloneMode = true }, { Text("Clone GitHub") })
+                    FilterChip(!cloneMode, { cloneMode = false }, { Text("Create repository") })
+                }
+                OutlinedTextField(
+                    value, { value = it }, Modifier.fillMaxWidth(),
+                    label = { Text(if (cloneMode) "HTTPS GitHub URL" else "Repository name") },
+                    singleLine = true
+                )
+                if (!cloneMode) Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(publish, { publish = it })
+                    Text("Create private GitHub repo and push")
+                }
+                Text("Laptop: $root", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                if (cloneMode) agent.cloneRemoteRepository(root, value) else agent.createRemoteRepository(root, value, publish)
+                onCreated()
+            }, enabled = root.isNotBlank() && value.isNotBlank() && !agent.remoteBusy) {
+                Text(if (cloneMode) "Clone and open" else "Create and open")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
+
+@Composable private fun ArtifactsPage(state: WorkspaceUiState, workspace: WorkspaceViewModel) {
+    var query by rememberSaveable { mutableStateOf("") }
+    val artifacts = state.artifacts.filter {
+        it.name.contains(query, ignoreCase = true) || it.relativePath.contains(query, ignoreCase = true)
+    }
+    Column(Modifier.fillMaxSize().padding(horizontal = 22.dp)) {
+        Text("Artifacts", style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 14.dp, bottom = 20.dp))
+        OutlinedTextField(
+            query, { query = it }, Modifier.fillMaxWidth(),
+            placeholder = { Text("Search code artifacts") },
+            leadingIcon = { Icon(Icons.Default.Search, null) },
+            singleLine = true,
+            shape = RoundedCornerShape(18.dp)
+        )
+        if (state.repo == null) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("Open a project to browse its real artifacts.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        } else {
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(2),
+                modifier = Modifier.fillMaxSize().padding(top = 14.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                gridItems(artifacts, key = { it.relativePath }) { artifact ->
+                    Column(Modifier.fillMaxWidth()) {
+                        OutlinedCard(onClick = { workspace.openArtifact(artifact) }, modifier = Modifier.fillMaxWidth().height(130.dp)) {
+                            val preview = remember(artifact.file.lastModified()) {
+                                runCatching { artifact.file.readText().take(320) }.getOrDefault("Unable to preview")
+                            }
+                            Text(
+                                preview,
+                                modifier = Modifier.padding(12.dp),
+                                maxLines = 7,
+                                fontFamily = FontFamily.Monospace,
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
+                        Text(artifact.name, maxLines = 1, style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 7.dp))
+                        Text(formatProjectDate(artifact.file.lastModified()), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun formatProjectDate(timestamp: Long): String = if (timestamp <= 0L) "unknown" else
+    SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date(timestamp))
+
+@Composable private fun SettingsPage(
+    appearance: Appearance,
+    fontChoice: FontChoice,
+    hapticEnabled: Boolean,
+    agent: AgentViewModel,
+    onDialog: (SettingsDialog) -> Unit,
+    onConnectors: () -> Unit,
+    onHaptic: (Boolean) -> Unit
+) {
+    val context = LocalContext.current
+    val connected = agent.connectors.count { it.connected }
+    LazyColumn(
+        Modifier.fillMaxSize().padding(horizontal = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+        contentPadding = PaddingValues(bottom = 28.dp)
+    ) {
+        item { Text("Settings", style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 14.dp, bottom = 10.dp)) }
+        item {
+            SettingsGroup {
+                SettingsRow(Icons.Default.QueryStats, "Usage", "${agent.chats.sumOf { it.messages.size }} saved messages") { onDialog(SettingsDialog.USAGE) }
+            }
+        }
+        item {
+            SettingsGroup {
+                SettingsRow(Icons.Default.Tune, "Capabilities", "${enabledCapabilityCount(agent)} enabled") { onDialog(SettingsDialog.CAPABILITIES) }
+                HorizontalDivider()
+                SettingsRow(Icons.Default.Link, "Connectors", "$connected connected", onConnectors)
+                HorizontalDivider()
+                SettingsRow(Icons.Default.AdminPanelSettings, "Permissions", "Android app permissions") {
+                    context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}")))
+                }
+            }
+        }
+        item {
+            SettingsGroup {
+                SettingsRow(Icons.Default.DarkMode, "Color mode", appearance.name.lowercase().replaceFirstChar { it.uppercase() }) { onDialog(SettingsDialog.COLOR) }
+                HorizontalDivider()
+                SettingsRow(Icons.Default.TextFields, "Font style", fontChoice.name.lowercase().replaceFirstChar { it.uppercase() }) { onDialog(SettingsDialog.FONT) }
+                HorizontalDivider()
+                SettingsRow(Icons.Default.GraphicEq, "Voice", "Android speech recognition") { onDialog(SettingsDialog.VOICE) }
+            }
+        }
+        item {
+            SettingsGroup {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Vibration, null)
+                    Spacer(Modifier.width(14.dp))
+                    Text("Haptic feedback", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                    Switch(checked = hapticEnabled, onCheckedChange = onHaptic)
+                }
+                HorizontalDivider()
+                SettingsRow(Icons.Default.Notifications, "Notifications", "System notification controls") {
+                    val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                        .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                    context.startActivity(intent)
+                }
+                HorizontalDivider()
+                SettingsRow(Icons.Default.PrivacyTip, "Privacy", "Manage local data") { onDialog(SettingsDialog.PRIVACY) }
+                HorizontalDivider()
+                SettingsRow(Icons.Default.Share, "Sharing", "Open Android share sheet") {
+                    context.startActivity(
+                        Intent.createChooser(
+                            Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(Intent.EXTRA_TEXT, "iQForge mobile coding workspace")
+                            },
+                            "Share iQForge"
+                        )
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable private fun SettingsGroup(content: @Composable ColumnScope.() -> Unit) =
+    Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(18.dp), tonalElevation = 1.dp) {
+        Column(content = content)
+    }
+
+@Composable private fun SettingsRow(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    title: String,
+    subtitle: String,
+    onClick: () -> Unit
+) = Surface(onClick = onClick, color = Color.Transparent) {
+    Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+        Icon(icon, null)
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.titleMedium)
+            Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
+        }
+        Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
+    agent.modelServiceReady,
+    agent.webSearchEnabled,
+    agent.memoryEnabled,
+    agent.connectors.any { it.connected },
+    true // The compiled offline engine is always available.
+).count { it }
+
+@Composable private fun SettingsDetailDialog(
+    dialog: SettingsDialog,
+    appearance: Appearance,
+    fontChoice: FontChoice,
+    voiceLanguage: String,
+    voiceName: String,
+    voicePace: Float,
+    agent: AgentViewModel,
+    workspace: WorkspaceUiState,
+    onAppearance: (Appearance) -> Unit,
+    onFont: (FontChoice) -> Unit,
+    onVoiceLanguage: (String) -> Unit,
+    onVoiceName: (String) -> Unit,
+    onVoicePace: (Float) -> Unit,
+    onStartVoice: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    var bridgeUrl by remember(dialog) { mutableStateOf(agent.bridgeUrl) }
+    val title = when (dialog) {
+        SettingsDialog.USAGE -> "Usage"
+        SettingsDialog.CAPABILITIES -> "Capabilities"
+        SettingsDialog.COLOR -> "Color mode"
+        SettingsDialog.FONT -> "Font style"
+        SettingsDialog.VOICE -> "Voice"
+        SettingsDialog.PRIVACY -> "Privacy"
+        SettingsDialog.DEVICE -> "Laptop bridge"
+        SettingsDialog.NONE -> "Settings"
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            when (dialog) {
+                SettingsDialog.USAGE -> Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Saved chats: ${agent.chats.size}")
+                    Text("Saved messages: ${agent.chats.sumOf { it.messages.size }}")
+                    Text("Cowork tasks: ${agent.coworkTasks.size}")
+                    Text("Repositories on device: ${workspace.repositories.size}")
+                    Text("Readable artifacts: ${workspace.artifacts.size}")
+                }
+                SettingsDialog.CAPABILITIES -> Column {
+                    CapabilityToggle("Real model", agent.modelServiceReady, null)
+                    CapabilityToggle("Offline engine", true, null)
+                    CapabilityToggle("Web search", agent.webSearchEnabled, agent::updateWebSearch)
+                    CapabilityToggle("Memory", agent.memoryEnabled, agent::updateMemory)
+                    CapabilityToggle("Live connectors", agent.connectors.any { it.connected }, null)
+                }
+                SettingsDialog.COLOR -> Column {
+                    Appearance.entries.forEach { choice ->
+                        RadioSetting(choice.name.lowercase().replaceFirstChar { it.uppercase() }, appearance == choice) { onAppearance(choice) }
+                    }
+                }
+                SettingsDialog.FONT -> Column {
+                    FontChoice.entries.forEach { choice ->
+                        RadioSetting(choice.name.lowercase().replaceFirstChar { it.uppercase() }, fontChoice == choice) { onFont(choice) }
+                    }
+                }
+                SettingsDialog.VOICE -> VoiceSettingsContent(
+                    languageTag = voiceLanguage,
+                    voiceName = voiceName,
+                    pace = voicePace,
+                    onLanguage = onVoiceLanguage,
+                    onVoice = onVoiceName,
+                    onPace = onVoicePace,
+                    onTestInput = onStartVoice
+                )
+                SettingsDialog.PRIVACY -> Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Chats, task results, preferences, and repositories are stored locally on this device. Incognito chats bypass saved history and memory.")
+                    OutlinedButton(onClick = agent::clearMemory, modifier = Modifier.fillMaxWidth()) { Text("Clear memory") }
+                    OutlinedButton(onClick = agent::clearSavedChats, modifier = Modifier.fillMaxWidth()) { Text("Clear saved chats") }
+                }
+                SettingsDialog.DEVICE -> Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(bridgeUrl, { bridgeUrl = it }, label = { Text("Bridge URL") }, singleLine = true)
+                    Text(agent.connectorStatus, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Button(onClick = {
+                        agent.updateBridgeUrl(bridgeUrl)
+                        agent.checkBridge()
+                    }, modifier = Modifier.fillMaxWidth()) { Text("Save and test") }
+                }
+                SettingsDialog.NONE -> Unit
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } }
+    )
+}
+
+@Composable private fun CapabilityToggle(label: String, enabled: Boolean, onChange: ((Boolean) -> Unit)?) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, Modifier.weight(1f))
+        if (onChange == null) Icon(if (enabled) Icons.Default.CheckCircle else Icons.Default.Cancel, null, tint = if (enabled) Color(0xFF2EAD5B) else MaterialTheme.colorScheme.error)
+        else Switch(enabled, onChange)
+    }
+}
+
+@Composable private fun RadioSetting(label: String, selected: Boolean, onClick: () -> Unit) =
+    Row(Modifier.fillMaxWidth().clickable(onClick = onClick), verticalAlignment = Alignment.CenterVertically) {
+        RadioButton(selected, onClick)
+        Text(label)
+    }
+
+@Composable private fun VoiceSettingsContent(
+    languageTag: String,
+    voiceName: String,
+    pace: Float,
+    onLanguage: (String) -> Unit,
+    onVoice: (String) -> Unit,
+    onPace: (Float) -> Unit,
+    onTestInput: () -> Unit
+) {
+    val context = LocalContext.current
+    var engine by remember { mutableStateOf<TextToSpeech?>(null) }
+    var installedVoices by remember { mutableStateOf<List<android.speech.tts.Voice>>(emptyList()) }
+    var languageMenu by remember { mutableStateOf(false) }
+    var voiceMenu by remember { mutableStateOf(false) }
+    var paceMenu by remember { mutableStateOf(false) }
+    val locales = remember {
+        Locale.getAvailableLocales().filter { it.language.isNotBlank() }
+            .distinctBy { it.toLanguageTag() }.sortedBy { it.displayName }
+    }
+    val selectedLocale = locales.firstOrNull { it.toLanguageTag() == languageTag } ?: Locale.getDefault()
+    val matchingVoices = installedVoices.filter { it.locale.language == selectedLocale.language }.ifEmpty { installedVoices }
+    DisposableEffect(context) {
+        lateinit var tts: TextToSpeech
+        tts = TextToSpeech(context) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                engine = tts
+                installedVoices = tts.voices.orEmpty().filterNot { it.isNetworkConnectionRequired }.sortedBy { it.name }
+            }
+        }
+        onDispose {
+            tts.stop()
+            tts.shutdown()
+            engine = null
+        }
+    }
+    LaunchedEffect(engine, voiceName, pace, languageTag) {
+        engine?.let { tts ->
+            tts.language = selectedLocale
+            matchingVoices.firstOrNull { it.name == voiceName }?.let { tts.voice = it }
+            tts.setSpeechRate(pace)
+        }
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Box {
+            OutlinedButton(onClick = { languageMenu = true }, modifier = Modifier.fillMaxWidth()) {
+                Text("Language: ${selectedLocale.displayName}", Modifier.weight(1f), maxLines = 1)
+                Icon(Icons.Default.ArrowDropDown, null)
+            }
+            DropdownMenu(expanded = languageMenu, onDismissRequest = { languageMenu = false }, modifier = Modifier.heightIn(max = 360.dp)) {
+                locales.take(120).forEach { locale ->
+                    DropdownMenuItem(text = { Text(locale.displayName) }, onClick = {
+                        onLanguage(locale.toLanguageTag())
+                        languageMenu = false
+                    })
+                }
+            }
+        }
+        Box {
+            OutlinedButton(onClick = { voiceMenu = true }, enabled = matchingVoices.isNotEmpty(), modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    if (matchingVoices.isEmpty()) "Loading installed voices…" else "Voice: ${voiceName.ifBlank { matchingVoices.first().name }}",
+                    Modifier.weight(1f),
+                    maxLines = 1
+                )
+                Icon(Icons.Default.ArrowDropDown, null)
+            }
+            DropdownMenu(expanded = voiceMenu, onDismissRequest = { voiceMenu = false }, modifier = Modifier.heightIn(max = 300.dp)) {
+                matchingVoices.forEach { voice ->
+                    DropdownMenuItem(text = { Text(voice.name, maxLines = 1) }, onClick = {
+                        onVoice(voice.name)
+                        voiceMenu = false
+                    })
+                }
+            }
+        }
+        Box {
+            OutlinedButton(onClick = { paceMenu = true }, modifier = Modifier.fillMaxWidth()) {
+                Text("Pace: ${when (pace) { .75f -> "Slow"; 1.25f -> "Fast"; else -> "Normal" }}", Modifier.weight(1f))
+                Icon(Icons.Default.ArrowDropDown, null)
+            }
+            DropdownMenu(expanded = paceMenu, onDismissRequest = { paceMenu = false }) {
+                listOf("Slow" to .75f, "Normal" to 1f, "Fast" to 1.25f).forEach { (label, value) ->
+                    DropdownMenuItem(text = { Text(label) }, onClick = { onPace(value); paceMenu = false })
+                }
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = { engine?.speak("IQF voice preview is ready", TextToSpeech.QUEUE_FLUSH, null, "iqf-preview") },
+                enabled = engine != null,
+                modifier = Modifier.weight(1f)
+            ) { Text("Preview voice") }
+            OutlinedButton(onClick = onTestInput, modifier = Modifier.weight(1f)) { Text("Test input") }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun CreateCoworkTaskSheet(
+    repositories: List<String>,
+    onCreate: (String, String, String?) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var title by rememberSaveable { mutableStateOf("") }
+    var instruction by rememberSaveable { mutableStateOf("") }
+    var repository by rememberSaveable { mutableStateOf<String?>(null) }
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(22.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Text("Create a Cowork task", style = MaterialTheme.typography.headlineSmall)
+            OutlinedTextField(title, { title = it }, Modifier.fillMaxWidth(), label = { Text("Task name") }, singleLine = true)
+            OutlinedTextField(instruction, { instruction = it }, Modifier.fillMaxWidth().height(150.dp), label = { Text("What should the model achieve?") })
+            if (repositories.isNotEmpty()) {
+                Text("Repository context", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    item { FilterChip(repository == null, { repository = null }, { Text("None") }) }
+                    items(repositories) { name -> FilterChip(repository == name, { repository = name }, { Text(name) }) }
+                }
+            }
+            Button(
+                onClick = { onCreate(title.trim(), instruction.trim(), repository) },
+                enabled = title.isNotBlank() && instruction.isNotBlank(),
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Start real task") }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun CreateProjectSheet(
+    busy: Boolean,
+    onCreate: (String, String) -> Unit,
+    onClone: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    var name by rememberSaveable { mutableStateOf("") }
+    var goal by rememberSaveable { mutableStateOf("") }
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(22.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Text("Create a project", style = MaterialTheme.typography.headlineSmall)
+            OutlinedTextField(name, { name = it }, Modifier.fillMaxWidth(), label = { Text("Project name") }, singleLine = true)
+            OutlinedTextField(goal, { goal = it }, Modifier.fillMaxWidth().height(150.dp), label = { Text("Goals and context") })
+            Button(
+                onClick = { onCreate(name.trim(), goal.trim()) },
+                enabled = name.matches(Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,79}")) && !busy,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text(if (busy) "Creating…" else "Create Git project") }
+            TextButton(onClick = onClone, modifier = Modifier.fillMaxWidth()) { Text("Clone an existing repository instead") }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun ConnectorsSheet(agent: AgentViewModel, onDismiss: () -> Unit) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.background,
+        contentColor = MaterialTheme.colorScheme.onBackground,
+        dragHandle = { BottomSheetDefaults.DragHandle() }
+    ) {
+        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 20.dp)) {
+            SheetTitle("Connectors", onDismiss) {
+                IconButton(agent::refreshServices, enabled = !agent.checkingConnector) {
+                    Icon(Icons.Default.Refresh, "Refresh live connectors")
+                }
+            }
+            if (agent.checkingConnector && agent.connectors.isEmpty()) {
+                Box(Modifier.fillMaxWidth().height(220.dp), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            } else if (agent.connectors.isEmpty()) {
+                Text(
+                    agent.connectorStatus,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(24.dp)
+                )
+            } else {
+                Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
+                    Column {
+                        agent.connectors.forEachIndexed { index, connector ->
+                            Row(
+                                Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 17.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                SheetIcon(
+                                    when (connector.id) {
+                                        "github" -> Icons.Default.Code
+                                        "ollama" -> Icons.Default.Memory
+                                        else -> Icons.Default.Language
+                                    }
+                                )
+                                Spacer(Modifier.width(14.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(connector.name, style = MaterialTheme.typography.titleMedium)
+                                    Text(
+                                        connector.detail,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+                                Icon(
+                                    if (connector.connected) Icons.Default.CheckCircle else Icons.Default.ErrorOutline,
+                                    contentDescription = connector.status,
+                                    tint = if (connector.connected) Color(0xFF4CAF70) else MaterialTheme.colorScheme.error
+                                )
+                            }
+                            if (index != agent.connectors.lastIndex) HorizontalDivider()
+                        }
+                    }
+                }
+            }
+            Text(
+                "These states are live checks against Ollama, GitHub's API, and the web-search provider. Authentication secrets are never bundled in the APK.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(12.dp)
+            )
+            Spacer(Modifier.height(20.dp))
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun ProjectSelectorSheet(
+    state: WorkspaceUiState,
+    onSelect: (String) -> Unit,
+    onClone: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    var query by rememberSaveable { mutableStateOf("") }
+    val projects = state.repositories.filter { it.name.contains(query, ignoreCase = true) }
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.background,
+        contentColor = MaterialTheme.colorScheme.onBackground
+    ) {
+        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 20.dp)) {
+            SheetTitle("Add to project", onDismiss) {
+                IconButton(onClone) { Icon(Icons.Default.Add, "Clone another repository") }
+            }
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                modifier = Modifier.fillMaxWidth(),
+                placeholder = { Text("Search projects") },
+                leadingIcon = { Icon(Icons.Default.Search, null) },
+                singleLine = true,
+                shape = RoundedCornerShape(18.dp)
+            )
+            Spacer(Modifier.height(14.dp))
+            if (projects.isEmpty()) {
+                Text("No cloned project matches your search.", Modifier.padding(20.dp))
+            } else {
+                Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
+                    Column {
+                        projects.forEachIndexed { index, repo ->
+                            Surface(onClick = { onSelect(repo.name) }, color = Color.Transparent) {
+                                Row(
+                                    Modifier.fillMaxWidth().padding(18.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(Icons.Default.Inventory2, null)
+                                    Spacer(Modifier.width(14.dp))
+                                    Text(repo.name, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                                    if (repo.root == state.repo?.root) Icon(Icons.Default.Check, "Selected")
+                                }
+                            }
+                            if (index != projects.lastIndex) HorizontalDivider()
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(28.dp))
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun ModelSelectorSheet(
+    agent: AgentViewModel,
+    onEffort: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.background,
+        contentColor = MaterialTheme.colorScheme.onBackground
+    ) {
+        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 20.dp)) {
+            SheetTitle("Select model", onDismiss)
+            if (agent.availableModels.isEmpty()) {
+                if (!agent.offlineModelReady) Text(
+                    "No verified model is available. Install the on-device GGUF model or connect Ollama.",
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(20.dp)
+                )
+            } else {
+                Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
+                    Column {
+                        agent.availableModels.forEachIndexed { index, model ->
+                            Surface(onClick = { agent.selectModel(model) }, color = Color.Transparent) {
+                                Row(
+                                    Modifier.fillMaxWidth().padding(18.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(
+                                            model.id,
+                                            color = if (model.id == agent.selectedModel) Color(0xFF75AFFF) else MaterialTheme.colorScheme.onSurface,
+                                            style = MaterialTheme.typography.titleMedium
+                                        )
+                                        Text(
+                                            listOfNotNull(model.parameterSize, model.quantization).joinToString(" - "),
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
+                                    if (model.id == agent.selectedModel) Icon(Icons.Default.Check, "Selected", tint = Color(0xFF75AFFF))
+                                }
+                            }
+                            if (index != agent.availableModels.lastIndex) HorizontalDivider()
+                        }
+                    }
+                }
+            }
+            if (agent.offlineModelReady) {
+                Spacer(Modifier.height(12.dp))
+                Surface(onClick = agent::selectOfflineModel, color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
+                    Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.PhoneAndroid, null, tint = Color(0xFF54C878))
+                        Spacer(Modifier.width(14.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("Qwen2.5 Coder 1.5B", style = MaterialTheme.typography.titleMedium)
+                            Text("On-device • ${agent.offlineModelBytes / 1_000_000} MB GGUF • works without internet", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        if (agent.selectedModel?.contains("on-device") == true) Icon(Icons.Default.Check, "Selected", tint = Color(0xFF54C878))
+                    }
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+            Surface(onClick = onEffort, color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
+                Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
+                    SheetIcon(Icons.Default.Timer)
+                    Spacer(Modifier.width(14.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Effort", style = MaterialTheme.typography.titleMedium)
+                        Text(agent.effort.label, color = Color(0xFF75AFFF))
+                    }
+                    Icon(Icons.Default.ChevronRight, null)
+                }
+            }
+            Spacer(Modifier.height(24.dp))
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun EffortSheet(agent: AgentViewModel, onDismiss: () -> Unit) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.background,
+        contentColor = MaterialTheme.colorScheme.onBackground
+    ) {
+        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 20.dp)) {
+            SheetTitle("Effort", onDismiss)
+            Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
+                Column {
+                    EffortLevel.entries.forEachIndexed { index, level ->
+                        Surface(
+                            onClick = { agent.updateEffort(level) },
+                            color = Color.Transparent
+                        ) {
+                            Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        level.label,
+                                        color = if (level == agent.effort) Color(0xFF75AFFF) else MaterialTheme.colorScheme.onSurface,
+                                        style = MaterialTheme.typography.titleMedium
+                                    )
+                                    if (level == EffortLevel.MEDIUM) Text("Default", style = MaterialTheme.typography.labelSmall)
+                                }
+                                if (level == agent.effort) Icon(Icons.Default.Check, "Selected", tint = Color(0xFF75AFFF))
+                            }
+                        }
+                        if (index != EffortLevel.entries.lastIndex) HorizontalDivider()
+                    }
+                }
+            }
+            Text(
+                "Effort changes the depth and response budget sent to the real model.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(12.dp)
+            )
+            Spacer(Modifier.height(24.dp))
+        }
+    }
+}
+
+@Composable private fun SheetTitle(
+    title: String,
+    onBack: () -> Unit,
+    action: @Composable () -> Unit = { Spacer(Modifier.size(48.dp)) }
+) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        IconButton(onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
+        Text(
+            title,
+            Modifier.weight(1f),
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.SemiBold
+        )
+        action()
+    }
+    Spacer(Modifier.height(14.dp))
+}
 
 @Composable private fun RepositoryDrawer(
     state: WorkspaceUiState,
@@ -616,11 +3467,20 @@ class AgentViewModel(
     }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun EditorScreen(state: WorkspaceUiState, workspace: WorkspaceViewModel) =
+@Composable private fun EditorScreen(state: WorkspaceUiState, workspace: WorkspaceViewModel, agent: AgentViewModel) {
+    var showAiEdit by remember { mutableStateOf(false) }
+    var instruction by rememberSaveable { mutableStateOf("") }
     Scaffold(topBar = {
         TopAppBar(
             title = { Text(state.selectedFile?.relativePath ?: "Editor") },
-            navigationIcon = { IconButton(workspace::closeEditor) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back to agent") } }
+            navigationIcon = { IconButton(workspace::closeEditor) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back to agent") } },
+            actions = {
+                TextButton(onClick = { showAiEdit = true }) {
+                    Icon(Icons.Default.AutoAwesome, null)
+                    Spacer(Modifier.width(6.dp))
+                    Text("Edit with IQF")
+                }
+            }
         )
     }) { padding ->
         Column(Modifier.fillMaxSize().padding(padding).padding(16.dp)) {
@@ -635,3 +3495,38 @@ class AgentViewModel(
             }
         }
     }
+    if (showAiEdit) AlertDialog(
+        onDismissRequest = { if (!agent.fileEditBusy) showAiEdit = false },
+        title = { Text("Edit ${state.selectedFile?.name.orEmpty()} with IQForge") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    instruction,
+                    { instruction = it },
+                    Modifier.fillMaxWidth(),
+                    label = { Text("Describe the code change") },
+                    minLines = 3,
+                    enabled = !agent.fileEditBusy
+                )
+                if (agent.fileEditBusy) {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                    Text("Generating the complete updated file…")
+                }
+                agent.fileEditError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = instruction.isNotBlank() && !agent.fileEditBusy,
+                onClick = {
+                    agent.generateFileEdit(state.selectedFile?.relativePath.orEmpty(), state.editorText, instruction) {
+                        workspace.updateEditor(it)
+                        instruction = ""
+                        showAiEdit = false
+                    }
+                }
+            ) { Text("Generate edit") }
+        },
+        dismissButton = { TextButton(enabled = !agent.fileEditBusy, onClick = { showAiEdit = false }) { Text("Cancel") } }
+    )
+}

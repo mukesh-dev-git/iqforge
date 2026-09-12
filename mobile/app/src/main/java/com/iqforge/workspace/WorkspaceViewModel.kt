@@ -17,6 +17,11 @@ data class WorkspaceUiState(
     val githubUsername: String = "",
     val githubToken: String = "",
     val repo: Repo? = null,
+    val repositories: List<Repo> = emptyList(),
+    val pinnedRepositoryNames: Set<String> = emptySet(),
+    val projectMetadata: Map<String, ProjectMetadata> = emptyMap(),
+    val showArchivedProjects: Boolean = false,
+    val artifacts: List<WorkspaceEntry> = emptyList(),
     val entries: List<WorkspaceEntry> = emptyList(),
     val expandedDirectories: Set<String> = emptySet(),
     val selectedFile: WorkspaceEntry? = null,
@@ -33,20 +38,36 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
     private val workspaceRoot = application.filesDir.resolve("repositories")
     private val repoManager = JGitRepoManager(workspaceRoot)
     private val files = FileWorkspace()
-    private val mutableState = mutableStateOf(WorkspaceUiState())
+    private val preferences = application.getSharedPreferences("iqforge_workspace", android.content.Context.MODE_PRIVATE)
+    private val metadataStore = ProjectMetadataStore(preferences)
+    private val mutableState = mutableStateOf(
+        WorkspaceUiState(
+            pinnedRepositoryNames = preferences.getStringSet("pinned_repositories", emptySet()).orEmpty(),
+            projectMetadata = metadataStore.load()
+        )
+    )
     val state: State<WorkspaceUiState> = mutableState
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
-            val existing = workspaceRoot.listFiles()
+            val repositories = workspaceRoot.listFiles()
                 ?.filter { it.isDirectory && it.resolve(".git").isDirectory }
-                ?.maxByOrNull { it.resolve(".git/index").lastModified() }
+                ?.sortedByDescending { it.resolve(".git/index").lastModified() }
+                ?.map { Repo(it, it.name) }
+                .orEmpty()
+            val existing = repositories.firstOrNull()
             if (existing != null) {
-                val repo = Repo(existing, existing.name)
-                val entries = files.visibleEntries(repo.root, emptySet())
+                val entries = files.visibleEntries(existing.root, emptySet())
                 withContext(Dispatchers.Main) {
-                    mutableState.value = mutableState.value.copy(repo = repo, entries = entries)
+                    mutableState.value = mutableState.value.copy(
+                        repo = existing,
+                        repositories = repositories,
+                        entries = entries,
+                        artifacts = files.artifactFiles(existing.root)
+                    )
                 }
+            } else withContext(Dispatchers.Main) {
+                mutableState.value = mutableState.value.copy(repositories = repositories)
             }
         }
     }
@@ -63,16 +84,119 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
         val name = RepositoryPaths.repositoryName(snapshot.repoUrl)
         val destination = RepositoryPaths.uniqueCloneDirectory(workspaceRoot, name)
         val repo = repoManager.clone(snapshot.repoUrl.trim(), destination)
+        val metadata = metadataStore.save(ProjectMetadata(repo.name))
         withContext(Dispatchers.Main) {
             mutableState.value = mutableState.value.copy(
                 repo = repo,
+                repositories = (mutableState.value.repositories.filterNot { it.root == repo.root } + repo)
+                    .sortedBy { it.name.lowercase() },
                 githubToken = "",
                 entries = files.visibleEntries(repo.root, emptySet()),
+                artifacts = files.artifactFiles(repo.root),
+                projectMetadata = metadata,
                 message = "Cloned ${repo.name}",
                 error = null
             )
         }
     }
+
+    fun createRepository(name: String, description: String) = runOperation("Creating project…") {
+        val repo = repoManager.create(name, description)
+        val metadata = metadataStore.save(ProjectMetadata(repo.name, description = description.trim()))
+        withContext(Dispatchers.Main) {
+            mutableState.value = mutableState.value.copy(
+                repo = repo,
+                repositories = (mutableState.value.repositories + repo).sortedBy { it.name.lowercase() },
+                entries = files.visibleEntries(repo.root, emptySet()),
+                artifacts = files.artifactFiles(repo.root),
+                projectMetadata = metadata,
+                message = "Created ${repo.name}",
+                error = null
+            )
+        }
+    }
+
+    fun selectRepository(name: String) {
+        val repo = mutableState.value.repositories.firstOrNull { it.name == name } ?: return
+        runOperation("Opening ${repo.name}…") {
+            val entries = files.visibleEntries(repo.root, emptySet())
+            withContext(Dispatchers.Main) {
+                mutableState.value = mutableState.value.copy(
+                    repo = repo,
+                    entries = entries,
+                    artifacts = files.artifactFiles(repo.root),
+                    expandedDirectories = emptySet(),
+                    selectedFile = null,
+                    editorText = "",
+                    editorDirty = false,
+                    message = "Opened ${repo.name}",
+                    error = null
+                )
+            }
+        }
+    }
+
+    fun startNewRepository() = update {
+        copy(
+            repo = null,
+            entries = emptyList(),
+            artifacts = emptyList(),
+            selectedFile = null,
+            editorText = "",
+            repoUrl = "",
+            message = null,
+            error = null
+        )
+    }
+
+    fun togglePinned(name: String) {
+        val pins = mutableState.value.pinnedRepositoryNames.toMutableSet().apply {
+            if (!add(name)) remove(name)
+        }
+        preferences.edit().putStringSet("pinned_repositories", pins).apply()
+        update { copy(pinnedRepositoryNames = pins) }
+    }
+
+    fun setShowArchived(show: Boolean) = update { copy(showArchivedProjects = show) }
+
+    fun updateProjectDetails(name: String, description: String, instructions: String) {
+        val current = mutableState.value.projectMetadata[name] ?: ProjectMetadata(name)
+        val metadata = metadataStore.save(current.copy(description = description.trim(), instructions = instructions.trim()))
+        update { copy(projectMetadata = metadata, message = "Updated $name", error = null) }
+    }
+
+    fun toggleArchived(name: String) {
+        val current = mutableState.value.projectMetadata[name] ?: ProjectMetadata(name)
+        val metadata = metadataStore.save(current.copy(archived = !current.archived))
+        update { copy(projectMetadata = metadata, message = if (current.archived) "Restored $name" else "Archived $name") }
+    }
+
+    fun deleteRepository(name: String) {
+        val repository = mutableState.value.repositories.firstOrNull { it.name == name } ?: return
+        runOperation("Deleting $name…") {
+            val safeRoot = RepositoryPaths.requireInside(workspaceRoot, repository.root)
+            check(safeRoot.deleteRecursively()) { "Could not delete $name" }
+            val metadata = metadataStore.remove(name)
+            val pins = mutableState.value.pinnedRepositoryNames - name
+            preferences.edit().putStringSet("pinned_repositories", pins).apply()
+            withContext(Dispatchers.Main) {
+                val remaining = mutableState.value.repositories.filterNot { it.name == name }
+                val next = remaining.firstOrNull()
+                mutableState.value = mutableState.value.copy(
+                    repo = next,
+                    repositories = remaining,
+                    pinnedRepositoryNames = pins,
+                    projectMetadata = metadata,
+                    entries = next?.let { files.visibleEntries(it.root, emptySet()) }.orEmpty(),
+                    artifacts = next?.let { files.artifactFiles(it.root) }.orEmpty(),
+                    message = "Deleted $name",
+                    error = null
+                )
+            }
+        }
+    }
+
+    fun openArtifact(entry: WorkspaceEntry) = openEntry(entry)
 
     fun openEntry(entry: WorkspaceEntry) {
         val repo = mutableState.value.repo ?: return
@@ -168,7 +292,8 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
 
     private suspend fun refreshFiles(repo: Repo) = withContext(Dispatchers.Main) {
         mutableState.value = mutableState.value.copy(
-            entries = files.visibleEntries(repo.root, mutableState.value.expandedDirectories)
+            entries = files.visibleEntries(repo.root, mutableState.value.expandedDirectories),
+            artifacts = files.artifactFiles(repo.root)
         )
     }
 
