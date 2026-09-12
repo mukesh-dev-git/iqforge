@@ -51,3 +51,4 @@ backend is CPU-only by design for now; real NPU support needs teammate B's Docke
 build (see `finals-30hr/NPU_SETUP_INSTRUCTIONS.md`) plus a separate jniLibs integration step
 (see the comment in `mobile/app/src/main/cpp/CMakeLists.txt`) — it does not fall out for free
 once the Docker build succeeds.
+<!-- On-device review flow test: 2026-09-12T21:20:09Z -->
