@@ -1047,7 +1047,7 @@ class AgentViewModel(
                             }.orEmpty()
                         }
                         if (fileText.length > MAX_LOCAL_FILE_CHARS) {
-                            if (bridgeUrl.isNotBlank() && !bridgeUrl.contains("localhost")) {
+                            if (modelServiceReady && bridgeUrl.isNotBlank() && !bridgeUrl.contains("localhost") && !bridgeUrl.contains("127.0.0.1")) {
                                 replyRole = "laptop"
                                 bridgeClient.escalateWithOptions(
                                     bridgeUrl, task,
@@ -1928,7 +1928,12 @@ class AgentViewModel(
                     onAddDevice = { settingsDialog = SettingsDialog.DEVICE }
                 )
                 AppDestination.ARTIFACTS -> ArtifactsPage(state, workspace)
-                AppDestination.REVIEW -> ReviewPage()
+                AppDestination.REVIEW -> ReviewPage(
+                    agent = agent,
+                    workspace = workspace,
+                    state = state,
+                    onOpenCode = { destination = AppDestination.CODE }
+                )
                 AppDestination.SETTINGS -> SettingsPage(
                     appearance = appearance,
                     fontChoice = fontChoice,
@@ -2220,121 +2225,63 @@ class AgentViewModel(
 
 private fun displayModelText(text: String): String = text.trim()
 
-/**
- * Minimal, dependency-free markdown for model replies: fenced ```code``` blocks render as their
- * own monospace surface (with the language tag if the model gave one), **bold** and `inline code`
- * render inline. No external markdown library — the model's output only ever uses this handful of
- * constructs, and a tiny hand-rolled parser is far less risk than adding a dependency this late.
- */
-private sealed class MdBlock {
-    data class Paragraph(val text: String) : MdBlock()
-    data class Heading(val level: Int, val text: String) : MdBlock()
-    data class Code(val code: String, val language: String?) : MdBlock()
+/** Renders **bold**, `inline code`, fenced code blocks, and bullet/numbered lists from raw model output as styled text instead of literal markdown syntax. */
+@Composable private fun MarkdownText(
+    text: String,
+    modifier: Modifier = Modifier,
+    style: androidx.compose.ui.text.TextStyle = MaterialTheme.typography.bodyLarge,
+    color: Color = Color.Unspecified
+) {
+    Text(text = remember(text) { parseSimpleMarkdown(text) }, modifier = modifier, style = style, color = color)
 }
 
-private val CODE_FENCE = Regex("```([a-zA-Z0-9_+-]*)\\n?([\\s\\S]*?)```")
-private val HEADING_LINE = Regex("^(#{1,6})\\s+(.*)$")
+private val boldOrCodePattern = Regex("\\*\\*(.+?)\\*\\*|`(.+?)`")
 
-/** Splits a prose chunk (no code fences in it) into Heading blocks on `#`/`##`/`###` lines and
- *  Paragraph blocks for everything else, grouping consecutive plain lines into one paragraph. */
-private fun parseProseBlocks(text: String): List<MdBlock> {
-    val out = mutableListOf<MdBlock>()
-    val paragraphLines = mutableListOf<String>()
-    fun flushParagraph() {
-        if (paragraphLines.isNotEmpty()) {
-            out.add(MdBlock.Paragraph(paragraphLines.joinToString("\n")))
-            paragraphLines.clear()
+private fun androidx.compose.ui.text.AnnotatedString.Builder.appendInlineMarkdown(line: String) {
+    var lastIndex = 0
+    for (match in boldOrCodePattern.findAll(line)) {
+        append(line.substring(lastIndex, match.range.first))
+        val bold = match.groupValues[1]
+        val code = match.groupValues[2]
+        if (bold.isNotEmpty()) {
+            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(bold) }
+        } else {
+            withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = Color(0x22FFFFFF))) { append(code) }
         }
+        lastIndex = match.range.last + 1
     }
-    for (line in text.split("\n")) {
-        val heading = HEADING_LINE.find(line)
-        when {
-            heading != null -> {
-                flushParagraph()
-                out.add(MdBlock.Heading(heading.groupValues[1].length, heading.groupValues[2].trim()))
-            }
-            line.isBlank() -> flushParagraph()
-            else -> paragraphLines.add(line)
-        }
-    }
-    flushParagraph()
-    return out
+    append(line.substring(lastIndex))
 }
 
-private fun parseMarkdownBlocks(raw: String): List<MdBlock> {
-    val blocks = mutableListOf<MdBlock>()
-    var lastEnd = 0
-    for (match in CODE_FENCE.findAll(raw)) {
-        if (match.range.first > lastEnd) {
-            val before = raw.substring(lastEnd, match.range.first).trim('\n', ' ')
-            if (before.isNotBlank()) blocks.addAll(parseProseBlocks(before))
-        }
-        blocks.add(MdBlock.Code(match.groupValues[2].trimEnd('\n'), match.groupValues[1].ifBlank { null }))
-        lastEnd = match.range.last + 1
-    }
-    if (lastEnd < raw.length) {
-        val rest = raw.substring(lastEnd).trim('\n', ' ')
-        if (rest.isNotBlank()) blocks.addAll(parseProseBlocks(rest))
-    }
-    return blocks.ifEmpty { if (raw.isNotBlank()) listOf(MdBlock.Paragraph(raw)) else emptyList() }
-}
-
-private fun inlineMarkdown(text: String): AnnotatedString = buildAnnotatedString {
+private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.AnnotatedString = buildAnnotatedString {
+    val lines = raw.trim().lines()
     var i = 0
-    while (i < text.length) {
+    while (i < lines.size) {
+        val line = lines[i]
+        if (line.trim().startsWith("```")) {
+            i++
+            val codeLines = mutableListOf<String>()
+            while (i < lines.size && !lines[i].trim().startsWith("```")) {
+                codeLines.add(lines[i]); i++
+            }
+            withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = Color(0x22FFFFFF))) {
+                append(codeLines.joinToString("\n"))
+            }
+            if (i < lines.size) i++ // skip closing fence
+            if (i < lines.size) append("\n\n")
+            continue
+        }
+        val bulletMatch = Regex("^\\s*[-*]\\s+(.*)").find(line)
+        val numberedMatch = Regex("^\\s*(\\d+)[.)]\\s+(.*)").find(line)
+        val headingMatch = Regex("^#{1,6}\\s+(.*)").find(line)
         when {
-            text.startsWith("**", i) && text.indexOf("**", i + 2) != -1 -> {
-                val end = text.indexOf("**", i + 2)
-                withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(text, i + 2, end) }
-                i = end + 2
-            }
-            text[i] == '`' && text.indexOf('`', i + 1) != -1 -> {
-                val end = text.indexOf('`', i + 1)
-                withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(text, i + 1, end) }
-                i = end + 1
-            }
-            else -> { append(text[i]); i++ }
+            headingMatch != null -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(headingMatch.groupValues[1]) }
+            bulletMatch != null -> { append("•  "); appendInlineMarkdown(bulletMatch.groupValues[1]) }
+            numberedMatch != null -> { append("${numberedMatch.groupValues[1]}.  "); appendInlineMarkdown(numberedMatch.groupValues[2]) }
+            else -> appendInlineMarkdown(line)
         }
-    }
-}
-
-@Composable
-private fun MarkdownText(raw: String, style: androidx.compose.ui.text.TextStyle, color: Color = Color.Unspecified) {
-    val blocks = remember(raw) { parseMarkdownBlocks(raw) }
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        blocks.forEach { block ->
-            when (block) {
-                is MdBlock.Paragraph -> Text(inlineMarkdown(block.text), style = style, color = color)
-                is MdBlock.Heading -> Text(
-                    inlineMarkdown(block.text),
-                    style = when {
-                        block.level <= 1 -> MaterialTheme.typography.titleLarge
-                        block.level == 2 -> MaterialTheme.typography.titleMedium
-                        else -> MaterialTheme.typography.titleSmall
-                    },
-                    fontWeight = FontWeight.Bold,
-                    color = color
-                )
-                is MdBlock.Code -> Surface(
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(Modifier.padding(10.dp)) {
-                        if (!block.language.isNullOrBlank()) {
-                            Text(
-                                block.language.uppercase(),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontFamily = FontFamily.Monospace
-                            )
-                            Spacer(Modifier.height(4.dp))
-                        }
-                        Text(block.code, fontFamily = FontFamily.Monospace, fontSize = 13.sp)
-                    }
-                }
-            }
-        }
+        if (i != lines.lastIndex) append("\n")
+        i++
     }
 }
 
@@ -3582,10 +3529,34 @@ private fun MarkdownText(raw: String, style: androidx.compose.ui.text.TextStyle,
     }
 }
 
-@Composable private fun ReviewPage() {
+@Composable private fun ReviewPage(
+    agent: AgentViewModel,
+    workspace: WorkspaceViewModel,
+    state: WorkspaceUiState,
+    onOpenCode: () -> Unit
+) {
     val github: GitHubViewModel = viewModel()
     var repoInput by rememberSaveable { mutableStateOf("") }
     var tab by rememberSaveable { mutableStateOf(0) } // 0 = PRs, 1 = Issues
+    val startReview: (String) -> Unit = { prompt ->
+        val ref = github.repoRef
+        if (ref != null) {
+            val existing = state.repositories.firstOrNull {
+                it.name.equals(ref.repo, ignoreCase = true) || it.name.startsWith("${ref.repo}-", ignoreCase = true)
+            }
+            if (existing != null) {
+                agent.createCodeSession(existing.root.absolutePath)
+                agent.sendCodeSessionMessage(prompt)
+                onOpenCode()
+            } else {
+                workspace.cloneRepository("https://github.com/${ref.owner}/${ref.repo}") { repo ->
+                    agent.createCodeSession(repo.root.absolutePath)
+                    agent.sendCodeSessionMessage(prompt)
+                    onOpenCode()
+                }
+            }
+        }
+    }
 
     Column(Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 10.dp)) {
         Text("Review", style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 14.dp, bottom = 4.dp))
@@ -3642,8 +3613,20 @@ private fun MarkdownText(raw: String, style: androidx.compose.ui.text.TextStyle,
         if (github.loadingDetail) StatusCard("Loading…")
         github.detailError?.let { StatusCard(it, error = true) }
     }
-    github.selectedPullRequest?.let { PullRequestDetailDialog(it, onDismiss = github::clearSelection) }
-    github.selectedIssue?.let { IssueDetailDialog(it, onDismiss = github::clearSelection) }
+    github.selectedPullRequest?.let { pr ->
+        PullRequestDetailDialog(
+            pr,
+            onDismiss = github::clearSelection,
+            onReview = { startReview(buildPullRequestReviewPrompt(github.repoRef!!.fullName, pr)) }
+        )
+    }
+    github.selectedIssue?.let { issue ->
+        IssueDetailDialog(
+            issue,
+            onDismiss = github::clearSelection,
+            onReview = { startReview(buildIssueReviewPrompt(github.repoRef!!.fullName, issue)) }
+        )
+    }
 }
 
 @Composable private fun CodeSessionsPage(
@@ -3702,7 +3685,7 @@ private fun MarkdownText(raw: String, style: androidx.compose.ui.text.TextStyle,
             return@Column
         }
         if (githubOpen && state.repo != null) {
-            GitHubPanel(github, state.repo)
+            GitHubPanel(github, state.repo, agent)
             return@Column
         }
         Text("Devices", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 24.dp))
@@ -4991,8 +4974,13 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
         state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
     }
 
-@Composable private fun GitHubPanel(github: GitHubViewModel, repo: com.iqforge.git.Repo) {
+@Composable private fun GitHubPanel(github: GitHubViewModel, repo: com.iqforge.git.Repo, agent: AgentViewModel) {
     var tab by rememberSaveable { mutableStateOf(0) } // 0 = PRs, 1 = Issues
+    val repoFullName = github.repoRef?.fullName ?: repo.name
+    val startReview: (String) -> Unit = { prompt ->
+        agent.createCodeSession(repo.root.absolutePath)
+        agent.sendCodeSessionMessage(prompt)
+    }
     Column {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
@@ -5021,8 +5009,20 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
         if (github.loadingDetail) StatusCard("Loading…")
         github.detailError?.let { StatusCard(it, error = true) }
     }
-    github.selectedPullRequest?.let { PullRequestDetailDialog(it, onDismiss = github::clearSelection) }
-    github.selectedIssue?.let { IssueDetailDialog(it, onDismiss = github::clearSelection) }
+    github.selectedPullRequest?.let { pr ->
+        PullRequestDetailDialog(
+            pr,
+            onDismiss = github::clearSelection,
+            onReview = { startReview(buildPullRequestReviewPrompt(repoFullName, pr)) }
+        )
+    }
+    github.selectedIssue?.let { issue ->
+        IssueDetailDialog(
+            issue,
+            onDismiss = github::clearSelection,
+            onReview = { startReview(buildIssueReviewPrompt(repoFullName, issue)) }
+        )
+    }
 }
 
 @Composable private fun ColumnScope.PullRequestList(
@@ -5090,7 +5090,20 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
     }
 }
 
-@Composable private fun PullRequestDetailDialog(pr: GitHubPullRequestDetailDto, onDismiss: () -> Unit) {
+private fun buildPullRequestReviewPrompt(repoFullName: String, pr: GitHubPullRequestDetailDto): String = buildString {
+    append("Review GitHub pull request #${pr.number} in $repoFullName: \"${pr.title}\"\n")
+    append("Branch: ${pr.head.ref} -> ${pr.base.ref} · +${pr.additions} -${pr.deletions} across ${pr.changedFiles} files\n\n")
+    if (!pr.body.isNullOrBlank()) append("${pr.body}\n\n")
+    append("Explore this repository's code relevant to this branch and give a thorough review: correctness, edge cases, and style. Suggest concrete improvements.")
+}
+
+private fun buildIssueReviewPrompt(repoFullName: String, issue: GitHubIssueDto): String = buildString {
+    append("Review GitHub issue #${issue.number} in $repoFullName: \"${issue.title}\"\n\n")
+    if (!issue.body.isNullOrBlank()) append("${issue.body}\n\n")
+    append("Explore this repository, find the root cause, and propose a concrete fix.")
+}
+
+@Composable private fun PullRequestDetailDialog(pr: GitHubPullRequestDetailDto, onDismiss: () -> Unit, onReview: (() -> Unit)? = null) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("#${pr.number} ${pr.title}") },
@@ -5111,11 +5124,18 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                 if (!pr.body.isNullOrBlank()) Text(pr.body)
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } }
+        confirmButton = {
+            if (onReview != null) Button(onClick = { onDismiss(); onReview() }) {
+                Icon(Icons.Default.Code, null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Review")
+            } else TextButton(onClick = onDismiss) { Text("Done") }
+        },
+        dismissButton = { if (onReview != null) TextButton(onClick = onDismiss) { Text("Close") } }
     )
 }
 
-@Composable private fun IssueDetailDialog(issue: GitHubIssueDto, onDismiss: () -> Unit) {
+@Composable private fun IssueDetailDialog(issue: GitHubIssueDto, onDismiss: () -> Unit, onReview: (() -> Unit)? = null) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("#${issue.number} ${issue.title}") },
@@ -5131,7 +5151,14 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                 if (!issue.body.isNullOrBlank()) Text(issue.body)
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } }
+        confirmButton = {
+            if (onReview != null) Button(onClick = { onDismiss(); onReview() }) {
+                Icon(Icons.Default.Code, null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Review")
+            } else TextButton(onClick = onDismiss) { Text("Done") }
+        },
+        dismissButton = { if (onReview != null) TextButton(onClick = onDismiss) { Text("Close") } }
     )
 }
 
