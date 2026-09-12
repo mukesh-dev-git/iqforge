@@ -420,16 +420,40 @@ class AgentViewModel(
     fun isCatalogModelDownloaded(model: ModelInfo): Boolean =
         (codeEngine as? NativeEngine)?.isCatalogModelAvailable(model) == true
 
+    var isActivatingModel by mutableStateOf(false); private set
+
     /**
      * Switch which on-device model is active. Downloaded already -> activate it (and relaunch
-     * the NPU daemon against it). Not downloaded -> fetch it first; startModelDownload() already
-     * activates whatever NativeEngine.activeModel is once the download finishes.
+     * the NPU daemon against it), tracked via isActivatingModel so the sheet can show progress
+     * instead of silently doing nothing while ensureNpuDaemonRunning() spawns the daemon (can
+     * take several seconds) — and surface a real error if it fails, rather than leaving the row
+     * stuck on "tap to activate" with no explanation. Not downloaded -> fetch it first;
+     * startModelDownload() already activates whatever NativeEngine.activeModel is once the
+     * download finishes.
      */
     fun selectCatalogModel(model: ModelInfo) {
         val nativeEngine = codeEngine as? NativeEngine ?: return
-        if (isDownloadingModel) return
+        if (isDownloadingModel || isActivatingModel) return
         nativeEngine.selectCatalogModel(model)
-        if (nativeEngine.isModelAvailable()) refreshOfflineModel() else startModelDownload()
+        if (nativeEngine.isModelAvailable()) {
+            isActivatingModel = true
+            viewModelScope.launch {
+                val ready = nativeEngine.initialize()
+                offlineModelReady = ready
+                offlineModelBytes = nativeEngine.installedModelBytes()
+                offlineModelName = if (ready) nativeEngine.displayName else null
+                if (ready && selectedModel == null) selectedModel = nativeEngine.displayName
+                isActivatingModel = false
+                if (!ready) {
+                    feed += FeedItem.Status(
+                        "Couldn't start ${model.displayName} on the Hexagon NPU — the daemon didn't come up in time. Try again, or check the phone isn't thermal-throttled.",
+                        error = true
+                    )
+                }
+            }
+        } else {
+            startModelDownload()
+        }
     }
 
     fun startModelDownload() {
@@ -4785,14 +4809,18 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                         val isActive = model.id == agent.activeCatalogModelId
                         val isDownloaded = agent.isCatalogModelDownloaded(model)
                         val isDownloadingThis = agent.isDownloadingModel && isActive
+                        val isActivatingThis = agent.isActivatingModel && isActive
                         Surface(
                             onClick = {
-                                if (agent.isDownloadingModel) return@Surface
+                                if (agent.isDownloadingModel || agent.isActivatingModel) return@Surface
                                 if (isActive && agent.offlineModelReady) {
                                     agent.selectOfflineModel(); onDismiss()
+                                } else if (isDownloaded) {
+                                    // Don't dismiss yet — stay open showing "Activating…" until
+                                    // selectCatalogModel's coroutine resolves, success or failure.
+                                    agent.selectCatalogModel(model)
                                 } else {
                                     agent.selectCatalogModel(model)
-                                    if (isDownloaded) onDismiss()
                                 }
                             },
                             color = Color.Transparent
@@ -4815,6 +4843,7 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                                                 "Hardware accelerated on Hexagon HTP • ${String.format(java.util.Locale.US, "%.1f", it)} tokens/sec"
                                             } ?: "Hardware accelerated on Hexagon HTP • Pure NPU"
                                             isActive && agent.offlineModelReady -> "Active • ${agent.offlineModelBytes / 1_000_000} MB GGUF • Pure NPU execution"
+                                            isActivatingThis -> "Activating on Hexagon NPU… this can take a few seconds"
                                             isDownloadingThis -> "Downloading: ${(agent.downloadProgress * 100).toInt()}% (${agent.downloadProgressStatus})"
                                             isDownloaded -> "Downloaded • tap to activate"
                                             else -> "Tap to download (${String.format(java.util.Locale.US, "%.1f", model.approxSizeBytes / 1_000_000_000.0)} GB)"
@@ -4825,6 +4854,7 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                                 }
                                 when {
                                     isActive && (agent.offlineModelReady || isNpu) -> Icon(Icons.Default.Check, "Active", tint = Color(0xFF54C878))
+                                    isActivatingThis -> CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                                     isDownloadingThis -> Unit
                                     !isDownloaded -> Icon(Icons.Default.Download, "Download", tint = MaterialTheme.colorScheme.primary)
                                     else -> Unit
