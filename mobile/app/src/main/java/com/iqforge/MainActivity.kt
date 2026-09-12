@@ -849,6 +849,14 @@ class AgentViewModel(
         }
     }
 
+    /** Shake to regenerate — re-issues the last user prompt through the same [send] path. */
+    fun regenerateLastReply() {
+        if (sending) return
+        val lastPrompt = feed.filterIsInstance<FeedItem.User>().lastOrNull()?.text ?: return
+        composer = lastPrompt
+        send()
+    }
+
     /**
      * Send the same prompt + file context to the laptop bridge.
      * Called when the user taps "Ask laptop" on an [FeedItem.EscalatePrompt] card,
@@ -1068,9 +1076,20 @@ class AgentViewModel(
     var voiceName by rememberSaveable { mutableStateOf(settingsPreferences.getString("tts_voice", "").orEmpty()) }
     var voicePace by rememberSaveable { mutableStateOf(settingsPreferences.getFloat("voice_pace", 1f)) }
     var navigationOpen by remember { mutableStateOf(false) }
+    // Face-down locks the session (shoulder-surf protection) and stays locked — flipping
+    // back face-up does NOT auto-unlock, an explicit tap does. Whatever was visible while
+    // it was face-down may already have been seen; auto-unlocking on flip-back defeats
+    // the point.
+    var sessionLocked by remember { mutableStateOf(false) }
     // Tilt right opens the sidebar, tilt left closes it — app-wide, not just on the chat
-    // screen. Replaces the old tilt-to-scroll gesture (removed from Feed).
-    SensorFeedback(onTiltRight = { navigationOpen = true }, onTiltLeft = { navigationOpen = false })
+    // screen. Replaces the old tilt-to-scroll gesture (removed from Feed). Shake regenerates
+    // the last on-device reply. Face-down locks the session (see above).
+    SensorFeedback(
+        onTiltRight = { navigationOpen = true },
+        onTiltLeft = { navigationOpen = false },
+        onShake = { agent.regenerateLastReply() },
+        onFaceDown = { isDown -> if (isDown) sessionLocked = true }
+    )
     var destination by rememberSaveable { mutableStateOf(AppDestination.CHATS) }
     var selectedProjectName by rememberSaveable { mutableStateOf<String?>(null) }
     var showAddToChat by rememberSaveable { mutableStateOf(false) }
@@ -1365,6 +1384,29 @@ class AgentViewModel(
             onStartVoice = startVoiceInput,
             onDismiss = { settingsDialog = SettingsDialog.NONE }
         )
+    }
+    if (sessionLocked) {
+        Surface(
+            modifier = Modifier.fillMaxSize().clickable { sessionLocked = false },
+            color = MaterialTheme.colorScheme.background
+        ) {
+            Column(
+                modifier = Modifier.fillMaxSize(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Icon(
+                    Icons.Default.Lock,
+                    contentDescription = null,
+                    modifier = Modifier.size(48.dp),
+                    tint = MaterialTheme.colorScheme.onBackground
+                )
+                Spacer(Modifier.height(16.dp))
+                Text("Session locked", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onBackground)
+                Spacer(Modifier.height(8.dp))
+                Text("Tap to unlock", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
     }
 }
 
