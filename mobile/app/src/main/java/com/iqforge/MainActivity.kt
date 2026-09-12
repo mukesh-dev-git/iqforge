@@ -95,6 +95,7 @@ import java.util.Locale
 import com.iqforge.sensors.SensorFeedback
 import com.iqforge.sensors.HapticCue
 import com.iqforge.sensors.buzz
+import com.iqforge.sensors.TorchFeedback
 import com.iqforge.git.JGitRepoManager
 import com.iqforge.git.Repo
 import org.eclipse.jgit.api.Git
@@ -1599,6 +1600,9 @@ class AgentViewModel(
         onShake = { agent.regenerateLastReply() },
         onFaceDown = { isDown -> if (isDown) sessionLocked = true }
     )
+    // Pulses the rear flash while the model is actually generating — on-device, laptop-escalated,
+    // or a code-session reply, doesn't matter which; visible from across the room or face-down.
+    TorchFeedback(active = agent.sending || agent.codeSessionBusy)
     var destination by rememberSaveable { mutableStateOf(AppDestination.CHATS) }
     var selectedProjectName by rememberSaveable { mutableStateOf<String?>(null) }
     var showAddToChat by rememberSaveable { mutableStateOf(false) }
