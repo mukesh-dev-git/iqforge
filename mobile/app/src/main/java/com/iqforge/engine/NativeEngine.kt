@@ -149,10 +149,32 @@ class NativeEngine(private val context: Context) : CodeEngine {
         false
     }
 
-    fun isModelAvailable(): Boolean {
-        val inFiles = File(context.filesDir, activeModel.fileName)
-        val inTmp = File("/data/local/tmp/gguf/${activeModel.fileName}")
+    fun isModelAvailable(): Boolean = isCatalogModelAvailable(activeModel)
+
+    /** Which catalog model is currently active — drives the model-picker UI's checkmark. */
+    val activeModelInfo: ModelInfo get() = activeModel
+
+    /** Checks a specific catalog entry, independent of [activeModel] — for listing download state in the picker. */
+    fun isCatalogModelAvailable(model: ModelInfo): Boolean {
+        val inFiles = File(context.filesDir, model.fileName)
+        val inTmp = File("/data/local/tmp/gguf/${model.fileName}")
         return (inFiles.exists() && inFiles.length() > 50_000_000L) || inTmp.exists()
+    }
+
+    /**
+     * Switches which catalog model subsequent initialize()/downloadModel() calls target. Resets
+     * readiness so the NPU daemon (bound to whatever GGUF it was launched with) gets relaunched
+     * against the newly selected model rather than silently continuing to serve the old one.
+     */
+    fun selectCatalogModel(model: ModelInfo) {
+        if (activeModel.id == model.id) return
+        // A daemon already running is bound to the OLD model's weights — ensureNpuDaemonRunning()
+        // would otherwise see it as healthy and skip relaunching, silently keeping the old model.
+        serverProcess?.destroy()
+        serverProcess = null
+        activeModel = model
+        isReady = false
+        isNpuActive = false
     }
 
     suspend fun downloadModel(onProgress: (Float, String) -> Unit): Boolean = withContext(Dispatchers.IO) {
