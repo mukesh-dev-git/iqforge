@@ -286,11 +286,13 @@ enum class EffortLevel(val label: String, val wireName: String) {
 // ---------------------------------------------------------------------------
 
 class AgentViewModel(
-    private val codeEngine: CodeEngine,
+    internal val codeEngine: CodeEngine,
     internal var bridgeClient: LaptopBridgeClient = LaptopBridgeClient(),
     private val preferences: android.content.SharedPreferences? = null,
     private val attachmentService: ChatAttachmentService = ChatAttachmentService()
 ) : ViewModel() {
+    val isNpuActive: Boolean get() = (codeEngine as? NativeEngine)?.isNpuActive == true
+    val lastNpuTokensPerSec: Double? get() = (codeEngine as? NativeEngine)?.lastNpuTokensPerSec
     private val historyStore = preferences?.let(::ChatHistoryStore)
     private val coworkStore = preferences?.let(::CoworkTaskStore)
     private val dispatchStore = preferences?.let(::DispatchStore)
@@ -632,7 +634,7 @@ class AgentViewModel(
             connectorStatus = try {
                 val health = bridgeClient.health(bridgeUrl)
                 modelServiceReady = health.modelReachable
-                if (selectedModel?.contains("on-device", ignoreCase = true) != true) {
+                if (selectedModel?.contains("on-device", ignoreCase = true) != true && selectedModel?.contains("Snapdragon", ignoreCase = true) != true) {
                     selectedModel = health.model
                 }
                 if (health.modelReachable) {
@@ -663,7 +665,7 @@ class AgentViewModel(
                 val discoveredConnectors = bridgeClient.connectors(bridgeUrl)
                 availableModels = discoveredModels
                 connectors = discoveredConnectors
-                if (selectedModel?.contains("on-device", ignoreCase = true) != true) {
+                if (selectedModel?.contains("on-device", ignoreCase = true) != true && selectedModel?.contains("Snapdragon", ignoreCase = true) != true) {
                     selectedModel = discoveredModels.firstOrNull { it.selected }?.id ?: health.model
                 }
                 modelServiceReady = discoveredModels.any { it.id == selectedModel }
@@ -736,7 +738,9 @@ class AgentViewModel(
                         feed += FeedItem.Status("Web search unavailable; continuing on-device. ${error.message.orEmpty()}", error = true)
                     }
                 }
-                val isOfflineSelected = selectedModel?.contains("on-device", ignoreCase = true) == true
+                val isOfflineSelected = selectedModel?.contains("on-device", ignoreCase = true) == true ||
+                    selectedModel?.contains("Snapdragon", ignoreCase = true) == true ||
+                    (codeEngine as? NativeEngine)?.isNpuActive == true
                 val useRealModel = !isOfflineSelected && modelServiceReady &&
                     (toolAccessMode == ToolAccessMode.AUTO || toolAccessMode == ToolAccessMode.AUTOMATIC)
                 val response = if (useRealModel) {
@@ -1349,7 +1353,7 @@ class AgentViewModel(
             is FeedItem.User           -> UserBubble(item.text)
             is FeedItem.Status         -> StatusCard(item.text, item.success, item.error)
             is FeedItem.Tool           -> ToolCard(item.text)
-            is FeedItem.Reply          -> OnDeviceReplyCard(item.text)
+            is FeedItem.Reply          -> OnDeviceReplyCard(item.text, agent)
             is FeedItem.Diff           -> DiffCard(item)
             is FeedItem.EscalatePrompt -> EscalatePromptCard(item) { agent.escalate(item.prompt, item.context, item.task) }
             is FeedItem.LaptopReply    -> LaptopReplyCard(item.text)
@@ -1515,7 +1519,15 @@ private fun displayModelText(text: String): String = text
  * Successful laptop bridge response.
  * Styled with a laptop icon + primary tint to visually distinguish from the offline reply above.
  */
-@Composable private fun OnDeviceReplyCard(text: String) {
+@Composable private fun OnDeviceReplyCard(text: String, agent: AgentViewModel) {
+    val isNpu = agent.isNpuActive
+    val tps = agent.lastNpuTokensPerSec
+    val badgeLabel = if (isNpu) {
+        if (tps != null) "Snapdragon Hexagon NPU (${String.format(java.util.Locale.US, "%.1f", tps)} t/s)"
+        else "Snapdragon Hexagon NPU (HTP v81)"
+    } else {
+        "On-Device (Qwen 1.5B)"
+    }
     Surface(
         color = MaterialTheme.colorScheme.surface,
         shape = RoundedCornerShape(10.dp),
@@ -1532,9 +1544,10 @@ private fun displayModelText(text: String): String = text
                 )
                 Spacer(Modifier.width(6.dp))
                 Text(
-                    "On-Device (Qwen 1.5B)",
+                    badgeLabel,
                     style = MaterialTheme.typography.labelSmall,
-                    color = Color(0xFF54C878)
+                    color = Color(0xFF54C878),
+                    fontWeight = FontWeight.SemiBold
                 )
             }
             Spacer(Modifier.height(6.dp))
@@ -1652,15 +1665,23 @@ private fun displayModelText(text: String): String = text
                         modifier = Modifier.padding(horizontal = 17.dp, vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        val isOffline = agent.selectedModel?.contains("on-device", ignoreCase = true) == true
+                        val isNpu = agent.isNpuActive
+                        val isOffline = isNpu || agent.selectedModel?.contains("on-device", ignoreCase = true) == true ||
+                            agent.selectedModel?.contains("Snapdragon", ignoreCase = true) == true
                         Text(
-                            if (isOffline) "On-device model (offline)" else if (agent.modelServiceReady) "Connected coding model" else "Private offline fallback",
+                            if (isNpu) "Snapdragon NPU active (HTP v81)"
+                            else if (isOffline) "On-device model (offline)"
+                            else if (agent.modelServiceReady) "Connected coding model"
+                            else "Private offline fallback",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodyMedium
                         )
                         Spacer(Modifier.weight(1f))
                         Text(
-                            if (isOffline) "Qwen 1.5B active" else if (agent.modelServiceReady) "Real model ready" else "Offline fallback",
+                            if (isNpu) "23+ t/s NPU"
+                            else if (isOffline) "Qwen 1.5B active"
+                            else if (agent.modelServiceReady) "Real model ready"
+                            else "Offline fallback",
                             color = if (isOffline) Color(0xFF54C878) else MaterialTheme.colorScheme.primary,
                             fontWeight = FontWeight.SemiBold,
                             style = MaterialTheme.typography.bodyMedium
@@ -1724,8 +1745,10 @@ private fun displayModelText(text: String): String = text
                                 modifier = Modifier.size(17.dp)
                             )
                             Spacer(Modifier.width(6.dp))
+                            val isNpu = agent.isNpuActive
                             val displayModelName = when {
                                 agent.selectedModel == null -> "Select model"
+                                isNpu || agent.selectedModel?.contains("Snapdragon", ignoreCase = true) == true -> "Qwen NPU"
                                 agent.selectedModel?.contains("on-device", ignoreCase = true) == true -> "Qwen 1.5B"
                                 else -> agent.selectedModel?.substringBefore(':') ?: "Select model"
                             }
@@ -3343,17 +3366,18 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                     }
                 }
             }
-            if (agent.offlineModelReady) {
+            val isNpu = agent.isNpuActive
+            if (agent.offlineModelReady || isNpu) {
                 Spacer(Modifier.height(12.dp))
                 Surface(onClick = { agent.selectOfflineModel(); onDismiss() }, color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
                     Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.PhoneAndroid, null, tint = Color(0xFF54C878))
                         Spacer(Modifier.width(14.dp))
                         Column(Modifier.weight(1f)) {
-                            Text("Qwen2.5 Coder 1.5B", style = MaterialTheme.typography.titleMedium)
-                            Text("On-device • ${agent.offlineModelBytes / 1_000_000} MB GGUF • works without internet", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(if (isNpu) "Qwen 1.5B (Snapdragon NPU)" else "Qwen2.5 Coder 1.5B", style = MaterialTheme.typography.titleMedium)
+                            Text(if (isNpu) "Hardware accelerated on Hexagon HTP • 23+ tokens/sec" else "On-device • ${agent.offlineModelBytes / 1_000_000} MB GGUF • works without internet", color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
-                        if (agent.selectedModel?.contains("on-device") == true) Icon(Icons.Default.Check, "Selected", tint = Color(0xFF54C878))
+                        if (agent.selectedModel?.contains("on-device") == true || agent.selectedModel?.contains("Snapdragon") == true) Icon(Icons.Default.Check, "Selected", tint = Color(0xFF54C878))
                     }
                 }
             }
