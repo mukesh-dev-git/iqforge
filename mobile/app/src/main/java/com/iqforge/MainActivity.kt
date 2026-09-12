@@ -21,6 +21,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -81,6 +83,9 @@ import com.iqforge.dispatch.DispatchRecord
 import com.iqforge.dispatch.DispatchStatus
 import com.iqforge.dispatch.DispatchStore
 import com.iqforge.engine.OfflineEngine
+import com.iqforge.github.GitHubIssueDto
+import com.iqforge.github.GitHubPullRequestDetailDto
+import com.iqforge.github.GitHubViewModel
 import kotlinx.coroutines.launch
 import com.iqforge.workspace.WorkspaceEntry
 import com.iqforge.workspace.WorkspaceUiState
@@ -2903,7 +2908,9 @@ private fun displayModelText(text: String): String = text.trim()
 ) {
     var filesOpen by rememberSaveable { mutableStateOf(false) }
     var laptopFilesOpen by rememberSaveable { mutableStateOf(false) }
+    var githubOpen by rememberSaveable { mutableStateOf(false) }
     var showRepositoryDialog by rememberSaveable { mutableStateOf(false) }
+    val github: GitHubViewModel = viewModel()
     val laptopRoot = agent.dispatchWorkspaces.firstOrNull().orEmpty()
     val activeRoot = agent.activeRemoteWorkspace.ifBlank {
         state.repo?.root?.absolutePath.orEmpty().ifBlank { laptopRoot }
@@ -2920,11 +2927,24 @@ private fun displayModelText(text: String): String = text.trim()
                 onClick = {
                     laptopFilesOpen = !laptopFilesOpen
                     filesOpen = false
+                    githubOpen = false
                     if (laptopFilesOpen) agent.refreshRemoteFiles(activeRoot)
                 }
             ) { Text(if (laptopFilesOpen) "Sessions" else "Laptop files") }
-            if (state.repo != null) TextButton(onClick = { filesOpen = !filesOpen }) {
+            if (state.repo != null) TextButton(onClick = {
+                filesOpen = !filesOpen
+                githubOpen = false
+                laptopFilesOpen = false
+            }) {
                 Text(if (filesOpen) "Sessions" else "Files")
+            }
+            if (state.repo != null) TextButton(onClick = {
+                githubOpen = !githubOpen
+                filesOpen = false
+                laptopFilesOpen = false
+                if (githubOpen) github.loadForRepo(state.repo)
+            }) {
+                Text(if (githubOpen) "Sessions" else "GitHub")
             }
         }
         if (laptopFilesOpen) {
@@ -2933,6 +2953,10 @@ private fun displayModelText(text: String): String = text.trim()
         }
         if (filesOpen && state.repo != null) {
             FilePanel(state, workspace)
+            return@Column
+        }
+        if (githubOpen && state.repo != null) {
+            GitHubPanel(github, state.repo)
             return@Column
         }
         Text("Devices", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 24.dp))
@@ -4087,6 +4111,136 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
         }
         state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
     }
+
+@Composable private fun GitHubPanel(github: GitHubViewModel, repo: com.iqforge.git.Repo) {
+    var tab by rememberSaveable { mutableStateOf(0) } // 0 = PRs, 1 = Issues
+    Column {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                github.repoRef?.fullName ?: repo.name,
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.titleSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            IconButton(onClick = { github.loadForRepo(repo, forceRefresh = true) }, enabled = !github.loadingList) {
+                Icon(Icons.Default.Refresh, "Refresh")
+            }
+        }
+        Row(Modifier.padding(top = 8.dp, bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(selected = tab == 0, onClick = { tab = 0 }, label = { Text("Pull requests (${github.pullRequests.size})") })
+            FilterChip(selected = tab == 1, onClick = { tab = 1 }, label = { Text("Issues (${github.issues.size})") })
+        }
+        when {
+            github.loadingList -> Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator()
+            }
+            github.listError != null -> StatusCard(github.listError!!, error = true)
+            tab == 0 -> LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                items(github.pullRequests, key = { "pr-${it.number}" }) { pr ->
+                    ElevatedCard(onClick = { github.openPullRequest(pr.number) }, modifier = Modifier.fillMaxWidth()) {
+                        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Code, null, tint = if (pr.draft) MaterialTheme.colorScheme.onSurfaceVariant else IqfYellow)
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text("#${pr.number} ${pr.title}", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
+                                Text(
+                                    "${pr.user?.login ?: "unknown"} · ${pr.state}${if (pr.draft) " · draft" else ""}",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Text(
+                                formatProjectDate(runCatching { java.time.Instant.parse(pr.updatedAt).toEpochMilli() }.getOrDefault(0L)),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+                if (github.pullRequests.isEmpty()) item {
+                    Text("No open pull requests.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 24.dp))
+                }
+            }
+            else -> LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                items(github.issues, key = { "issue-${it.number}" }) { issue ->
+                    ElevatedCard(onClick = { github.openIssue(issue) }, modifier = Modifier.fillMaxWidth()) {
+                        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.ErrorOutline, null, tint = IqfYellow)
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text("#${issue.number} ${issue.title}", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
+                                Text(
+                                    listOfNotNull(
+                                        issue.user?.login,
+                                        issue.labels.joinToString(", ") { it.name }.takeIf { it.isNotBlank() }
+                                    ).joinToString(" · "),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Text(
+                                formatProjectDate(runCatching { java.time.Instant.parse(issue.updatedAt).toEpochMilli() }.getOrDefault(0L)),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+                if (github.issues.isEmpty()) item {
+                    Text("No open issues.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 24.dp))
+                }
+            }
+        }
+        if (github.loadingDetail) StatusCard("Loading…")
+        github.detailError?.let { StatusCard(it, error = true) }
+    }
+    github.selectedPullRequest?.let { PullRequestDetailDialog(it, onDismiss = github::clearSelection) }
+    github.selectedIssue?.let { IssueDetailDialog(it, onDismiss = github::clearSelection) }
+}
+
+@Composable private fun PullRequestDetailDialog(pr: GitHubPullRequestDetailDto, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("#${pr.number} ${pr.title}") },
+        text = {
+            Column(
+                Modifier.verticalScroll(rememberScrollState()).heightIn(max = 420.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    "${pr.user?.login ?: "unknown"} · ${pr.state}${if (pr.draft) " · draft" else ""}",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text("${pr.head.ref} → ${pr.base.ref}", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    "+${pr.additions} / -${pr.deletions} · ${pr.changedFiles} files changed",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (!pr.body.isNullOrBlank()) Text(pr.body)
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } }
+    )
+}
+
+@Composable private fun IssueDetailDialog(issue: GitHubIssueDto, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("#${issue.number} ${issue.title}") },
+        text = {
+            Column(
+                Modifier.verticalScroll(rememberScrollState()).heightIn(max = 420.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("${issue.user?.login ?: "unknown"} · ${issue.state}", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (issue.labels.isNotEmpty()) Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    issue.labels.forEach { AssistChip(onClick = {}, label = { Text(it.name) }) }
+                }
+                if (!issue.body.isNullOrBlank()) Text(issue.body)
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } }
+    )
+}
 
 @Composable private fun FilePanel(state: WorkspaceUiState, workspace: WorkspaceViewModel) =
     Column {

@@ -102,6 +102,11 @@ class JGitRepoManager(private val workspaceRoot: File) : RepoManager {
         return normalized
     }
 
+    /** Reads the `origin` remote URL straight from .git/config; not persisted anywhere else. */
+    suspend fun remoteUrl(repo: Repo): String? = withContext(Dispatchers.IO) {
+        runCatching { useGit(repo) { git -> git.repository.config.getString("remote", "origin", "url") } }.getOrNull()
+    }
+
     override suspend fun push(repo: Repo): Unit = withContext(Dispatchers.IO) {
         useGit(repo) { git ->
             val command = git.push()
