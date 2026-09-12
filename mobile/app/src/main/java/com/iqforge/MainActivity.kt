@@ -826,7 +826,13 @@ class AgentViewModel(
                 }
                 saveChatMessage("assistant", response)
                 if (memoryEnabled && !incognito) remember("User: $prompt\nIQF: ${response.take(1_500)}")
-                if (!useRealModel && bridgeUrl.isNotBlank() && toolAccessMode != ToolAccessMode.OFF) {
+                // Only offer escalation when there's an actual reason to — a diff/context past
+                // the ~40-line point where a 1.5B on-device model's review quality reliably
+                // holds up (see finals-30hr/BUILD_PLAN.md). Showing this after every reply,
+                // regardless of whether the on-device answer was already sufficient, trained
+                // the UI to look laptop-dependent by default — it isn't.
+                val contextIsLarge = enrichedContext.lines().size > 40
+                if (!useRealModel && bridgeUrl.isNotBlank() && toolAccessMode != ToolAccessMode.OFF && contextIsLarge) {
                     feed += FeedItem.EscalatePrompt(prompt = prompt, context = enrichedContext, task = task)
                 }
             } catch (error: Exception) {
@@ -1481,15 +1487,14 @@ private fun displayModelText(text: String): String = text
                 lineHeight = 32.sp,
                 textAlign = androidx.compose.ui.text.style.TextAlign.Center
             )
-            if (incognito) {
-                Spacer(Modifier.height(14.dp))
-                Text(
-                    "This chat is not saved to history or memory.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodyMedium,
-                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
-                )
-            }
+            Spacer(Modifier.height(14.dp))
+            Text(
+                if (incognito) "This chat is not saved to history or memory."
+                else "Running on your iQOO's NPU — no cloud, no laptop needed.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+            )
             if (repositoryName != null) {
                 Spacer(Modifier.height(12.dp))
                 Text(
@@ -2175,13 +2180,13 @@ private fun displayModelText(text: String): String = text
                         }
                     }
                 }
+                // MVP nav: Chats / Code / Settings only. Dispatch, Cowork, Projects, and
+                // Artifacts are folded into Code (Dispatch) or hidden for the demo — the
+                // code behind them is untouched, just not linked from here. See
+                // finals-30hr/MVP_PLAN.md.
                 item { NavigationItem("Chats", Icons.Default.Forum) { onDestination(AppDestination.CHATS) } }
                 item { NavigationItem("Clear current chat", Icons.Default.DeleteSweep) { agent.clearCurrentChat(); onDestination(AppDestination.CHATS) } }
-                item { NavigationItem("Dispatch", Icons.Default.Terminal) { onDestination(AppDestination.DISPATCH) } }
-                item { NavigationItem("Cowork", Icons.Default.TaskAlt) { onDestination(AppDestination.COWORK) } }
-                item { NavigationItem("Projects", Icons.Default.Inventory2) { onDestination(AppDestination.PROJECTS) } }
                 item { NavigationItem("Code", Icons.Default.Code) { onDestination(AppDestination.CODE) } }
-                item { NavigationItem("Artifacts", Icons.Default.Category) { onDestination(AppDestination.ARTIFACTS) } }
                 item { NavigationItem("Settings", Icons.Default.Settings) { onDestination(AppDestination.SETTINGS) } }
                 item { HorizontalDivider(Modifier.padding(vertical = 12.dp)) }
                 if (state.pinnedRepositoryNames.isNotEmpty()) {
