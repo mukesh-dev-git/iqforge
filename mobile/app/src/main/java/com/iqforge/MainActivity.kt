@@ -2430,7 +2430,16 @@ private fun displayModelText(text: String): String = text.trim()
                             )
                         },
                         colors = IconButtonDefaults.filledIconButtonColors(containerColor = IqfYellow)
-                    ) { Icon(Icons.Default.Tune, "Cycle appearance") }
+                    ) {
+                        Icon(
+                            when (appearance) {
+                                Appearance.DARK -> Icons.Default.DarkMode
+                                Appearance.LIGHT -> Icons.Default.LightMode
+                                Appearance.SYSTEM -> Icons.Default.BrightnessAuto
+                            },
+                            "Cycle appearance"
+                        )
+                    }
                     Spacer(Modifier.weight(1f))
                     val darkTheme = MaterialTheme.colorScheme.background.luminance() < .5f
                     Button(
@@ -2953,6 +2962,7 @@ private fun displayModelText(text: String): String = text.trim()
     val session = agent.codeSessions.firstOrNull { it.id == agent.activeCodeSessionId }
     var input by rememberSaveable { mutableStateOf("") }
     val listState = rememberLazyListState()
+    val haptics = LocalHapticFeedback.current
     LaunchedEffect(session?.messages?.size, agent.codeSessionBusy) {
         val count = (session?.messages?.size ?: 0) + if (agent.codeSessionBusy) 1 else 0
         if (count > 0) listState.animateScrollToItem(count - 1)
@@ -2977,13 +2987,34 @@ private fun displayModelText(text: String): String = text.trim()
             }
         }
         if (session == null || session.messages.isEmpty()) {
-            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Text(
-                    "Ask the coding agent to explore, edit, or run something in this workspace.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 32.dp),
-                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
-                )
+            Box(Modifier.weight(1f).fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 28.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(
+                        Icons.Default.Code,
+                        contentDescription = null,
+                        tint = IqfYellow,
+                        modifier = Modifier.size(48.dp)
+                    )
+                    Spacer(Modifier.height(22.dp))
+                    Text(
+                        text = "Let's ship something,\nDelfi.",
+                        color = MaterialTheme.colorScheme.onBackground,
+                        fontFamily = FontFamily.Serif,
+                        fontSize = 25.sp,
+                        lineHeight = 32.sp,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    )
+                    Spacer(Modifier.height(14.dp))
+                    Text(
+                        "Ask the coding agent to explore, edit, or run something in this workspace.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodyMedium,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    )
+                }
             }
         } else {
             LazyColumn(
@@ -3002,28 +3033,105 @@ private fun displayModelText(text: String): String = text.trim()
                 item { Spacer(Modifier.height(4.dp)) }
             }
         }
-        Surface(modifier = Modifier.fillMaxWidth().imePadding(), color = MaterialTheme.colorScheme.background) {
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically
+        Surface(
+            modifier = Modifier.fillMaxWidth().imePadding(),
+            color = MaterialTheme.colorScheme.background
+        ) {
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 8.dp, bottom = 16.dp),
+                color = MaterialTheme.colorScheme.surface,
+                shape = RoundedCornerShape(32.dp),
+                shadowElevation = 10.dp,
+                tonalElevation = 1.dp
             ) {
-                OutlinedTextField(
-                    value = input,
-                    onValueChange = { input = it },
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("Message the coding agent…") },
-                    enabled = !agent.codeSessionBusy
-                )
-                Spacer(Modifier.width(8.dp))
-                IconButton(
-                    onClick = {
-                        val text = input
-                        input = ""
-                        agent.sendCodeSessionMessage(text)
-                    },
-                    enabled = input.isNotBlank() && !agent.codeSessionBusy
-                ) {
-                    Icon(Icons.AutoMirrored.Filled.Send, "Send")
+                Column(Modifier.padding(14.dp)) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        shape = RoundedCornerShape(24.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 17.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                Icons.Default.Code,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                session?.repository ?: "Coding agent",
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Spacer(Modifier.weight(1f))
+                            Text(
+                                if (agent.codeSessionBusy) "Working…" else "Ready",
+                                color = if (agent.codeSessionBusy) MaterialTheme.colorScheme.primary else Color(0xFF54C878),
+                                fontWeight = FontWeight.SemiBold,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                    }
+
+                    TextField(
+                        value = input,
+                        onValueChange = { input = it },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 76.dp, max = 132.dp),
+                        placeholder = {
+                            Text(
+                                "Message the coding agent…",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .75f),
+                                fontSize = 22.sp
+                            )
+                        },
+                        enabled = !agent.codeSessionBusy,
+                        maxLines = 4,
+                        textStyle = MaterialTheme.typography.bodyLarge.copy(fontSize = 20.sp),
+                        colors = TextFieldDefaults.colors(
+                            focusedContainerColor = Color.Transparent,
+                            unfocusedContainerColor = Color.Transparent,
+                            disabledContainerColor = Color.Transparent,
+                            focusedIndicatorColor = Color.Transparent,
+                            unfocusedIndicatorColor = Color.Transparent,
+                            disabledIndicatorColor = Color.Transparent
+                        )
+                    )
+
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Spacer(Modifier.weight(1f))
+                        FilledIconButton(
+                            onClick = {
+                                if (input.isNotBlank() && !agent.codeSessionBusy) {
+                                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    val text = input
+                                    input = ""
+                                    agent.sendCodeSessionMessage(text)
+                                }
+                            },
+                            enabled = input.isNotBlank() && !agent.codeSessionBusy,
+                            colors = IconButtonDefaults.filledIconButtonColors(
+                                containerColor = MaterialTheme.colorScheme.primary,
+                                contentColor = Color.White,
+                                disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                                disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
+                            )
+                        ) {
+                            if (agent.codeSessionBusy) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(21.dp),
+                                    strokeWidth = 2.dp,
+                                    color = MaterialTheme.colorScheme.surface
+                                )
+                            } else {
+                                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
+                            }
+                        }
+                    }
                 }
             }
         }
