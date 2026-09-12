@@ -70,6 +70,8 @@ import com.iqforge.chat.AttachmentKind
 import com.iqforge.chat.ChatAttachment
 import com.iqforge.chat.ChatAttachmentService
 import com.iqforge.chat.ChatHistoryStore
+import com.iqforge.code.CodeSession
+import com.iqforge.code.CodeSessionStore
 import com.iqforge.chat.SavedChat
 import com.iqforge.cowork.CoworkStatus
 import com.iqforge.cowork.CoworkTask
@@ -88,18 +90,19 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-private val IqfCoral = Color(0xFFDA7756)
+private val IqfYellow = Color(0xFFFFC400)
 private val ForgeDarkColors = darkColorScheme(
-    primary = IqfCoral,
+    primary = IqfYellow,
     background = Color(0xFF121311),
     surface = Color(0xFF1D1E1B),
     surfaceVariant = Color(0xFF282925),
     outline = Color(0xFF3B3C37),
     onBackground = Color(0xFFF2EFE9),
     onSurface = Color(0xFFF2EFE9),
-    onSurfaceVariant = Color(0xFFAAA9A3)
+    onSurfaceVariant = Color(0xFFAAA9A3),
+    onPrimary = Color(0xFF1A1500)
 )
-private val ForgeLightColors = lightColorScheme(primary = Color(0xFF185ABC), background = Color(0xFFFFFBFF), surface = Color(0xFFFFFBFF), surfaceVariant = Color(0xFFE7E0EC))
+private val ForgeLightColors = lightColorScheme(primary = Color(0xFFB38600), background = Color(0xFFFFFBFF), surface = Color(0xFFFFFBFF), surfaceVariant = Color(0xFFE7E0EC))
 
 private enum class Appearance { SYSTEM, LIGHT, DARK }
 private enum class FontChoice { DEFAULT, SERIF, MONOSPACE }
@@ -293,6 +296,7 @@ class AgentViewModel(
     private val historyStore = preferences?.let(::ChatHistoryStore)
     private val coworkStore = preferences?.let(::CoworkTaskStore)
     private val dispatchStore = preferences?.let(::DispatchStore)
+    private val codeSessionStore = preferences?.let(::CodeSessionStore)
     var composer by mutableStateOf(""); private set
     var bridgeUrl by mutableStateOf(preferences?.getString("bridge_url", DEFAULT_BRIDGE_URL) ?: DEFAULT_BRIDGE_URL); private set
     var sending by mutableStateOf(false); private set
@@ -325,6 +329,9 @@ class AgentViewModel(
     var incognito by mutableStateOf(false); private set
     var coworkTasks by mutableStateOf<List<CoworkTask>>(coworkStore?.markInterrupted().orEmpty()); private set
     var dispatchRecords by mutableStateOf<List<DispatchRecord>>(dispatchStore?.load().orEmpty()); private set
+    var codeSessions by mutableStateOf<List<CodeSession>>(codeSessionStore?.load().orEmpty()); private set
+    var activeCodeSessionId by mutableStateOf<String?>(null); private set
+    var codeSessionBusy by mutableStateOf(false); private set
     var dispatchWorkspaces by mutableStateOf<List<String>>(emptyList()); private set
     var dispatchBusy by mutableStateOf(false); private set
     var dispatchError by mutableStateOf<String?>(null); private set
@@ -464,6 +471,55 @@ class AgentViewModel(
     fun selectRemoteWorkspace(path: String) {
         activeRemoteWorkspace = path
         refreshRemoteFiles(path)
+    }
+
+    fun createCodeSession(workspace: String): CodeSession? {
+        if (workspace.isBlank()) return null
+        val session = codeSessionStore?.create(workspace) ?: return null
+        codeSessions = codeSessionStore.load()
+        activeCodeSessionId = session.id
+        activeRemoteWorkspace = workspace
+        return session
+    }
+
+    fun openCodeSession(id: String) {
+        codeSessions.firstOrNull { it.id == id }?.let {
+            activeCodeSessionId = id
+            activeRemoteWorkspace = it.workspace
+        }
+    }
+
+    fun closeCodeSession() { activeCodeSessionId = null }
+
+    fun sendCodeSessionMessage(text: String) {
+        val id = activeCodeSessionId ?: return
+        val session = codeSessions.firstOrNull { it.id == id } ?: return
+        if (text.isBlank() || codeSessionBusy) return
+        codeSessions = codeSessionStore?.append(id, "user", text.trim()).orEmpty()
+        codeSessionBusy = true
+        viewModelScope.launch {
+            val response = try {
+                val explicit = text.trim().removePrefix("/")
+                val plan = bridgeClient.planDispatch(bridgeUrl, explicit, session.workspace)
+                if (plan.executable && plan.command != null) {
+                    val result = bridgeClient.execute(bridgeUrl, plan.command, session.workspace)
+                    buildString {
+                        append(plan.summary).append("\n\n$ ").append(plan.command).append('\n')
+                        append((result.stdout + result.stderr).trim())
+                        append("\n\nExit ").append(result.exitCode)
+                    }
+                } else {
+                    bridgeClient.escalateWithOptions(
+                        bridgeUrl, BridgeTask.WRITE,
+                        "Repository: ${session.repository}\nWorkspace: ${session.workspace}",
+                        text.trim(), effort.wireName
+                    )
+                }
+            } catch (error: Exception) { "ERROR: ${error.message ?: "Code agent failed"}" }
+            codeSessions = codeSessionStore?.append(id, "assistant", response).orEmpty()
+            codeSessionBusy = false
+            refreshRemoteFiles(session.workspace)
+        }
     }
 
     fun cloneRemoteRepository(root: String, url: String) {
@@ -1383,21 +1439,21 @@ private fun displayModelText(text: String): String = text
                     modifier = Modifier.size(44.dp)
                 )
             } else {
-                Text(
-                    "IQF",
-                    color = IqfCoral,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 30.sp,
-                    letterSpacing = 2.sp
+                Image(
+                    painter = painterResource(R.drawable.iqoo_q_mark),
+                    contentDescription = "iQOO",
+                    colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(IqfYellow),
+                    modifier = Modifier.size(48.dp)
                 )
             }
             Spacer(Modifier.height(22.dp))
             Text(
-                text = if (incognito) "Private session" else "Up late, Delfi?",
+                text = if (incognito) "Private session" else "Let's iQuest on and on, Delfi.\nAre you ready?",
                 color = MaterialTheme.colorScheme.onBackground,
                 fontFamily = FontFamily.Serif,
                 fontSize = 25.sp,
-                lineHeight = 32.sp
+                lineHeight = 32.sp,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center
             )
             if (incognito) {
                 Spacer(Modifier.height(14.dp))
@@ -1421,7 +1477,7 @@ private fun displayModelText(text: String): String = text
 
 @Composable private fun UserBubble(text: String) =
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-        Surface(color = Color(0xFF553126), shape = RoundedCornerShape(20.dp, 20.dp, 4.dp, 20.dp)) {
+        Surface(color = Color(0xFF4A3B00), shape = RoundedCornerShape(20.dp, 20.dp, 4.dp, 20.dp)) {
             Text(text, Modifier.padding(horizontal = 16.dp, vertical = 11.dp))
         }
     }
@@ -2110,7 +2166,7 @@ private fun displayModelText(text: String): String = text
                                 }
                             )
                         },
-                        colors = IconButtonDefaults.filledIconButtonColors(containerColor = IqfCoral)
+                        colors = IconButtonDefaults.filledIconButtonColors(containerColor = IqfYellow)
                     ) { Icon(Icons.Default.Tune, "Cycle appearance") }
                     Spacer(Modifier.weight(1f))
                     val darkTheme = MaterialTheme.colorScheme.background.luminance() < .5f
@@ -2433,7 +2489,7 @@ private fun displayModelText(text: String): String = text
                                 Icon(
                                     if (repo.name in state.pinnedRepositoryNames) Icons.Default.PushPin else Icons.Default.PushPin,
                                     contentDescription = if (repo.name in state.pinnedRepositoryNames) "Unpin ${repo.name}" else "Pin ${repo.name}",
-                                    tint = if (repo.name in state.pinnedRepositoryNames) IqfCoral else MaterialTheme.colorScheme.onSurfaceVariant
+                                    tint = if (repo.name in state.pinnedRepositoryNames) IqfYellow else MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                         }
@@ -2465,7 +2521,7 @@ private fun displayModelText(text: String): String = text
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center
             ) {
-                Icon(Icons.Default.Workspaces, null, tint = IqfCoral, modifier = Modifier.size(78.dp))
+                Icon(Icons.Default.Workspaces, null, tint = IqfYellow, modifier = Modifier.size(78.dp))
                 Spacer(Modifier.height(22.dp))
                 Text("Run coding work from your phone", style = MaterialTheme.typography.headlineMedium, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
                 Spacer(Modifier.height(18.dp))
@@ -2546,6 +2602,10 @@ private fun displayModelText(text: String): String = text
     var showRepositoryDialog by rememberSaveable { mutableStateOf(false) }
     val laptopRoot = agent.dispatchWorkspaces.firstOrNull().orEmpty()
     val activeRoot = agent.activeRemoteWorkspace.ifBlank { laptopRoot }
+    if (agent.activeCodeSessionId != null) {
+        CodeSessionChat(agent)
+        return
+    }
     Column(Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Code", style = MaterialTheme.typography.displaySmall, modifier = Modifier.weight(1f))
@@ -2586,21 +2646,21 @@ private fun displayModelText(text: String): String = text
             }
         }
         Text("Sessions", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 26.dp, bottom = 8.dp))
-        if (agent.coworkTasks.isEmpty()) {
+        if (agent.codeSessions.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Text("No model-backed coding sessions yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Start a session to work with the coding agent.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         } else {
             LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(agent.coworkTasks, key = { "session-${it.id}" }) { task ->
-                    ElevatedCard(Modifier.fillMaxWidth()) {
+                items(agent.codeSessions, key = { "session-${it.id}" }) { session ->
+                    ElevatedCard(Modifier.fillMaxWidth().clickable { agent.openCodeSession(session.id) }) {
                         Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                             Icon(Icons.Default.Code, null)
                             Spacer(Modifier.width(12.dp))
                             Column(Modifier.weight(1f)) {
-                                Text(task.title, maxLines = 1)
+                                Text(session.title, maxLines = 1)
                                 Text(
-                                    "${task.status.name.lowercase()}${task.repository?.let { " · $it" }.orEmpty()}",
+                                    "${session.repository} · ${session.messages.size} messages",
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
@@ -2609,10 +2669,13 @@ private fun displayModelText(text: String): String = text
                 }
             }
         }
-        Button(onClick = { showRepositoryDialog = true }, modifier = Modifier.align(Alignment.End).padding(bottom = 22.dp)) {
-            Icon(Icons.Default.Add, null)
-            Spacer(Modifier.width(8.dp))
-            Text("New session")
+        Row(Modifier.align(Alignment.End).padding(bottom = 22.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = { showRepositoryDialog = true }) { Text("Repository") }
+            Button(onClick = { agent.createCodeSession(activeRoot) }, enabled = activeRoot.isNotBlank()) {
+                Icon(Icons.Default.Add, null)
+                Spacer(Modifier.width(8.dp))
+                Text("New session")
+            }
         }
     }
     if (showRepositoryDialog) RepositorySessionDialog(
@@ -2621,6 +2684,84 @@ private fun displayModelText(text: String): String = text
         onDismiss = { showRepositoryDialog = false },
         onCreated = { showRepositoryDialog = false; laptopFilesOpen = true }
     )
+}
+
+@Composable private fun CodeSessionChat(agent: AgentViewModel) {
+    val session = agent.codeSessions.firstOrNull { it.id == agent.activeCodeSessionId }
+    var input by rememberSaveable { mutableStateOf("") }
+    val listState = rememberLazyListState()
+    LaunchedEffect(session?.messages?.size, agent.codeSessionBusy) {
+        val count = (session?.messages?.size ?: 0) + if (agent.codeSessionBusy) 1 else 0
+        if (count > 0) listState.animateScrollToItem(count - 1)
+    }
+    Column(Modifier.fillMaxSize()) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = agent::closeCodeSession) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back to sessions")
+            }
+            Spacer(Modifier.width(4.dp))
+            Column(Modifier.weight(1f)) {
+                Text(session?.title ?: "Session", maxLines = 1, style = MaterialTheme.typography.titleMedium)
+                Text(
+                    session?.workspace.orEmpty(),
+                    maxLines = 1,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+        if (session == null || session.messages.isEmpty()) {
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text(
+                    "Ask the coding agent to explore, edit, or run something in this workspace.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 32.dp),
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                )
+            }
+        } else {
+            LazyColumn(
+                Modifier.weight(1f).fillMaxWidth().padding(horizontal = 18.dp),
+                state = listState,
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                items(session.messages) { message ->
+                    if (message.role == "user") UserBubble(message.text)
+                    else LaptopReplyCard(message.text)
+                }
+                if (agent.codeSessionBusy) item { ThinkingIndicator() }
+                item { Spacer(Modifier.height(4.dp)) }
+            }
+        }
+        Surface(modifier = Modifier.fillMaxWidth().imePadding(), color = MaterialTheme.colorScheme.background) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = input,
+                    onValueChange = { input = it },
+                    modifier = Modifier.weight(1f),
+                    placeholder = { Text("Message the coding agent…") },
+                    enabled = !agent.codeSessionBusy
+                )
+                Spacer(Modifier.width(8.dp))
+                IconButton(
+                    onClick = {
+                        val text = input
+                        input = ""
+                        agent.sendCodeSessionMessage(text)
+                    },
+                    enabled = input.isNotBlank() && !agent.codeSessionBusy
+                ) {
+                    Icon(Icons.AutoMirrored.Filled.Send, "Send")
+                }
+            }
+        }
+    }
 }
 
 @Composable private fun ColumnScope.RemoteLaptopFiles(agent: AgentViewModel, cwd: String) {
