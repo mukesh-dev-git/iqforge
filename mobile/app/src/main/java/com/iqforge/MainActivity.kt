@@ -2516,13 +2516,19 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
     }
 
 @Composable private fun StatusCard(text: String, success: Boolean = false, error: Boolean = false) {
+    // success/error use a fixed dark background regardless of app theme (by design — it's a
+    // status color, not a surface), so the text color must ALSO be fixed rather than following
+    // MaterialTheme's theme-adaptive default: in light mode that default renders near-black text
+    // on this same dark background — unreadable. Only the neutral (non-success/error) case should
+    // still follow the theme, since its background does too.
     val background = when { success -> Color(0xFF0A3D17); error -> Color(0xFF4A1517); else -> MaterialTheme.colorScheme.surfaceVariant }
     val tint = when { success -> Color(0xFF36C76A); error -> Color(0xFFFF8A80); else -> MaterialTheme.colorScheme.primary }
+    val textColor = when { success -> Color(0xFFDFF3E3); error -> Color(0xFFFFDEDC); else -> MaterialTheme.colorScheme.onSurfaceVariant }
     Surface(color = background, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()) {
         Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(if (success) Icons.Default.Check else Icons.Default.Sync, null, tint = tint, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(10.dp))
-            Text(text)
+            Text(text, color = textColor)
         }
     }
 }
@@ -2691,9 +2697,12 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
             }
             Spacer(Modifier.height(4.dp))
             Text(
+                // Fixed light color, not theme-adaptive onSurface — this card's background is
+                // always dark maroon regardless of app theme, so in light mode onSurface (near
+                // black) was rendering unreadable text on it. Same bug as StatusCard above.
                 item.message,
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = .80f)
+                color = Color(0xFFF2E4E3).copy(alpha = .80f)
             )
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
