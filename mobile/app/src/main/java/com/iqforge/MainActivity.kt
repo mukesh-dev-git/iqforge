@@ -581,21 +581,40 @@ class AgentViewModel(
                     }
                     looksLikeBigTask(trimmed) -> {
                         replyRole = "laptop"
-                        bridgeClient.escalateWithOptions(
-                            bridgeUrl, BridgeTask.WRITE,
-                            "Repository: ${session.repository}\nWorkspace: ${session.workspace}",
-                            trimmed, effort.wireName
-                        )
+                        try {
+                            bridgeClient.escalateWithOptions(
+                                bridgeUrl, BridgeTask.WRITE,
+                                "Repository: ${session.repository}\nWorkspace: ${session.workspace}",
+                                trimmed, effort.wireName
+                            )
+                        } catch (e: Exception) {
+                            replyRole = "assistant"
+                            codeEngine.write(trimmed, "Repository: ${session.repository}\nWorkspace: ${session.workspace}")
+                        }
                     }
                     else -> {
                         val task = inferTask(trimmed)
-                        val knownFiles = remoteFiles.ifEmpty {
-                            runCatching { bridgeClient.workspaceFiles(bridgeUrl, session.workspace) }.getOrNull().orEmpty()
+                        val sessionDir = java.io.File(session.workspace)
+                        val isLocal = sessionDir.exists() && sessionDir.isDirectory
+                        val knownFiles = if (isLocal) {
+                            sessionDir.walkTopDown()
+                                .filter { it.isFile && !it.path.contains("/.git/") && !it.path.contains("\\.git\\") }
+                                .map { it.relativeTo(sessionDir).path.replace('\\', '/') }
+                                .take(150)
+                                .toList()
+                        } else {
+                            remoteFiles.ifEmpty {
+                                runCatching { bridgeClient.workspaceFiles(bridgeUrl, session.workspace) }.getOrNull().orEmpty()
+                            }
                         }
                         val mentionedFile = knownFiles.firstOrNull { trimmed.contains(it, ignoreCase = true) }
-                        val fileText = mentionedFile?.let {
-                            runCatching { bridgeClient.workspaceFile(bridgeUrl, session.workspace, it) }.getOrNull()
-                        }.orEmpty()
+                        val fileText = if (isLocal && mentionedFile != null) {
+                            runCatching { java.io.File(sessionDir, mentionedFile).readText() }.getOrDefault("")
+                        } else {
+                            mentionedFile?.let {
+                                runCatching { bridgeClient.workspaceFile(bridgeUrl, session.workspace, it) }.getOrNull()
+                            }.orEmpty()
+                        }
                         val header = "Repository: ${session.repository}\nWorkspace: ${session.workspace}" +
                             (mentionedFile?.let { "\nFile: $it" } ?: "")
                         val enrichedContext = if (fileText.isNotBlank()) "$header\n\n$fileText" else header
@@ -2842,7 +2861,9 @@ private fun displayModelText(text: String): String = text.trim()
     var laptopFilesOpen by rememberSaveable { mutableStateOf(false) }
     var showRepositoryDialog by rememberSaveable { mutableStateOf(false) }
     val laptopRoot = agent.dispatchWorkspaces.firstOrNull().orEmpty()
-    val activeRoot = agent.activeRemoteWorkspace.ifBlank { laptopRoot }
+    val activeRoot = agent.activeRemoteWorkspace.ifBlank {
+        state.repo?.root?.absolutePath.orEmpty().ifBlank { laptopRoot }
+    }
     if (agent.activeCodeSessionId != null) {
         CodeSessionChat(agent)
         return
@@ -2912,7 +2933,14 @@ private fun displayModelText(text: String): String = text.trim()
         }
         Row(Modifier.align(Alignment.End).padding(bottom = 22.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(onClick = { showRepositoryDialog = true }) { Text("Repository") }
-            Button(onClick = { agent.createCodeSession(activeRoot) }, enabled = activeRoot.isNotBlank()) {
+            val canCreate = activeRoot.isNotBlank() || state.repo != null
+            Button(
+                onClick = {
+                    val rootToUse = activeRoot.ifBlank { state.repo?.root?.absolutePath.orEmpty() }
+                    agent.createCodeSession(rootToUse)
+                },
+                enabled = canCreate
+            ) {
                 Icon(Icons.Default.Add, null)
                 Spacer(Modifier.width(8.dp))
                 Text("New session")
@@ -2921,9 +2949,11 @@ private fun displayModelText(text: String): String = text.trim()
     }
     if (showRepositoryDialog) RepositorySessionDialog(
         agent = agent,
-        root = laptopRoot,
+        workspace = workspace,
+        state = state,
+        laptopRoot = laptopRoot,
         onDismiss = { showRepositoryDialog = false },
-        onCreated = { showRepositoryDialog = false; laptopFilesOpen = true }
+        onCreated = { showRepositoryDialog = false }
     )
 }
 
@@ -3064,13 +3094,19 @@ private fun displayModelText(text: String): String = text.trim()
 
 @Composable private fun RepositorySessionDialog(
     agent: AgentViewModel,
-    root: String,
+    workspace: WorkspaceViewModel,
+    state: WorkspaceUiState,
+    laptopRoot: String,
     onDismiss: () -> Unit,
     onCreated: () -> Unit
 ) {
     var cloneMode by rememberSaveable { mutableStateOf(true) }
+    var targetLaptop by rememberSaveable { mutableStateOf(false) }
     var value by rememberSaveable { mutableStateOf("") }
+    var token by rememberSaveable { mutableStateOf("") }
     var publish by rememberSaveable { mutableStateOf(false) }
+    val isBusy = state.busy || agent.remoteBusy
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("New coding session") },
@@ -3080,24 +3116,73 @@ private fun displayModelText(text: String): String = text.trim()
                     FilterChip(cloneMode, { cloneMode = true }, { Text("Clone GitHub") })
                     FilterChip(!cloneMode, { cloneMode = false }, { Text("Create repository") })
                 }
+                if (laptopRoot.isNotBlank()) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(!targetLaptop, { targetLaptop = false }, { Text("📱 On phone") })
+                        FilterChip(targetLaptop, { targetLaptop = true }, { Text("💻 On laptop") })
+                    }
+                }
                 OutlinedTextField(
                     value, { value = it }, Modifier.fillMaxWidth(),
                     label = { Text(if (cloneMode) "HTTPS GitHub URL" else "Repository name") },
+                    placeholder = { if (cloneMode) Text("https://github.com/user/repo") else Text("my-project") },
                     singleLine = true
                 )
-                if (!cloneMode) Row(verticalAlignment = Alignment.CenterVertically) {
+                if (cloneMode && !targetLaptop) {
+                    OutlinedTextField(
+                        token, { token = it }, Modifier.fillMaxWidth(),
+                        label = { Text("GitHub token (optional, for private repos)") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true
+                    )
+                }
+                if (!cloneMode && targetLaptop) Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(publish, { publish = it })
                     Text("Create private GitHub repo and push")
                 }
-                Text("Laptop: $root", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    if (targetLaptop && laptopRoot.isNotBlank()) "Target: Laptop ($laptopRoot)"
+                    else "Target: 📱 On-device (Phone storage • Pure offline NPU)",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (targetLaptop) MaterialTheme.colorScheme.onSurfaceVariant else Color(0xFF54C878)
+                )
+                state.error?.let {
+                    Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+                }
             }
         },
         confirmButton = {
-            Button(onClick = {
-                if (cloneMode) agent.cloneRemoteRepository(root, value) else agent.createRemoteRepository(root, value, publish)
-                onCreated()
-            }, enabled = root.isNotBlank() && value.isNotBlank() && !agent.remoteBusy) {
-                Text(if (cloneMode) "Clone and open" else "Create and open")
+            val canConfirm = value.isNotBlank() && !isBusy && (!targetLaptop || laptopRoot.isNotBlank())
+            Button(
+                onClick = {
+                    if (targetLaptop) {
+                        if (cloneMode) agent.cloneRemoteRepository(laptopRoot, value)
+                        else agent.createRemoteRepository(laptopRoot, value, publish)
+                        onCreated()
+                    } else {
+                        if (cloneMode) {
+                            workspace.cloneRepository(value, token = token) { repo ->
+                                agent.createCodeSession(repo.root.absolutePath)
+                                onCreated()
+                            }
+                        } else {
+                            workspace.createRepository(value) { repo ->
+                                agent.createCodeSession(repo.root.absolutePath)
+                                onCreated()
+                            }
+                        }
+                    }
+                },
+                enabled = canConfirm
+            ) {
+                Text(
+                    when {
+                        state.busy -> "Cloning to phone…"
+                        agent.remoteBusy -> "Cloning to laptop…"
+                        cloneMode -> "Clone and open"
+                        else -> "Create and open"
+                    }
+                )
             }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }

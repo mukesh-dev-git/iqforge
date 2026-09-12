@@ -78,12 +78,19 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
     fun updateCommitMessage(value: String) = update { copy(commitMessage = value, error = null) }
     fun updateEditor(value: String) = update { copy(editorText = value, editorDirty = true) }
 
-    fun cloneRepository() = runOperation("Cloning repository…") {
-        applyCredentials()
-        val snapshot = mutableState.value
-        val name = RepositoryPaths.repositoryName(snapshot.repoUrl)
+    fun cloneRepository() = cloneRepository(mutableState.value.repoUrl, mutableState.value.githubUsername, mutableState.value.githubToken, null)
+
+    fun cloneRepository(
+        url: String,
+        username: String = "",
+        token: String = "",
+        onComplete: ((Repo) -> Unit)? = null
+    ) = runOperation("Cloning repository…") {
+        if (token.isNotBlank()) repoManager.updateCredentials(username, token)
+        else applyCredentials()
+        val name = RepositoryPaths.repositoryName(url)
         val destination = RepositoryPaths.uniqueCloneDirectory(workspaceRoot, name)
-        val repo = repoManager.clone(snapshot.repoUrl.trim(), destination)
+        val repo = repoManager.clone(url.trim(), destination)
         val metadata = metadataStore.save(ProjectMetadata(repo.name))
         withContext(Dispatchers.Main) {
             mutableState.value = mutableState.value.copy(
@@ -97,10 +104,17 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
                 message = "Cloned ${repo.name}",
                 error = null
             )
+            onComplete?.invoke(repo)
         }
     }
 
-    fun createRepository(name: String, description: String) = runOperation("Creating project…") {
+    fun createRepository(name: String, description: String) = createRepository(name, description, null)
+
+    fun createRepository(
+        name: String,
+        description: String = "",
+        onComplete: ((Repo) -> Unit)? = null
+    ) = runOperation("Creating project…") {
         val repo = repoManager.create(name, description)
         val metadata = metadataStore.save(ProjectMetadata(repo.name, description = description.trim()))
         withContext(Dispatchers.Main) {
@@ -113,6 +127,7 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
                 message = "Created ${repo.name}",
                 error = null
             )
+            onComplete?.invoke(repo)
         }
     }
 
