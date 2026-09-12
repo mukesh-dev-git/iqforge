@@ -46,6 +46,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -95,7 +98,6 @@ import java.util.Locale
 import com.iqforge.sensors.SensorFeedback
 import com.iqforge.sensors.HapticCue
 import com.iqforge.sensors.buzz
-import com.iqforge.sensors.TorchFeedback
 import com.iqforge.git.JGitRepoManager
 import com.iqforge.git.Repo
 import org.eclipse.jgit.api.Git
@@ -1600,9 +1602,6 @@ class AgentViewModel(
         onShake = { agent.regenerateLastReply() },
         onFaceDown = { isDown -> if (isDown) sessionLocked = true }
     )
-    // Pulses the rear flash while the model is actually generating — on-device, laptop-escalated,
-    // or a code-session reply, doesn't matter which; visible from across the room or face-down.
-    TorchFeedback(active = agent.sending || agent.codeSessionBusy)
     var destination by rememberSaveable { mutableStateOf(AppDestination.CHATS) }
     var selectedProjectName by rememberSaveable { mutableStateOf<String?>(null) }
     var showAddToChat by rememberSaveable { mutableStateOf(false) }
@@ -2014,6 +2013,86 @@ class AgentViewModel(
 
 private fun displayModelText(text: String): String = text.trim()
 
+/**
+ * Minimal, dependency-free markdown for model replies: fenced ```code``` blocks render as their
+ * own monospace surface (with the language tag if the model gave one), **bold** and `inline code`
+ * render inline. No external markdown library — the model's output only ever uses this handful of
+ * constructs, and a tiny hand-rolled parser is far less risk than adding a dependency this late.
+ */
+private sealed class MdBlock {
+    data class Paragraph(val text: String) : MdBlock()
+    data class Code(val code: String, val language: String?) : MdBlock()
+}
+
+private val CODE_FENCE = Regex("```([a-zA-Z0-9_+-]*)\\n?([\\s\\S]*?)```")
+
+private fun parseMarkdownBlocks(raw: String): List<MdBlock> {
+    val blocks = mutableListOf<MdBlock>()
+    var lastEnd = 0
+    for (match in CODE_FENCE.findAll(raw)) {
+        if (match.range.first > lastEnd) {
+            val before = raw.substring(lastEnd, match.range.first).trim('\n', ' ')
+            if (before.isNotBlank()) blocks.add(MdBlock.Paragraph(before))
+        }
+        blocks.add(MdBlock.Code(match.groupValues[2].trimEnd('\n'), match.groupValues[1].ifBlank { null }))
+        lastEnd = match.range.last + 1
+    }
+    if (lastEnd < raw.length) {
+        val rest = raw.substring(lastEnd).trim('\n', ' ')
+        if (rest.isNotBlank()) blocks.add(MdBlock.Paragraph(rest))
+    }
+    return blocks.ifEmpty { if (raw.isNotBlank()) listOf(MdBlock.Paragraph(raw)) else emptyList() }
+}
+
+private fun inlineMarkdown(text: String): AnnotatedString = buildAnnotatedString {
+    var i = 0
+    while (i < text.length) {
+        when {
+            text.startsWith("**", i) && text.indexOf("**", i + 2) != -1 -> {
+                val end = text.indexOf("**", i + 2)
+                withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(text, i + 2, end) }
+                i = end + 2
+            }
+            text[i] == '`' && text.indexOf('`', i + 1) != -1 -> {
+                val end = text.indexOf('`', i + 1)
+                withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(text, i + 1, end) }
+                i = end + 1
+            }
+            else -> { append(text[i]); i++ }
+        }
+    }
+}
+
+@Composable
+private fun MarkdownText(raw: String, style: androidx.compose.ui.text.TextStyle, color: Color = Color.Unspecified) {
+    val blocks = remember(raw) { parseMarkdownBlocks(raw) }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        blocks.forEach { block ->
+            when (block) {
+                is MdBlock.Paragraph -> Text(inlineMarkdown(block.text), style = style, color = color)
+                is MdBlock.Code -> Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(Modifier.padding(10.dp)) {
+                        if (!block.language.isNullOrBlank()) {
+                            Text(
+                                block.language.uppercase(),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Spacer(Modifier.height(4.dp))
+                        }
+                        Text(block.code, fontFamily = FontFamily.Monospace, fontSize = 13.sp)
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable private fun EmptyAgentState(modifier: Modifier, repositoryName: String?, incognito: Boolean) =
     Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(
@@ -2185,7 +2264,7 @@ private fun displayModelText(text: String): String = text.trim()
                 )
             }
             Spacer(Modifier.height(6.dp))
-            Text(displayModelText(text), style = MaterialTheme.typography.bodyLarge)
+            MarkdownText(displayModelText(text), style = MaterialTheme.typography.bodyLarge)
         }
     }
 }
@@ -2213,7 +2292,7 @@ private fun displayModelText(text: String): String = text.trim()
                 )
             }
             Spacer(Modifier.height(6.dp))
-            Text(displayModelText(text), style = MaterialTheme.typography.bodyLarge)
+            MarkdownText(displayModelText(text), style = MaterialTheme.typography.bodyLarge)
         }
     }
 }
