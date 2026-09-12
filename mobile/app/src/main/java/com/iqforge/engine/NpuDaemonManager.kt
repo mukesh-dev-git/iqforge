@@ -175,9 +175,14 @@ object NpuDaemonManager {
             return@withContext false
         }
 
-        // Poll for health check (HTP model initialization typically takes 1.5 - 3 seconds)
-        for (i in 1..20) {
-            delay(300)
+        // Poll for health check. A cold Hexagon HTP load of a multi-hundred-MB GGUF routinely
+        // takes well past 6 seconds — the same team already proved this the hard way fixing
+        // start_npu_server.ps1 (PR #31: fixed timeout was too short there too, moved to 30s).
+        // This in-app path had the identical bug, and it's worse here: giving up early and then
+        // retrying re-runs the pkill cleanup above first, killing a daemon that may have been
+        // seconds from ready and restarting its cold-load clock from zero.
+        for (i in 1..40) {
+            delay(750)
             if (isServerAlive()) {
                 Log.i(TAG, "NPU server is alive and responding on port 8080!")
                 return@withContext true
