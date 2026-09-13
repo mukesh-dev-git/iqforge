@@ -137,7 +137,7 @@ private val ForgeLightColors = lightColorScheme(primary = Color(0xFFB38600), bac
 
 private enum class Appearance { SYSTEM, LIGHT, DARK }
 private enum class FontChoice { DEFAULT, SERIF, MONOSPACE }
-private enum class AppDestination { CHATS, DISPATCH, COWORK, PROJECTS, PROJECT_DETAIL, CODE, ARTIFACTS, REVIEW, SETTINGS }
+private enum class AppDestination { CHATS, DISPATCH, COWORK, PROJECTS, PROJECT_DETAIL, CODE, ARTIFACTS, REVIEW, CI_HEALTH, SETTINGS }
 private enum class SettingsDialog { NONE, USAGE, CAPABILITIES, GITHUB, COLOR, FONT, VOICE, PRIVACY, DEVICE }
 
 class MainActivity : ComponentActivity() {
@@ -937,7 +937,7 @@ class AgentViewModel(
      * path, so a bad response skips the fix instead of corrupting the file), commits, pushes, and
      * re-triggers the deploy pipeline so the loop actually closes instead of just naming the bug.
      */
-    private suspend fun diagnoseCiFailure(sessionDir: File, logText: String): String {
+    suspend fun diagnoseCiFailure(sessionDir: File, logText: String): String {
         if (logText.isBlank()) {
             return "⚠️ Paste the failed CI log after the command, e.g. `/diagnose <paste log here>`"
         }
@@ -2208,6 +2208,7 @@ class AgentViewModel(
                     state = state,
                     onOpenCode = { destination = AppDestination.CODE }
                 )
+                AppDestination.CI_HEALTH -> CiHealthPage(agent = agent, workspace = workspace, state = state)
                 AppDestination.SETTINGS -> SettingsPage(
                     appearance = appearance,
                     fontChoice = fontChoice,
@@ -3346,6 +3347,7 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
                 item { NavigationItem("Chats", Icons.Default.Forum) { onDestination(AppDestination.CHATS) } }
                 item { NavigationItem("Code", Icons.Default.Code) { onDestination(AppDestination.CODE) } }
                 item { NavigationItem("Review", Icons.Default.RateReview) { onDestination(AppDestination.REVIEW) } }
+                item { NavigationItem("CI Health", Icons.Default.HealthAndSafety) { onDestination(AppDestination.CI_HEALTH) } }
                 item { NavigationItem("Settings", Icons.Default.Settings) { onDestination(AppDestination.SETTINGS) } }
                 item { HorizontalDivider(Modifier.padding(vertical = 12.dp)) }
                 if (state.pinnedRepositoryNames.isNotEmpty()) {
@@ -3948,6 +3950,117 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
                 startReview(buildPullRequestReviewPrompt(github.repoRef!!.fullName, pr, github.selectedPullRequestFiles))
             }
         )
+    }
+}
+
+/**
+ * The dedicated front door for self-healing CI (previously only reachable as a hidden
+ * `/diagnose` chat command inside an already-open Code Session). Shows both existing,
+ * already-cloned projects AND lets you clone a new one right here — same underlying
+ * diagnoseCiFailure() either way, this just gives it a visible entry point.
+ */
+@Composable private fun CiHealthPage(agent: AgentViewModel, workspace: WorkspaceViewModel, state: WorkspaceUiState) {
+    var selectedRepoPath by rememberSaveable { mutableStateOf<String?>(null) }
+    var cloneUrl by rememberSaveable { mutableStateOf("") }
+    var logInput by rememberSaveable { mutableStateOf("") }
+    var result by rememberSaveable { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    var cloneError by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    val selectedRepoName = selectedRepoPath?.let { File(it).name }
+
+    Column(Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 10.dp)) {
+        Text("CI Health", style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 14.dp, bottom = 4.dp))
+        Text(
+            "Paste a failed build or test log for any project on this phone. The on-device model finds the real root cause, tells a flaky failure from a real regression, and — for a real regression — can fix it, commit, push, and re-deploy automatically.",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.padding(bottom = 16.dp)
+        )
+
+        Text("Project", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(bottom = 8.dp))
+        if (state.repositories.isEmpty()) {
+            Text(
+                "No projects on this phone yet — clone one below.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(bottom = 8.dp)
+            )
+        } else {
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 12.dp)) {
+                items(state.repositories, key = { it.root.absolutePath }) { repo ->
+                    FilterChip(
+                        selected = selectedRepoPath == repo.root.absolutePath,
+                        onClick = { selectedRepoPath = repo.root.absolutePath; result = null },
+                        label = { Text(repo.name) },
+                        leadingIcon = { Icon(Icons.Default.Folder, null, modifier = Modifier.size(18.dp)) }
+                    )
+                }
+            }
+        }
+
+        Text("Or clone a new one", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Row(Modifier.padding(top = 6.dp, bottom = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = cloneUrl,
+                onValueChange = { cloneUrl = it; cloneError = null },
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("https://github.com/owner/repo") },
+                singleLine = true
+            )
+            Spacer(Modifier.width(8.dp))
+            IconButton(
+                onClick = {
+                    cloneError = null
+                    workspace.cloneRepository(cloneUrl) { repo ->
+                        selectedRepoPath = repo.root.absolutePath
+                        cloneUrl = ""
+                        result = null
+                    }
+                },
+                enabled = cloneUrl.isNotBlank() && !workspace.state.value.busy
+            ) { Icon(Icons.Default.Download, "Clone repository") }
+        }
+        workspace.state.value.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(bottom = 8.dp)) }
+
+        if (selectedRepoName != null) {
+            HorizontalDivider(Modifier.padding(bottom = 16.dp))
+            Text("Diagnosing: $selectedRepoName", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(bottom = 8.dp))
+            OutlinedTextField(
+                value = logInput,
+                onValueChange = { logInput = it },
+                modifier = Modifier.fillMaxWidth().weight(1f, fill = false).heightIn(min = 140.dp, max = 260.dp),
+                placeholder = { Text("Paste the failed CI/CD build or test log here…") },
+                minLines = 6
+            )
+            Spacer(Modifier.height(10.dp))
+            Button(
+                onClick = {
+                    val path = selectedRepoPath ?: return@Button
+                    busy = true
+                    result = null
+                    scope.launch {
+                        result = agent.diagnoseCiFailure(File(path), logInput)
+                        busy = false
+                    }
+                },
+                enabled = logInput.isNotBlank() && !busy,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                if (busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary)
+                else Text("Diagnose")
+            }
+            result?.let { text ->
+                Spacer(Modifier.height(14.dp))
+                ElevatedCard(Modifier.fillMaxWidth()) {
+                    MarkdownText(text, modifier = Modifier.padding(16.dp))
+                }
+            }
+        } else {
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text("Select or clone a project above to get started.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
     }
 }
 
