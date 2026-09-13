@@ -156,9 +156,19 @@ class GitHubViewModel(application: Application) : AndroidViewModel(application) 
                     return@launch
                 }
 
-                mergeState = MergeState.APPROVING
-                mergeMessage = "Submitting your approval…"
-                client.submitApproval(ref.owner, ref.repo, number)
+                val authenticatedUser = runCatching { client.getAuthenticatedUser() }.getOrNull()
+                val isOwnPullRequest = authenticatedUser?.login
+                    ?.equals(latest.user?.login, ignoreCase = true) == true
+                if (isOwnPullRequest) {
+                    // GitHub rejects self-approval. Repository owners may still merge their
+                    // own clean PR when branch protection permits it, so continue directly
+                    // to the guarded exact-SHA merge instead of reporting a false failure.
+                    mergeMessage = "You authored this pull request, so GitHub self-approval was skipped. Preparing the verified merge…"
+                } else {
+                    mergeState = MergeState.APPROVING
+                    mergeMessage = "Submitting your approval…"
+                    client.submitApproval(ref.owner, ref.repo, number)
+                }
 
                 mergeState = MergeState.MERGING
                 mergeMessage = "Merging the exact commit you reviewed…"

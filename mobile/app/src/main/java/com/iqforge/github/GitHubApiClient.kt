@@ -55,6 +55,9 @@ open class GitHubApiClient(
             get("repos/$owner/$repo/commits/$ref/check-runs")
         )
 
+    open suspend fun getAuthenticatedUser(): GitHubUserDto =
+        json.decodeFromString(GitHubUserDto.serializer(), get("user"))
+
     open suspend fun submitApproval(owner: String, repo: String, number: Int): GitHubReviewDto =
         json.decodeFromString(
             GitHubReviewDto.serializer(),
@@ -85,6 +88,44 @@ open class GitHubApiClient(
             get("repos/$owner/$repo/issues?state=open&per_page=30")
         ).filter { it.pullRequest == null }
 
+    /** Triggers a real workflow_dispatch run. [workflowFile] is the file name under .github/workflows/. */
+    open suspend fun dispatchWorkflow(
+        owner: String,
+        repo: String,
+        workflowFile: String,
+        ref: String,
+        inputs: Map<String, String> = emptyMap()
+    ) {
+        request(
+            path = "repos/$owner/$repo/actions/workflows/$workflowFile/dispatches",
+            method = "POST",
+            body = json.encodeToString(GitHubDispatchRequest.serializer(), GitHubDispatchRequest(ref, inputs))
+        )
+    }
+
+    /** Most recent runs for one workflow, newest first — used to find the run a dispatch just created. */
+    open suspend fun listWorkflowRuns(owner: String, repo: String, workflowFile: String, perPage: Int = 5): List<GitHubWorkflowRunDto> =
+        json.decodeFromString(
+            GitHubWorkflowRunsResponse.serializer(),
+            get("repos/$owner/$repo/actions/workflows/$workflowFile/runs?per_page=$perPage")
+        ).workflowRuns
+
+    /** Per-job (and per-step within each job) status for one run — this is what drives the live checklist. */
+    open suspend fun listRunJobs(owner: String, repo: String, runId: Long): List<GitHubJobDto> =
+        json.decodeFromString(
+            GitHubJobsResponse.serializer(),
+            get("repos/$owner/$repo/actions/runs/$runId/jobs")
+        ).jobs
+
+    /** Raw plaintext logs for one failed job — fed to the on-device model as real failure evidence. */
+    open suspend fun getJobLogs(owner: String, repo: String, jobId: Long): String =
+        request(path = "repos/$owner/$repo/actions/jobs/$jobId/logs", method = "GET")
+
+    /** Re-runs only the jobs that failed in this run, on the same commit — a real retry, not a fresh dispatch. */
+    open suspend fun rerunFailedJobs(owner: String, repo: String, runId: Long) {
+        request(path = "repos/$owner/$repo/actions/runs/$runId/rerun-failed-jobs", method = "POST")
+    }
+
     private suspend fun get(path: String): String = request(path, "GET")
 
     private suspend fun request(path: String, method: String, body: String? = null): String = withContext(Dispatchers.IO) {
@@ -108,7 +149,17 @@ open class GitHubApiClient(
                     else "GitHub API request was forbidden."
                 )
             }
-            if (response.code == 404) throw IOException("Repository not found or not public.")
+            if (response.code == 404) {
+                val message = when {
+                    method == "POST" && path.endsWith("/reviews") ->
+                        "GitHub could not submit this approval. The saved token needs Pull requests write access, and GitHub does not allow authors to approve their own pull requests."
+                    method == "PUT" && path.endsWith("/merge") ->
+                        "GitHub could not merge this pull request. The saved token needs Contents write access (public_repo or repo for a classic token)."
+                    else ->
+                        "GitHub could not find this resource. Check the repository name and make sure the saved token can access it."
+                }
+                throw IOException(message)
+            }
             if (!response.isSuccessful) throw IOException(githubError(response.code, responseBody))
             responseBody
         }
@@ -227,6 +278,52 @@ data class GitHubMergeResponse(
 
 @Serializable
 private data class GitHubErrorResponse(val message: String = "")
+
+@Serializable
+private data class GitHubDispatchRequest(
+    val ref: String,
+    val inputs: Map<String, String> = emptyMap()
+)
+
+@Serializable
+data class GitHubWorkflowRunsResponse(
+    @SerialName("total_count") val totalCount: Int = 0,
+    @SerialName("workflow_runs") val workflowRuns: List<GitHubWorkflowRunDto> = emptyList()
+)
+
+@Serializable
+data class GitHubWorkflowRunDto(
+    val id: Long,
+    val status: String,
+    val conclusion: String? = null,
+    @SerialName("html_url") val htmlUrl: String,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("head_sha") val headSha: String = ""
+)
+
+@Serializable
+data class GitHubJobsResponse(
+    @SerialName("total_count") val totalCount: Int = 0,
+    val jobs: List<GitHubJobDto> = emptyList()
+)
+
+@Serializable
+data class GitHubJobDto(
+    val id: Long,
+    val name: String,
+    val status: String,
+    val conclusion: String? = null,
+    @SerialName("html_url") val htmlUrl: String? = null,
+    val steps: List<GitHubJobStepDto> = emptyList()
+)
+
+@Serializable
+data class GitHubJobStepDto(
+    val name: String,
+    val status: String,
+    val conclusion: String? = null,
+    val number: Int
+)
 
 @Serializable
 data class GitHubIssueDto(

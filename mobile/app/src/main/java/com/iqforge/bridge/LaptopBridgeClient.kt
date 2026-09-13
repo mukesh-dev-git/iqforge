@@ -126,16 +126,40 @@ open class LaptopBridgeClient(
         laptopUrl: String,
         repo: String,
         commitSha: String,
-        message: String
+        message: String,
+        gated: Boolean = false
     ): DeployStatus = request(
         laptopUrl = laptopUrl,
         endpoint = "deploy",
-        body = json.encodeToString(DeployRequest.serializer(), DeployRequest(repo, commitSha, message))
+        body = json.encodeToString(DeployRequest.serializer(), DeployRequest(repo, commitSha, message, gated))
     ) { response ->
         json.decodeFromString(DeployStatusDto.serializer(), response).let {
-            DeployStatus(it.deployId, it.stage, it.stageLabel, it.percent, it.done)
+            it.toDomain()
         }
     }
+
+    /** Returns the bridge's latest deployment snapshot, including the accumulated logs. */
+    open suspend fun deployStatus(laptopUrl: String): DeployStatus =
+        json.decodeFromString<DeployStatusDto>(get(laptopUrl, "deploy/status")).toDomain()
+
+    open suspend fun advanceDeploy(laptopUrl: String, deployId: String, stage: String): DeployStatus = request(
+        laptopUrl = laptopUrl,
+        endpoint = "deploy/advance",
+        body = json.encodeToString(DeployAdvanceRequest.serializer(), DeployAdvanceRequest(deployId, stage))
+    ) { response -> json.decodeFromString<DeployStatusDto>(response).toDomain() }
+
+    private fun DeployStatusDto.toDomain() = DeployStatus(
+        deployId = deployId,
+        stage = stage,
+        stageLabel = stageLabel,
+        percent = percent,
+        done = done,
+        stageComplete = stageComplete,
+        logs = logs,
+        repo = repo,
+        commitSha = commitSha,
+        message = message
+    )
 
     private suspend fun get(laptopUrl: String, endpoint: String): String = withContext(Dispatchers.IO) {
         val request = Request.Builder().url("${normalizeUrl(laptopUrl)}/$endpoint").get().build()
@@ -269,13 +293,31 @@ private data class WorkspaceWriteResponse(
 
 data class RepositoryResult(val path: String, val output: String)
 
-data class DeployStatus(val deployId: String, val stage: String, val stageLabel: String, val percent: Int, val done: Boolean)
+data class DeployStatus(
+    val deployId: String,
+    val stage: String,
+    val stageLabel: String,
+    val percent: Int,
+    val done: Boolean,
+    val stageComplete: Boolean = false,
+    val logs: List<String> = emptyList(),
+    val repo: String = "",
+    val commitSha: String = "",
+    val message: String = ""
+)
 
 @Serializable
 private data class DeployRequest(
     val repo: String,
     @kotlinx.serialization.SerialName("commit_sha") val commitSha: String,
-    val message: String
+    val message: String,
+    val gated: Boolean = false
+)
+
+@Serializable
+private data class DeployAdvanceRequest(
+    @kotlinx.serialization.SerialName("deploy_id") val deployId: String,
+    val stage: String
 )
 
 @Serializable
@@ -284,7 +326,12 @@ private data class DeployStatusDto(
     val stage: String,
     @kotlinx.serialization.SerialName("stage_label") val stageLabel: String,
     val percent: Int,
-    val done: Boolean
+    val done: Boolean,
+    @kotlinx.serialization.SerialName("stage_complete") val stageComplete: Boolean = false,
+    val logs: List<String> = emptyList(),
+    val repo: String = "",
+    @kotlinx.serialization.SerialName("commit_sha") val commitSha: String = "",
+    val message: String = ""
 )
 
 @Serializable

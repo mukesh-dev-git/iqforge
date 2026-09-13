@@ -112,6 +112,37 @@ live web-search provider. A failed probe is returned as unavailable and never as
 Field names and casing must match exactly on both sides. If the shape changes, update this
 file first.
 
+**Run and observe the deployment demo** — `POST /deploy`, then `GET /deploy/status`
+
+The phone creates a deployment review first; this endpoint is called only after its preflight
+checklist is complete. The bridge currently provides the hackathon build/test/deploy/live
+simulation. The mobile client polls the status response and turns completed bridge stages into
+verified checklist ticks.
+
+```json
+{ "repo": "iqforge", "commit_sha": "abc123", "message": "Staging deployment from iQForge", "gated": true }
+```
+```json
+{
+  "deploy_id": "d34db33f",
+  "stage": "build" | "test" | "deploy" | "live" | "queued",
+  "stage_label": "Building",
+  "percent": 25,
+  "logs": ["Installing dependencies..."],
+  "done": false,
+  "stage_complete": false,
+  "repo": "iqforge",
+  "commit_sha": "abc123",
+  "message": "Staging deployment from iQForge",
+  "started_at": 0
+}
+```
+
+The initial **Start Deployment Review** action is phone-side and never releases code. Production
+release remains an explicit action in the Deploy stage. With `gated: true`, the bridge runs only
+the Build stage. Each subsequent phone approval calls `POST /deploy/advance` with the deployment
+ID and the exact next stage (`test`, `deploy`, then `live`); skipping a stage is rejected.
+
 ## The rule
 
 The NPU (or its CPU fallback) handles anything that's **reasoning over code**. `bridge/`

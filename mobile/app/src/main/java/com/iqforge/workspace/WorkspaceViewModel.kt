@@ -312,6 +312,8 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun hasSavedToken(): Boolean = preferences.getString("github_token", "").isNullOrBlank().not()
 
+    fun savedGitHubToken(): String = preferences.getString("github_token", "").orEmpty()
+
     fun saveGitHubToken(token: String, username: String = "") {
         preferences.edit()
             .putString("github_token", token.trim())

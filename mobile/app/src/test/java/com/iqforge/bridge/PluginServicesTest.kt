@@ -75,4 +75,29 @@ class PluginServicesTest {
         assertTrue(connectors.single().connected)
         assertEquals("/connectors", server.takeRequest().path)
     }
+
+    @Test fun `deployment status includes gated stage evidence and logs`() = runTest {
+        server.enqueue(MockResponse().setBody(
+            """{"deploy_id":"run1","stage":"build","stage_label":"Building","percent":25,"done":false,"stage_complete":true,"logs":["Build succeeded."],"repo":"iqforge","commit_sha":"abc123","message":"Staging"}"""
+        ))
+
+        val status = client.deployStatus(server.url("/").toString())
+
+        assertEquals("run1", status.deployId)
+        assertTrue(status.stageComplete)
+        assertEquals(listOf("Build succeeded."), status.logs)
+        assertEquals("/deploy/status", server.takeRequest().path)
+    }
+
+    @Test fun `advancing a deployment names the exact next stage`() = runTest {
+        server.enqueue(MockResponse().setBody(
+            """{"deploy_id":"run1","stage":"test","stage_label":"Running tests","percent":50,"done":false,"stage_complete":false,"logs":[]}"""
+        ))
+
+        client.advanceDeploy(server.url("/").toString(), "run1", "test")
+
+        val request = server.takeRequest()
+        assertEquals("/deploy/advance", request.path)
+        assertTrue(request.body.readUtf8().contains("\"deploy_id\":\"run1\""))
+    }
 }
