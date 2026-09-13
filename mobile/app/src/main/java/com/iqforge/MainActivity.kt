@@ -8,6 +8,7 @@ import android.app.Application
 import android.Manifest
 import rikka.shizuku.Shizuku
 import com.iqforge.engine.NpuDaemonManager
+import com.iqforge.hardware.HaloLightManager
 import android.net.Uri
 import android.provider.Settings
 import android.speech.RecognizerIntent
@@ -138,17 +139,23 @@ private val ForgeLightColors = lightColorScheme(primary = Color(0xFFB38600), bac
 private enum class Appearance { SYSTEM, LIGHT, DARK }
 private enum class FontChoice { DEFAULT, SERIF, MONOSPACE }
 private enum class AppDestination { CHATS, DISPATCH, COWORK, PROJECTS, PROJECT_DETAIL, CODE, ARTIFACTS, REVIEW, CI_HEALTH, SETTINGS }
-private enum class SettingsDialog { NONE, USAGE, CAPABILITIES, GITHUB, COLOR, FONT, VOICE, PRIVACY, DEVICE }
+private enum class SettingsDialog { NONE, USAGE, CAPABILITIES, GITHUB, COLOR, FONT, VOICE, PRIVACY, DEVICE, HALO }
 
 class MainActivity : ComponentActivity() {
     private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { _, grantResult ->
         if (grantResult == android.content.pm.PackageManager.PERMISSION_GRANTED) {
             android.util.Log.i("MainActivity", "Shizuku permission granted! Snapdragon Hexagon NPU ready.")
+            try {
+                com.iqforge.hardware.HaloLightManager.onShizukuReady()
+            } catch (_: Throwable) {}
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        try {
+            HaloLightManager.init(applicationContext)
+        } catch (_: Throwable) {}
         try {
             Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
             if (NpuDaemonManager.isShizukuAvailable() && !NpuDaemonManager.hasShizukuPermission()) {
@@ -172,6 +179,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        try {
+            HaloLightManager.stopThinkingPulse()
+        } catch (_: Throwable) {}
         try {
             Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener)
         } catch (_: Throwable) {}
@@ -5072,6 +5082,15 @@ private fun formatProjectDate(timestamp: Long): String = if (timestamp <= 0L) "u
                 SettingsRow(Icons.Default.TextFields, "Font style", fontChoice.name.lowercase().replaceFirstChar { it.uppercase() }) { onDialog(SettingsDialog.FONT) }
                 HorizontalDivider()
                 SettingsRow(Icons.Default.GraphicEq, "Voice", "Android speech recognition") { onDialog(SettingsDialog.VOICE) }
+                HorizontalDivider()
+                val haloSubtitle = if (HaloLightManager.mode == HaloLightManager.HaloMode.DISABLED) {
+                    "Disabled"
+                } else if (HaloLightManager.mode == HaloLightManager.HaloMode.CAMERA_TORCH) {
+                    "Flashlight Pulse"
+                } else {
+                    "${HaloLightManager.mode.displayName} • ${HaloLightManager.effect.displayName}"
+                }
+                SettingsRow(Icons.Default.Flare, "Monster Halo / Thinking Light", haloSubtitle) { onDialog(SettingsDialog.HALO) }
             }
         }
         item {
@@ -5171,6 +5190,7 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
         SettingsDialog.VOICE -> "Voice"
         SettingsDialog.PRIVACY -> "Privacy"
         SettingsDialog.DEVICE -> "Laptop bridge"
+        SettingsDialog.HALO -> "Monster Halo / Thinking Light"
         SettingsDialog.NONE -> "Settings"
     }
     AlertDialog(
@@ -5276,6 +5296,69 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
                         agent.updateBridgeUrl(bridgeUrl)
                         agent.checkBridge()
                     }, modifier = Modifier.fillMaxWidth()) { Text("Save and test") }
+                }
+                SettingsDialog.HALO -> Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    val context = LocalContext.current
+                    var currentMode by remember { mutableStateOf(HaloLightManager.mode) }
+                    var currentEffect by remember { mutableStateOf(HaloLightManager.effect) }
+                    var currentColor by remember { mutableStateOf(HaloLightManager.color) }
+                    var isPreviewActive by remember { mutableStateOf(false) }
+
+                    Text(
+                        if (HaloLightManager.isHaloHardwareSupported) {
+                            "Your device supports the rear camera RGB Monster Halo ring! The light dynamically illuminates and breathes while the on-device Hexagon NPU is thinking."
+                        } else {
+                            "Hardware RGB Halo is optimized for iQOO/vivo phones. Camera flashlight pulse is available as an active thinking indicator."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Text("Lighting Mode", style = MaterialTheme.typography.titleSmall)
+                    HaloLightManager.HaloMode.entries.forEach { m ->
+                        RadioSetting(m.displayName, currentMode == m) {
+                            currentMode = m
+                            HaloLightManager.mode = m
+                        }
+                    }
+
+                    if (currentMode != HaloLightManager.HaloMode.DISABLED) {
+                        if (currentMode != HaloLightManager.HaloMode.CAMERA_TORCH && HaloLightManager.isHaloHardwareSupported) {
+                            HorizontalDivider()
+                            Text("Camera Ring Effect", style = MaterialTheme.typography.titleSmall)
+                            HaloLightManager.HaloEffect.entries.forEach { eff ->
+                                RadioSetting(eff.displayName, currentEffect == eff) {
+                                    currentEffect = eff
+                                    HaloLightManager.effect = eff
+                                }
+                            }
+
+                            HorizontalDivider()
+                            Text("Ring Color Theme", style = MaterialTheme.typography.titleSmall)
+                            HaloLightManager.HaloColor.entries.forEach { col ->
+                                RadioSetting(col.displayName, currentColor == col) {
+                                    currentColor = col
+                                    HaloLightManager.color = col
+                                }
+                            }
+                        }
+
+                        HorizontalDivider()
+                        Button(
+                            onClick = {
+                                isPreviewActive = true
+                                HaloLightManager.testLight(context, 3000L)
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Default.Flare, contentDescription = null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Preview Light (3s)")
+                        }
+                    }
                 }
                 SettingsDialog.NONE -> Unit
             }
