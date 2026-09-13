@@ -21,8 +21,15 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.scrollBy
@@ -44,11 +51,15 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.res.painterResource
@@ -62,6 +73,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.ViewModel
@@ -96,6 +108,9 @@ import com.iqforge.cowork.CoworkTaskStore
 import com.iqforge.dispatch.DispatchRecord
 import com.iqforge.dispatch.DispatchStatus
 import com.iqforge.dispatch.DispatchStore
+import com.iqforge.deployment.DeploymentCheck
+import com.iqforge.deployment.DeploymentPage
+import com.iqforge.deployment.DeploymentViewModel
 import com.iqforge.engine.OfflineEngine
 import com.iqforge.github.GitHubIssueDto
 import com.iqforge.github.GitHubPullRequestDetailDto
@@ -103,8 +118,10 @@ import com.iqforge.github.GitHubViewModel
 import com.iqforge.github.cleanPullRequestSummary
 import com.iqforge.github.fallbackPullRequestSummary
 import com.iqforge.github.pullRequestSummaryPrompt
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
 import com.iqforge.workspace.WorkspaceEntry
 import com.iqforge.workspace.WorkspaceUiState
@@ -137,7 +154,7 @@ private val ForgeLightColors = lightColorScheme(primary = Color(0xFFB38600), bac
 
 private enum class Appearance { SYSTEM, LIGHT, DARK }
 private enum class FontChoice { DEFAULT, SERIF, MONOSPACE }
-private enum class AppDestination { CHATS, DISPATCH, COWORK, PROJECTS, PROJECT_DETAIL, CODE, ARTIFACTS, REVIEW, SETTINGS }
+private enum class AppDestination { CHATS, DISPATCH, COWORK, PROJECTS, PROJECT_DETAIL, CODE, ARTIFACTS, REVIEW, DEPLOYMENT, SETTINGS }
 private enum class SettingsDialog { NONE, USAGE, CAPABILITIES, GITHUB, COLOR, FONT, VOICE, PRIVACY, DEVICE }
 
 class MainActivity : ComponentActivity() {
@@ -1955,7 +1972,8 @@ class AgentViewModel(
     fontChoice: FontChoice,
     onFontChoiceChange: (FontChoice) -> Unit,
     workspace: WorkspaceViewModel = viewModel(),
-    agent: AgentViewModel = viewModel(factory = AgentViewModel.Factory)
+    agent: AgentViewModel = viewModel(factory = AgentViewModel.Factory),
+    deployment: DeploymentViewModel = viewModel()
 ) {
     val state by workspace.state
     val context = LocalContext.current
@@ -2104,6 +2122,34 @@ class AgentViewModel(
                     workspace = workspace,
                     state = state,
                     onOpenCode = { destination = AppDestination.CODE }
+                )
+                AppDestination.DEPLOYMENT -> DeploymentPage(
+                    repositories = state.repositories,
+                    currentRepository = state.repo,
+                    deployment = deployment,
+                    onOpenCode = { check: DeploymentCheck ->
+                        val repo = deployment.state.repository
+                        if (repo != null) {
+                            agent.createCodeSession(repo.root.absolutePath, title = "${repo.name} (Deploy Fix)")
+                            agent.sendCodeSessionMessage(
+                                "Fix this deployment checklist failure using the smallest safe code change. " +
+                                    "Do not modify unrelated files.\n\nCheck: ${check.title}\nEvidence: ${check.detail}"
+                            )
+                            destination = AppDestination.CODE
+                        }
+                    },
+                    onOpenDetailedReview = {
+                        val repo = deployment.state.repository
+                        if (repo != null) {
+                            agent.createCodeSession(repo.root.absolutePath, title = "${repo.name} (Deployment Review)")
+                            agent.sendCodeSessionMessage(
+                                "Perform a detailed deployment-readiness review for ${repo.name} at commit " +
+                                    "${deployment.state.commitSha.ifBlank { "HEAD" }} targeting ${deployment.state.environment}. " +
+                                    "Inspect build configuration, tests, deployment risks, rollback readiness, and any Dataform workflow impact."
+                            )
+                            destination = AppDestination.CODE
+                        }
+                    }
                 )
                 AppDestination.SETTINGS -> SettingsPage(
                     appearance = appearance,
@@ -2834,6 +2880,8 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
                     AttachmentStrip(agent)
                 }
 
+                PixelPetRunner(Modifier.padding(start = 6.dp, bottom = 2.dp))
+
                 TextField(
                     value = agent.composer,
                     onValueChange = agent::updateComposer,
@@ -2911,6 +2959,78 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
                                 contentDescription = "Send"
                             )
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private val pixelPetFrameA = listOf(
+    "..YYYY..",
+    ".YYYYYY.",
+    ".YYYYYY.",
+    ".YKYYKY.",
+    ".YYYYYY.",
+    "..YYYY..",
+    "...Y.Y..",
+    "........"
+)
+private val pixelPetFrameB = listOf(
+    "..YYYY..",
+    ".YYYYYY.",
+    ".YYYYYY.",
+    ".YKYYKY.",
+    ".YYYYYY.",
+    "..YYYY..",
+    "..Y...Y.",
+    "........"
+)
+
+@Composable private fun PixelPetRunner(modifier: Modifier = Modifier) {
+    val spriteSize = 22.dp
+    val density = LocalDensity.current
+    BoxWithConstraints(modifier.fillMaxWidth().height(spriteSize)) {
+        val trackWidthPx = with(density) { (maxWidth - spriteSize).toPx() }.coerceAtLeast(1f)
+        val transition = rememberInfiniteTransition(label = "pixel-pet")
+        val x by transition.animateFloat(
+            initialValue = 0f,
+            targetValue = trackWidthPx,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = (trackWidthPx / 0.09f).toInt().coerceIn(1400, 4200), easing = LinearEasing),
+                repeatMode = RepeatMode.Reverse
+            ),
+            label = "pixel-pet-x"
+        )
+        var previousX by remember { mutableStateOf(0f) }
+        val movingRight = x >= previousX
+        SideEffect { previousX = x }
+
+        var frame by remember { mutableStateOf(0) }
+        LaunchedEffect(Unit) {
+            while (true) {
+                delay(150)
+                frame = 1 - frame
+            }
+        }
+
+        Canvas(
+            modifier = Modifier
+                .offset { IntOffset(x.toInt(), 0) }
+                .size(spriteSize)
+                .graphicsLayer { scaleX = if (movingRight) 1f else -1f }
+        ) {
+            val grid = if (frame == 0) pixelPetFrameA else pixelPetFrameB
+            val cell = size.minDimension / 8f
+            grid.forEachIndexed { row, line ->
+                line.forEachIndexed { col, ch ->
+                    val color = when (ch) {
+                        'Y' -> Color(0xFFFFC400)
+                        'K' -> Color(0xFF2B2B2B)
+                        else -> null
+                    }
+                    if (color != null) {
+                        drawRect(color = color, topLeft = Offset(col * cell, row * cell), size = Size(cell, cell))
                     }
                 }
             }
@@ -3243,6 +3363,7 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
                 item { NavigationItem("Chats", Icons.Default.Forum) { onDestination(AppDestination.CHATS) } }
                 item { NavigationItem("Code", Icons.Default.Code) { onDestination(AppDestination.CODE) } }
                 item { NavigationItem("Review", Icons.Default.RateReview) { onDestination(AppDestination.REVIEW) } }
+                item { NavigationItem("Deployment", Icons.Default.RocketLaunch) { onDestination(AppDestination.DEPLOYMENT) } }
                 item { NavigationItem("Settings", Icons.Default.Settings) { onDestination(AppDestination.SETTINGS) } }
                 item { HorizontalDivider(Modifier.padding(vertical = 12.dp)) }
                 if (state.pinnedRepositoryNames.isNotEmpty()) {
@@ -3770,6 +3891,24 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
             }
         }
     }
+    val openCodeForFix: () -> Unit = {
+        val ref = github.repoRef
+        if (ref != null) {
+            val existing = state.repositories.firstOrNull {
+                it.name.equals(ref.repo, ignoreCase = true) || it.name.startsWith("${ref.repo}-", ignoreCase = true)
+            }
+            github.clearSelection()
+            if (existing != null) {
+                agent.createCodeSession(existing.root.absolutePath, title = "${existing.name} · Fix PR")
+                onOpenCode()
+            } else {
+                workspace.cloneRepository("https://github.com/${ref.owner}/${ref.repo}") { repo ->
+                    agent.createCodeSession(repo.root.absolutePath, title = "${repo.name} · Fix PR")
+                    onOpenCode()
+                }
+            }
+        }
+    }
 
     Column(Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 10.dp)) {
         Text("Review", style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 14.dp, bottom = 4.dp))
@@ -3843,7 +3982,8 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
             },
             onOpenDeepReview = {
                 startReview(buildPullRequestReviewPrompt(github.repoRef!!.fullName, pr, github.selectedPullRequestFiles))
-            }
+            },
+            onOpenCodeFix = openCodeForFix
         )
     }
 }
@@ -4229,6 +4369,8 @@ private fun parseSimpleMarkdown(raw: String): androidx.compose.ui.text.Annotated
                             )
                         }
                     }
+
+                    PixelPetRunner(Modifier.padding(start = 6.dp, bottom = 2.dp))
 
                     TextField(
                         value = input,
@@ -5192,6 +5334,7 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
         Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(22.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Text("Create a Cowork task", style = MaterialTheme.typography.headlineSmall)
             OutlinedTextField(title, { title = it }, Modifier.fillMaxWidth(), label = { Text("Task name") }, singleLine = true)
+            PixelPetRunner(Modifier.padding(start = 4.dp))
             OutlinedTextField(instruction, { instruction = it }, Modifier.fillMaxWidth().height(150.dp), label = { Text("What should the model achieve?") })
             if (repositories.isNotEmpty()) {
                 Text("Repository context", color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -5664,7 +5807,11 @@ private fun enabledCapabilityCount(agent: AgentViewModel): Int = listOf(
             onApproveAndMerge = { hasBlockers ->
                 github.approveAndMerge(pr.number, github.reviewReadiness?.reviewedHeadSha.orEmpty(), hasBlockers)
             },
-            onOpenDeepReview = { startReview(buildPullRequestReviewPrompt(repoFullName, pr, github.selectedPullRequestFiles)) }
+            onOpenDeepReview = { startReview(buildPullRequestReviewPrompt(repoFullName, pr, github.selectedPullRequestFiles)) },
+            onOpenCodeFix = {
+                github.clearSelection()
+                agent.createCodeSession(repo.root.absolutePath, title = "${repo.name} · Fix PR ${pr.number}")
+            }
         )
     }
     github.selectedIssue?.let { issue ->
@@ -5789,7 +5936,8 @@ private fun diffStat(additions: Int, deletions: Int): AnnotatedString = buildAnn
     agent: AgentViewModel,
     onDismiss: () -> Unit,
     onApproveAndMerge: (Boolean) -> Unit,
-    onOpenDeepReview: (() -> Unit)? = null
+    onOpenDeepReview: (() -> Unit)? = null,
+    onOpenCodeFix: (() -> Unit)? = null
 ) {
     var selectedStage by rememberSaveable(pr.number, pr.head.sha) { mutableIntStateOf(0) }
     var reviewBusy by remember(pr.head.sha) { mutableStateOf(true) }
@@ -5799,7 +5947,7 @@ private fun diffStat(additions: Int, deletions: Int): AnnotatedString = buildAnn
         mutableStateOf(fallbackPullRequestSummary(pr.title, files))
     }
 
-    LaunchedEffect(pr.head.sha, files) {
+    LaunchedEffect(pr.head.sha) {
         reviewBusy = true
         reviewError = null
         findings = null
@@ -5810,6 +5958,11 @@ private fun diffStat(additions: Int, deletions: Int): AnnotatedString = buildAnn
                 val patch = file.patch ?: return@flatMap emptyList()
                 agent.reviewPullRequestPatch(patch).map { PullRequestFinding(file.filename, it) }
             }
+        } catch (error: CancellationException) {
+            // LaunchedEffect is cancelled normally when this review leaves or is
+            // replaced in the composition. Never surface that lifecycle event as
+            // a failed code review.
+            throw error
         } catch (error: Exception) {
             reviewError = error.message ?: "The on-device review could not complete."
         } finally {
@@ -5875,7 +6028,17 @@ private fun diffStat(additions: Int, deletions: Int): AnnotatedString = buildAnn
                     0 -> PullRequestSummaryStage(pr, files, readiness, plainEnglishSummary, reviewBusy, reviewError, blockers, warnings, conflictLabel, mergeState, mergeMessage, mergedCommitSha)
                     1 -> PullRequestFindingsStage(reviewBusy, reviewError, findings)
                     2 -> PullRequestChangesStage(files)
-                    else -> PullRequestChecksStage(pr, readiness, checks, reviewBusy, reviewError, blockers, conflictLabel, mergeState)
+                    else -> PullRequestChecksStage(
+                        pr,
+                        readiness,
+                        checks,
+                        reviewBusy,
+                        reviewError,
+                        blockers,
+                        conflictLabel,
+                        mergeState,
+                        onOpenCodeFix
+                    )
                 }
 
                 HorizontalDivider()
@@ -6062,6 +6225,17 @@ private fun highlightPatch(patch: String): AnnotatedString = buildAnnotatedStrin
     }
 }
 
+private enum class GuidedCheckState { THINKING, PASSED, FAILED }
+
+private data class GuidedCheckItem(
+    val id: String,
+    val title: String,
+    val thinkingMessage: String,
+    val detail: String,
+    val state: GuidedCheckState,
+    val canFixInCode: Boolean = false
+)
+
 @Composable private fun ColumnScope.PullRequestChecksStage(
     pr: GitHubPullRequestDetailDto,
     readiness: com.iqforge.github.PullRequestReadiness?,
@@ -6070,47 +6244,210 @@ private fun highlightPatch(patch: String): AnnotatedString = buildAnnotatedStrin
     reviewError: String?,
     blockers: Int,
     conflictLabel: String,
-    mergeState: com.iqforge.github.MergeState
+    mergeState: com.iqforge.github.MergeState,
+    onOpenCodeFix: (() -> Unit)? = null
 ) {
-    LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        item { Text("MERGE READINESS", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)) }
-        item { ReviewCheckRow("Pull request is not a draft", !pr.draft, if (pr.draft) "Draft PRs cannot be merged" else "Ready for review") }
-        item { ReviewCheckRow("No merge conflicts", readiness?.hasConflicts == false, conflictLabel) }
-        item {
-            val checksPassed = readiness?.checksState in setOf(com.iqforge.github.ChecksState.PASSED, com.iqforge.github.ChecksState.NONE)
-            ReviewCheckRow("Automated checks", checksPassed, readiness?.checksState?.name?.lowercase()?.replaceFirstChar { it.uppercase() } ?: "Pending")
-        }
-        checks.forEach { check ->
-            item {
-                val passed = check.conclusion in setOf("success", "neutral", "skipped")
-                ReviewCheckRow(check.name, passed, (check.conclusion ?: check.status).replaceFirstChar { it.uppercase() })
-            }
-        }
-        item { ReviewCheckRow("Complete patch available", readiness?.patchAvailable == true, if (readiness?.patchAvailable == true) "All changed lines loaded" else "One or more patches unavailable") }
-        item { ReviewCheckRow("No blocking IQ findings", !reviewBusy && reviewError == null && blockers == 0, if (reviewBusy) "Review running" else if (blockers == 0) "No blockers" else "$blockers blockers") }
-        item {
+    val automatedState = when (readiness?.checksState) {
+        null, com.iqforge.github.ChecksState.PENDING -> GuidedCheckState.THINKING
+        com.iqforge.github.ChecksState.FAILED -> GuidedCheckState.FAILED
+        com.iqforge.github.ChecksState.NONE, com.iqforge.github.ChecksState.PASSED -> GuidedCheckState.PASSED
+    }
+    val failedChecks = checks.count { it.conclusion !in setOf("success", "neutral", "skipped") }
+    val automatedDetail = when (readiness?.checksState) {
+        null, com.iqforge.github.ChecksState.PENDING -> "Waiting for GitHub checks to finish"
+        com.iqforge.github.ChecksState.FAILED -> "$failedChecks automated check${if (failedChecks == 1) "" else "s"} need attention"
+        com.iqforge.github.ChecksState.NONE -> "No required automated checks"
+        com.iqforge.github.ChecksState.PASSED -> "${checks.size} automated check${if (checks.size == 1) "" else "s"} passed"
+    }
+    val iqState = when {
+        reviewBusy -> GuidedCheckState.THINKING
+        reviewError != null || blockers > 0 -> GuidedCheckState.FAILED
+        else -> GuidedCheckState.PASSED
+    }
+    val guidedChecks = buildList {
+        add(GuidedCheckItem(
+            "commit-loaded",
+            "Latest commit loaded",
+            "IQ is confirming the pull request commit…",
+            readiness?.reviewedHeadSha?.take(12)?.let { "Reviewing commit $it" } ?: "Loading the latest commit",
+            if (readiness == null) GuidedCheckState.THINKING else GuidedCheckState.PASSED
+        ))
+        add(GuidedCheckItem(
+            "draft",
+            "Pull request is ready",
+            "IQ is checking the pull request state…",
+            if (pr.draft) "Draft pull requests cannot be merged" else "The pull request is open for review",
+            if (pr.draft) GuidedCheckState.FAILED else GuidedCheckState.PASSED
+        ))
+        add(GuidedCheckItem(
+            "conflicts",
+            "No merge conflicts",
+            "IQ is comparing both branches…",
+            conflictLabel,
+            when (readiness?.hasConflicts) {
+                null -> GuidedCheckState.THINKING
+                true -> GuidedCheckState.FAILED
+                false -> GuidedCheckState.PASSED
+            },
+            canFixInCode = readiness?.hasConflicts == true
+        ))
+        add(GuidedCheckItem(
+            "automation",
+            "Automated checks",
+            "IQ is checking builds, tests, and previews…",
+            automatedDetail,
+            automatedState,
+            canFixInCode = automatedState == GuidedCheckState.FAILED
+        ))
+        add(GuidedCheckItem(
+            "patch",
+            "Complete patch available",
+            "IQ is loading every changed line…",
+            if (readiness?.patchAvailable == true) "All changed lines loaded" else "One or more file patches are unavailable",
+            when (readiness?.patchAvailable) {
+                null -> GuidedCheckState.THINKING
+                true -> GuidedCheckState.PASSED
+                false -> GuidedCheckState.FAILED
+            },
+            canFixInCode = readiness?.patchAvailable == false
+        ))
+        add(GuidedCheckItem(
+            "iq-review",
+            "No blocking IQ findings",
+            "IQ is reviewing the changed code on device…",
+            when {
+                reviewBusy -> "Private Snapdragon NPU analysis in progress"
+                reviewError != null -> reviewError
+                blockers > 0 -> "$blockers blocking finding${if (blockers == 1) "" else "s"} must be fixed"
+                else -> "No blocking findings detected"
+            },
+            iqState,
+            canFixInCode = iqState == GuidedCheckState.FAILED
+        ))
+        if (mergeState != com.iqforge.github.MergeState.IDLE) {
             val revalidated = mergeState in setOf(
                 com.iqforge.github.MergeState.APPROVING,
                 com.iqforge.github.MergeState.MERGING,
-                com.iqforge.github.MergeState.MERGED
+                com.iqforge.github.MergeState.MERGED,
+                com.iqforge.github.MergeState.FAILED
             )
-            ReviewCheckRow("Reviewed commit unchanged", revalidated, if (revalidated) "Exact reviewed SHA confirmed" else "Rechecked immediately before merge")
+            add(GuidedCheckItem(
+                "sha-check",
+                "Reviewed commit unchanged",
+                "IQ is confirming the exact reviewed commit…",
+                if (revalidated) "Exact reviewed SHA confirmed" else "Rechecking immediately before merge",
+                if (revalidated) GuidedCheckState.PASSED else GuidedCheckState.THINKING
+            ))
+        }
+    }
+
+    var settledCount by rememberSaveable(pr.head.sha) { mutableIntStateOf(0) }
+    val stateSignature = guidedChecks.joinToString("|") { "${it.id}:${it.state}" }
+    LaunchedEffect(stateSignature) {
+        while (settledCount < guidedChecks.size) {
+            val current = guidedChecks[settledCount]
+            if (current.state == GuidedCheckState.THINKING) break
+            kotlinx.coroutines.delay(450)
+            settledCount += 1
+            if (current.state == GuidedCheckState.FAILED) break
+        }
+    }
+    val firstFailedIndex = guidedChecks.indexOfFirst { it.state == GuidedCheckState.FAILED }
+    val visibleLastIndex = when {
+        guidedChecks.isEmpty() -> -1
+        firstFailedIndex >= 0 && settledCount > firstFailedIndex -> firstFailedIndex
+        else -> settledCount.coerceAtMost(guidedChecks.lastIndex)
+    }
+
+    LazyColumn(
+        Modifier.weight(1f).fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(0.dp)
+    ) {
+        item {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("MERGE READINESS", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold), modifier = Modifier.weight(1f))
+                Text(
+                    "${guidedChecks.take(settledCount).count { it.state == GuidedCheckState.PASSED }} of ${guidedChecks.size}",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelLarge
+                )
+            }
+            Spacer(Modifier.height(14.dp))
+        }
+        if (visibleLastIndex >= 0) {
+            guidedChecks.take(visibleLastIndex + 1).forEachIndexed { index, check ->
+                item(key = check.id) {
+                    val displayedState = if (
+                        index == settledCount && check.state in setOf(GuidedCheckState.PASSED, GuidedCheckState.FAILED)
+                    ) GuidedCheckState.THINKING else check.state
+                    GuidedCheckCard(
+                        check,
+                        displayedState,
+                        if (check.canFixInCode) onOpenCodeFix else null
+                    )
+                    if (index < visibleLastIndex || displayedState == GuidedCheckState.THINKING) {
+                        Box(Modifier.fillMaxWidth().height(24.dp), contentAlignment = Alignment.Center) {
+                            Box(Modifier.width(2.dp).fillMaxHeight().background(IqfYellow.copy(alpha = 0.55f)))
+                        }
+                    }
+                }
+            }
         }
     }
 }
 
-@Composable private fun ReviewCheckRow(label: String, passed: Boolean, detail: String) {
-    ElevatedCard(Modifier.fillMaxWidth()) {
-        Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(
-                if (passed) Icons.Default.CheckCircle else Icons.Default.ErrorOutline,
-                null,
-                tint = if (passed) Color(0xFF63C174) else MaterialTheme.colorScheme.error
-            )
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text(label, style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold))
-                Text(detail, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
+@Composable private fun GuidedCheckCard(
+    check: GuidedCheckItem,
+    displayedState: GuidedCheckState,
+    onFixInCode: (() -> Unit)?
+) {
+    val containerColor = when (displayedState) {
+        GuidedCheckState.PASSED -> Color(0xFF1F2B1C)
+        GuidedCheckState.FAILED -> MaterialTheme.colorScheme.errorContainer
+        GuidedCheckState.THINKING -> IqfYellow.copy(alpha = 0.10f)
+    }
+    ElevatedCard(colors = CardDefaults.elevatedCardColors(containerColor = containerColor), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                when (displayedState) {
+                    GuidedCheckState.THINKING -> Box(Modifier.size(34.dp), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(Modifier.fillMaxSize(), strokeWidth = 2.dp, color = IqfYellow)
+                        Image(
+                            painter = painterResource(com.iqforge.R.drawable.iqoo_q_mark),
+                            contentDescription = "IQ is thinking",
+                            modifier = Modifier.size(20.dp),
+                            colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(IqfYellow)
+                        )
+                    }
+                    GuidedCheckState.PASSED -> Icon(Icons.Default.CheckCircle, null, tint = Color(0xFF63C174), modifier = Modifier.size(34.dp))
+                    GuidedCheckState.FAILED -> Icon(Icons.Default.ErrorOutline, null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(34.dp))
+                }
+                Spacer(Modifier.width(14.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(check.title, style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold))
+                    Text(
+                        if (displayedState == GuidedCheckState.THINKING) check.thinkingMessage else check.detail,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+                if (displayedState == GuidedCheckState.FAILED && onFixInCode != null) {
+                    OutlinedIconButton(onClick = onFixInCode) {
+                        Icon(Icons.Default.Code, "Fix in Code")
+                    }
+                }
+            }
+            if (displayedState == GuidedCheckState.THINKING) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Image(
+                        painter = painterResource(com.iqforge.R.drawable.iqoo_q_mark),
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                        colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(IqfYellow)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("THINKING ON DEVICE", color = IqfYellow, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                }
             }
         }
     }
@@ -6213,6 +6550,7 @@ private fun highlightPatch(patch: String): AnnotatedString = buildAnnotatedStrin
         title = { Text("Edit ${state.selectedFile?.name.orEmpty()} with IQForge") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                PixelPetRunner(Modifier.padding(start = 4.dp))
                 OutlinedTextField(
                     instruction,
                     { instruction = it },

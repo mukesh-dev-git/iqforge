@@ -845,6 +845,12 @@ class DeployRequest(BaseModel):
     repo: str = "iqforge"
     commit_sha: str = ""
     message: str = "Hotfix from iQForge"
+    gated: bool = False
+
+
+class DeployAdvanceRequest(BaseModel):
+    deploy_id: str
+    stage: str
 
 
 class DeployStatusResponse(BaseModel):
@@ -854,6 +860,7 @@ class DeployStatusResponse(BaseModel):
     percent: int
     logs: list[str]
     done: bool
+    stage_complete: bool = False
     repo: str
     commit_sha: str
     message: str
@@ -888,30 +895,40 @@ _DEPLOY_STEPS = [
 ]
 
 
-def _run_deploy_pipeline(repo: str, commit_sha: str, message: str) -> None:
+def _run_deploy_stage(repo: str, commit_sha: str, message: str, stage_name: str) -> None:
     commit = commit_sha[:7] if commit_sha else "HEAD"
-    time.sleep(1.0)  # queued
-    for stage, label, lines, duration in _DEPLOY_STEPS:
+    stage_index = next((idx for idx, value in enumerate(_DEPLOY_STEPS) if value[0] == stage_name), None)
+    if stage_index is None:
+        return
+    stage, label, lines, duration = _DEPLOY_STEPS[stage_index]
+    with _deploy_lock:
+        if _latest_deploy is None:
+            return
+        _latest_deploy["stage"] = stage
+        _latest_deploy["stage_label"] = label
+        _latest_deploy["stage_complete"] = False
+    per_line = duration / len(lines)
+    for i, line in enumerate(lines):
+        time.sleep(per_line)
+        text = line.format(commit=commit, repo=repo, message=message)
         with _deploy_lock:
             if _latest_deploy is None:
                 return
-            _latest_deploy["stage"] = stage
-            _latest_deploy["stage_label"] = label
-        per_line = duration / len(lines)
-        for i, line in enumerate(lines):
-            time.sleep(per_line)
-            text = line.format(commit=commit, repo=repo, message=message)
-            with _deploy_lock:
-                if _latest_deploy is None:
-                    return
-                _latest_deploy["logs"].append(text)
-                stage_index = next(idx for idx, s in enumerate(_DEPLOY_STEPS) if s[0] == stage)
-                overall = (stage_index + (i + 1) / len(lines)) / len(_DEPLOY_STEPS)
-                _latest_deploy["percent"] = round(overall * 100)
+            _latest_deploy["logs"].append(text)
+            overall = (stage_index + (i + 1) / len(lines)) / len(_DEPLOY_STEPS)
+            _latest_deploy["percent"] = round(overall * 100)
     with _deploy_lock:
         if _latest_deploy is not None:
-            _latest_deploy["done"] = True
-            _latest_deploy["percent"] = 100
+            _latest_deploy["stage_complete"] = True
+            if stage_name == "live":
+                _latest_deploy["done"] = True
+                _latest_deploy["percent"] = 100
+
+
+def _run_deploy_pipeline(repo: str, commit_sha: str, message: str) -> None:
+    time.sleep(1.0)  # queued
+    for stage, _, _, _ in _DEPLOY_STEPS:
+        _run_deploy_stage(repo, commit_sha, message, stage)
 
 
 @app.post("/deploy", response_model=DeployStatusResponse)
@@ -925,14 +942,38 @@ def trigger_deploy(req: DeployRequest) -> DeployStatusResponse:
             "percent": 0,
             "logs": ["Queued for deploy..."],
             "done": False,
+            "stage_complete": False,
             "repo": req.repo,
             "commit_sha": req.commit_sha,
             "message": req.message,
             "started_at": time.time(),
         }
         snapshot = dict(_latest_deploy)
+    target = _run_deploy_stage if req.gated else _run_deploy_pipeline
+    args = (req.repo, req.commit_sha, req.message, "build") if req.gated else (req.repo, req.commit_sha, req.message)
+    threading.Thread(target=target, args=args, daemon=True).start()
+    return DeployStatusResponse(**snapshot)
+
+
+@app.post("/deploy/advance", response_model=DeployStatusResponse)
+def advance_deploy(req: DeployAdvanceRequest) -> DeployStatusResponse:
+    allowed_stages = [step[0] for step in _DEPLOY_STEPS]
+    with _deploy_lock:
+        if _latest_deploy is None or _latest_deploy["deploy_id"] != req.deploy_id:
+            raise HTTPException(status_code=404, detail="Deployment not found")
+        if not _latest_deploy.get("stage_complete"):
+            raise HTTPException(status_code=409, detail="Current deployment stage is still running")
+        current = _latest_deploy["stage"]
+        expected_index = allowed_stages.index(current) + 1
+        if expected_index >= len(allowed_stages) or req.stage != allowed_stages[expected_index]:
+            raise HTTPException(status_code=409, detail=f"Expected next stage: {allowed_stages[expected_index] if expected_index < len(allowed_stages) else 'none'}")
+        _latest_deploy["stage_complete"] = False
+        repo = _latest_deploy["repo"]
+        commit_sha = _latest_deploy["commit_sha"]
+        message = _latest_deploy["message"]
+        snapshot = dict(_latest_deploy)
     threading.Thread(
-        target=_run_deploy_pipeline, args=(req.repo, req.commit_sha, req.message), daemon=True
+        target=_run_deploy_stage, args=(repo, commit_sha, message, req.stage), daemon=True
     ).start()
     return DeployStatusResponse(**snapshot)
 
