@@ -6105,10 +6105,25 @@ private fun diffStat(additions: Int, deletions: Int): AnnotatedString = buildAnn
         plainEnglishSummary = fallbackPullRequestSummary(pr.title, files)
         try {
             plainEnglishSummary = agent.summarizePullRequest(pr, files)
-            findings = files.flatMap { file ->
-                val patch = file.patch ?: return@flatMap emptyList()
-                agent.reviewPullRequestPatch(patch).map { PullRequestFinding(file.filename, it) }
+            // Filter out non-code files and limit automatic review to top 5 code files to prevent SoC overheating
+            val reviewableFiles = files.filter { file ->
+                val name = file.filename.lowercase()
+                !name.endsWith(".lock") && !name.endsWith("-lock.json") &&
+                !name.endsWith(".min.js") && !name.endsWith(".min.css") &&
+                !name.endsWith(".map") && !name.endsWith(".svg") &&
+                !name.endsWith(".png") && !name.endsWith(".jpg") &&
+                (file.patch?.isNotBlank() == true)
+            }.take(5)
+
+            val gathered = mutableListOf<PullRequestFinding>()
+            for (file in reviewableFiles) {
+                val patch = file.patch ?: continue
+                val trimmedPatch = if (patch.length > 2500) patch.take(2500) + "\n... [diff truncated for thermal efficiency]" else patch
+                kotlinx.coroutines.delay(200) // Thermal breathing delay between file review passes
+                val items = agent.reviewPullRequestPatch(trimmedPatch).map { PullRequestFinding(file.filename, it) }
+                gathered.addAll(items)
             }
+            findings = gathered
         } catch (error: Exception) {
             reviewError = error.message ?: "The on-device review could not complete."
         } finally {

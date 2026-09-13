@@ -157,7 +157,7 @@ object NpuDaemonManager {
             "export ADSP_LIBRARY_PATH=/data/local/tmp/llama.cpp/lib; " +
             "nohup /data/local/tmp/llama.cpp/bin/llama-server " +
             "-m \"$modelPath\" " +
-            "--host 127.0.0.1 --port 8080 -ngl 99 --device HTP0 " +
+            "--host 127.0.0.1 --port 8080 -ngl 99 --device HTP0 -c 2048 -t 4 --threads-batch 4 " +
             "</dev/null >/data/local/tmp/llama-server.log 2>&1 &"
 
         try {
