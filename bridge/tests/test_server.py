@@ -12,6 +12,16 @@ from server import app, ConnectorInfo, ModelInfo
 
 client = TestClient(app)
 
+
+class ImmediateThread:
+    """Runs bridge background work inline so deployment transition tests are deterministic."""
+    def __init__(self, target, args=(), daemon=None):
+        self.target = target
+        self.args = args
+
+    def start(self):
+        self.target(*self.args)
+
 def test_health():
     with patch("server._check_ollama", return_value=True):
         response = client.get("/health")
@@ -24,6 +34,39 @@ def test_status():
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
     assert "uptime_s" in response.json()
+
+
+def test_gated_deployment_requires_each_stage_in_order():
+    with patch("server.threading.Thread", ImmediateThread), patch("server.time.sleep", return_value=None):
+        started = client.post("/deploy", json={
+            "repo": "iqforge", "commit_sha": "abc123", "message": "demo", "gated": True
+        })
+        assert started.status_code == 200
+
+        build = client.get("/deploy/status").json()
+        assert build["stage"] == "build"
+        assert build["stage_complete"] is True
+        assert build["done"] is False
+
+        skipped = client.post("/deploy/advance", json={"deploy_id": build["deploy_id"], "stage": "deploy"})
+        assert skipped.status_code == 409
+
+        tested = client.post("/deploy/advance", json={"deploy_id": build["deploy_id"], "stage": "test"})
+        assert tested.status_code == 200
+        assert client.get("/deploy/status").json()["stage"] == "test"
+
+
+def test_gated_deployment_reaches_live_only_after_explicit_advances():
+    with patch("server.threading.Thread", ImmediateThread), patch("server.time.sleep", return_value=None):
+        started = client.post("/deploy", json={"repo": "iqforge", "gated": True}).json()
+        deploy_id = started["deploy_id"]
+        for stage in ("test", "deploy", "live"):
+            response = client.post("/deploy/advance", json={"deploy_id": deploy_id, "stage": stage})
+            assert response.status_code == 200
+        final = client.get("/deploy/status").json()
+        assert final["stage"] == "live"
+        assert final["stage_complete"] is True
+        assert final["done"] is True
 
 @patch("server.run_backend", return_value="Mocked backend response")
 def test_legacy_review_success(mock_run):

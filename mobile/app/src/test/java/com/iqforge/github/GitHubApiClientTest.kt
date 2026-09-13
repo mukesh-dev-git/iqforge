@@ -1,5 +1,6 @@
 package com.iqforge.github
 
+import java.io.IOException
 import kotlinx.coroutines.test.runTest
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -112,6 +113,33 @@ class GitHubApiClientTest {
         val mergeBody = mergeRequest.body.readUtf8()
         assertTrue(mergeBody.contains("\"sha\":\"abc123\""))
         assertTrue(mergeBody.contains("\"merge_method\":\"squash\""))
+    }
+
+    @Test
+    fun `loads authenticated user for self approval detection`() = runTest {
+        server.enqueue(MockResponse().setBody("""{"login":"Delfi2007"}"""))
+        val client = GitHubApiClient(
+            tokenProvider = { "write-token" },
+            baseUrl = server.url("api/v3/").toString()
+        )
+
+        assertEquals("Delfi2007", client.getAuthenticatedUser().login)
+        assertEquals("/api/v3/user", server.takeRequest().path)
+    }
+
+    @Test
+    fun `approval 404 explains permissions instead of claiming repository is missing`() = runTest {
+        server.enqueue(MockResponse().setResponseCode(404).setBody("""{"message":"Not Found"}"""))
+        val client = GitHubApiClient(
+            tokenProvider = { "read-only-token" },
+            baseUrl = server.url("api/v3/").toString()
+        )
+
+        val error = runCatching { client.submitApproval("acme", "payments", 42) }.exceptionOrNull()
+
+        assertTrue(error is IOException)
+        assertTrue(error?.message.orEmpty().contains("Pull requests write access"))
+        assertFalse(error?.message.orEmpty().contains("Repository not found"))
     }
 
     @Test
