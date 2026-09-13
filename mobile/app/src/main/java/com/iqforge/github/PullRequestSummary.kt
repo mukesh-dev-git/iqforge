@@ -11,10 +11,22 @@ fun pullRequestSummaryPrompt(
     appendLine()
     appendLine("Title: $title")
     body?.takeIf { it.isNotBlank() }?.let { appendLine("Author description: $it") }
+    val codeFiles = files.filter { file ->
+        val n = file.filename.lowercase()
+        !n.endsWith(".lock") && !n.endsWith("-lock.json") &&
+        !n.endsWith(".min.js") && !n.endsWith(".min.css") &&
+        !n.endsWith(".map") && !n.endsWith(".svg")
+    }.take(5)
+
     appendLine("Changed files:")
-    files.forEach { file ->
+    var charBudget = 6000
+    codeFiles.forEach { file ->
         appendLine("${file.filename}: ${file.status}, ${file.additions} additions, ${file.deletions} deletions")
-        file.patch?.let { appendLine(it.take(4_000)) }
+        file.patch?.takeIf { it.isNotBlank() && charBudget > 0 }?.let { patch ->
+            val slice = patch.take(charBudget.coerceAtMost(2000))
+            charBudget -= slice.length
+            appendLine(slice)
+        }
     }
 }
 
