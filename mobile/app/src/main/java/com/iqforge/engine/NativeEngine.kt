@@ -1,6 +1,7 @@
 package com.iqforge.engine
 
 import android.content.Context
+import com.iqforge.hardware.HaloLightManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -390,15 +391,20 @@ class NativeEngine(private val context: Context) : CodeEngine {
     private suspend fun generate(system: String, user: String): String = withContext(Dispatchers.Default) {
         val formattedPrompt = wrapPrompt(system, user)
 
-        // PURE NPU EXECUTION: Model is integrated to run on Hexagon NPU alone, strictly no CPU fallback
-        if (checkNpuHealth() || ensureNpuDaemonRunning()) {
-            val npuResult = generateViaNpu(formattedPrompt)
-            if (!npuResult.isNullOrBlank()) {
-                return@withContext npuResult
+        HaloLightManager.startThinkingPulse(context)
+        try {
+            // PURE NPU EXECUTION: Model is integrated to run on Hexagon NPU alone, strictly no CPU fallback
+            if (checkNpuHealth() || ensureNpuDaemonRunning()) {
+                val npuResult = generateViaNpu(formattedPrompt)
+                if (!npuResult.isNullOrBlank()) {
+                    return@withContext npuResult
+                }
             }
-        }
 
-        "ERROR: Qualcomm Snapdragon Hexagon NPU (HTP) hardware acceleration is required. Inference runs exclusively on the NPU; CPU execution is disabled."
+            "ERROR: Qualcomm Snapdragon Hexagon NPU (HTP) hardware acceleration is required. Inference runs exclusively on the NPU; CPU execution is disabled."
+        } finally {
+            HaloLightManager.stopThinkingPulse()
+        }
     }
 
     override suspend fun write(instruction: String, fileContext: String): String {
